@@ -107,20 +107,25 @@ kernel void latent_attention_scores_paged(device const bfloat *q [[buffer(0)]],
 }
 
 // Each row's key list (LatentAttentionKeysParams): its window's slots in
-// position order, then its selected groups, and their count. A threadgroup
-// per row; its threads count the selection's groups, which end at its first
-// LATENT_INDEX_NONE.
+// position order, then its selected groups, and their count; none past a
+// limited lane's rows. A threadgroup per row; its threads count the
+// selection's groups, which end at its first LATENT_INDEX_NONE.
 kernel void latent_attention_keys(device const uint *positions [[buffer(0)]],
                                   device const uint *selected [[buffer(1)]],
                                   device uint *indices [[buffer(2)]],
                                   device uint *counts [[buffer(3)]],
-                                  constant LatentAttentionKeysParams &p [[buffer(4)]],
+                                  device const uint *limits [[buffer(4)]],
+                                  constant LatentAttentionKeysParams &p [[buffer(5)]],
                                   uint row [[threadgroup_position_in_grid]],
                                   uint tid [[thread_index_in_threadgroup]],
                                   uint lane [[thread_index_in_simdgroup]],
                                   uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup uint partials[kThreads / 32];
   if (row >= p.rows) return;
+  if (p.limited && row >= limits[p.lane]) {
+    if (tid == 0) counts[row] = 0;
+    return;
+  }
   const uint position = positions[row], window = min(p.window, position + 1);
   device uint *out = indices + ulong(row) * p.key_stride;
   for (uint i = tid; i < window; i += kThreads) {

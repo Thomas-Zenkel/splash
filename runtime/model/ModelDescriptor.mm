@@ -1,4 +1,5 @@
 #include "ModelDescriptor.hpp"
+#include "DSpark.hpp"
 #include "GgufImage.hpp"
 #include "SafetensorsImage.hpp"
 #include "WeightStore.hpp"
@@ -893,9 +894,10 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
     if (targetSource == TargetSource::Safetensors) requireQuantization(config, layout);
     if (targetSource == TargetSource::Gguf && layout.ffnKind == QwenFfnKind::SparseMoe)
       layout.experts = ggufRoutedExperts(text, layout);
-    // DeepSeek-V4.1 has no DFlash2 draft: it decodes a token a cycle.
+    // DeepSeek-V4.1 has no DFlash2 draft: it decodes a token a cycle, or a
+    // block with its DSpark (inspectModelRoot).
     if (draft && layout.deepseek.present())
-      throw std::invalid_argument(std::string(layout.family) + " decodes without a draft");
+      throw std::invalid_argument(std::string(layout.family) + " decodes without a DFlash2 draft");
     if (draft && layout.draftChoosesMaskToken()) layout.maskToken = draftMaskToken(draft, layout);
     if (draft) dflashLayout = readDraftLayout(draft, layout);
   }, *target);
@@ -1034,6 +1036,28 @@ ModelDescriptor servedFor(ModelDescriptor model, uint32_t contextTokens) {
   return model;
 }
 
+namespace {
+
+// `described`, a DeepSeek-V4.1 described without a draft, with the DSpark
+// of the GGUF at `path`: its draft layout (dsparkDraftLayout), and its noise
+// token the target's mask token, which fills the rows of a block after its
+// anchor.
+ModelDescriptor withDSpark(ModelDescriptor described, const std::filesystem::path &path) {
+  auto *target = std::get_if<DeepSeek41Layout>(&described.target);
+  if (!target) throw std::invalid_argument(std::string(described.family()) + " has no DSpark draft");
+  DSparkLayout layout;
+  {
+    const OpenGguf file(std::vector<std::filesystem::path>{path});
+    layout = readDSparkLayout(file.file(), *target);
+  }
+  target->maskToken = layout.noiseToken;
+  ModelDescriptor result = makeModelDescriptor(std::move(described.name), *target, dsparkDraftLayout(layout),
+                                               described.vision, described.targetSource, described.visionSource);
+  return result;
+}
+
+} // namespace
+
 ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
   @autoreleasepool {
     std::string sourceIdentity;
@@ -1043,12 +1067,15 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
     const std::string targetFormat = requireString(record, @"target_format", "target format");
     const std::string visionFormat = requireString(record, @"vision_format", "vision format");
     NSDictionary *config = readObject(root / "config.json", "upstream model config");
-    // A model decodes with its DFlash2 draft, in draft/, or, installed
-    // without one (--draft-model none), one token a cycle.
-    NSDictionary *draft = std::filesystem::exists(root / "draft")
+    // A model decodes with its draft, in draft/: a DFlash2 draft, or
+    // DeepSeek-V4.1's DSpark, its GGUF there; or, installed without one
+    // (--draft-model none), one token a cycle.
+    const std::optional<std::filesystem::path> dspark = findDSparkGguf(root / "draft");
+    NSDictionary *draft = std::filesystem::exists(root / "draft") && !dspark
                               ? readObject(root / "draft" / "config.json", "draft config")
                               : nil;
     ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft);
+    if (dspark) result = withDSpark(std::move(result), *dspark);
     result.sourceIdentity = std::move(sourceIdentity);
     if (!result.valid()) throw std::invalid_argument("incompatible target and draft model");
     return result;

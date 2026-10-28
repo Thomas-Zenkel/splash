@@ -87,7 +87,7 @@ access. It also completes local paths for `--model-dir`, `--draft-model` and
 | `--model-dir` | None | Prepare a local GGUF file or GGUF/MLX model directory without the Hub. See [local model files](#local-model-files). |
 | `--mmproj` | None | A local GGUF target's vision projector; requires `--model-dir`. |
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
-| `--draft-model` | The family's released DFlash2 draft, none for a family without one | A compatible repository or local directory in its place, or `none` to decode one token a cycle without a draft. See [drafts](#drafts). |
+| `--draft-model` | The family's released DFlash2 draft, none for a family without one | A compatible repository or local directory in its place, DeepSeek-V4.1-Flash's DSpark GGUF (a repository holding one `dspark*.gguf`, or a local file), or `none` to decode one token a cycle without a draft. See [drafts](#drafts). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](#vision). |
 | `--offline` | Off | Start the installed model without asking the Hub, as `HF_HUB_OFFLINE=1` does. See [revisions](#revisions). |
 | `--port` | `SPLASH_PORT` or `8000` | HTTP port. |
@@ -2059,6 +2059,43 @@ one for the rest, and `GgufPreparation` quantizes each projection into af4g64
 planes, 4 bits in groups of 64 as MLX's affine quantization rounds them, and
 copies every other tensor as stored. The draft runs on the block kernels its
 target's projections run on.
+
+DeepSeek-V4.1-Flash decodes with its own block drafter, DSpark, when
+`--draft-model` names it: the one `dspark*.gguf` at the root of a repository
+(unsloth's `unsloth/DeepSeek-V4.1-Flash-1017-GGUF` holds
+`dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf`, 8.0 GB), or a local GGUF of any
+name, installed as `draft/<name>.gguf` (`upstream.dspark_files`); without it
+the family decodes one token a cycle. The GGUF (architecture `dflash`,
+`model/DSpark.hpp`) holds three of the family's layers, of window attention
+alone and 128 experts each (top 3, MXFP4), the projection and norm of its view
+of the target's rows (`fc`, `enc.output_norm`), its output norm, a Markov head
+of rank 256 and a confidence head; it borrows the target's token table and
+head, and the engine checks it against the target when the model loads
+(`readDSparkLayout`). For each row DSpark reads, the target writes the mean of
+its four streams at the input of DSpark's target layers (37, 38 and 39), which
+DSpark projects and norms into the context row its rings' latents are computed
+from (`DSparkDraft`). A cycle drafts a block of five rows, the anchor and four
+noise tokens (the target's embedding of the GGUF's
+`tokenizer.ggml.mask_token_id`, 128799, which becomes the target's mask
+token), whose rows attend each other and their lane's ring of the last 128
+positions; the target's head gives their logits, and the Markov head's chain
+from the anchor proposes each row's token, the argmax of its logits plus the
+bias it projects from the embedding of the token before it, at the confidence
+of the sigmoid of the confidence head's score (`dspark_markov_step`). Its
+proposals are deterministic: a sampled lane accepts each with the target's
+probability of it, and redraws a rejected one from the target's distribution
+without it. A cycle verifies at most its anchor and the five proposals, the
+rows the verify budget chooses as for a DFlash2 draft, and the target's
+attention skips the rows past them (`LatentAttention::SplitKeys::limits`): all
+eight rows a lane took 54 ms of a profiled cycle on a 48 GB M4 Pro. A lane's state is DFlash2's:
+DSpark's three rings in the first 128 slots of their layers' ring keys, and
+the context window of its 4-bit context rows, which a cached state keeps and a
+restore computes the rings from. Its 8 GB stay resident beside the target and
+leave the target's experts that much less memory: on a 48 GB M4 Pro they got
+17.5 GiB instead of 25.5 GiB, and greedy prose of 128 tokens decoded at 11.6
+tokens per second over five runs (10.96 to 12.32) against 10.8 without DSpark
+(10.66 to 10.84), the budget verifying about 1.5 proposals a cycle and the
+target accepting 68-80% of them. Its own work takes about 10 ms of a cycle.
 
 ### Vision
 

@@ -819,6 +819,30 @@ def _at(repo):
     return f"{repo.name}@{repo.revision[:12]}" if repo.revision else repo.name
 
 
+def dspark_files(repo, target):
+    """The DSpark draft in repo for target's family, downloaded, by assembly
+    path: the one dspark*.gguf file at the root of the repository, or the
+    --draft-model GGUF itself. The engine checks it against the target when
+    the model loads (runtime/model/DSpark.hpp readDSparkLayout)."""
+    found = sorted(
+        name
+        for name in repo.files
+        if "/" not in name
+        and name.lower().startswith("dspark")
+        and name.lower().endswith(".gguf")
+    )
+    if repo.revision is None and len(repo.files) == 1:
+        found = sorted(repo.files)
+    if len(found) != 1:
+        held = f": {', '.join(found)}" if found else ""
+        raise models.ModelError(
+            f"{repo.name} does not hold one DSpark GGUF for {target.family.name}"
+            f" (dspark*.gguf at its root{held})"
+        )
+    downloaded = repo.download(set(found))
+    return {"draft/" + name: path for name, path in downloaded.items()}
+
+
 def draft_files(repo, target):
     """The DFlash2 draft in repo for target's family, downloaded, by assembly
     path: its config.json and safetensors weights, model.safetensors or the
@@ -828,6 +852,8 @@ def draft_files(repo, target):
     download only once the engine accepts its configuration with the
     target's (check_model)."""
     family = target.family
+    if family.dspark:
+        return dspark_files(repo, target)
     try:
         if "config.json" not in repo.files:
             raise models.ModelError("no config.json")

@@ -297,4 +297,9 @@ class WeightFile;
 // compressor and an indexer layer, all of them among its layers.
 void requireDeepSeek41Layout(const DeepSeek41Layout &layout);
 
+// RoPE's inverse frequencies of the layout's pairs: of a compressed layer,
+// base compress_rope_theta stretched by YaRN, else rope_theta (the
+// reference's rope_angles).
+[[nodiscard]] std::vector<float> deepSeek41RopeFrequencies(const DeepSeek41Layout &layout, bool compressed);
+
 } // namespace splash::model

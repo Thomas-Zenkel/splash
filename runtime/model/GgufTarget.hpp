@@ -48,10 +48,12 @@ public:
                    ExpertStoreOptions experts = {});
   // The images `plan` makes of the GGUF at `paths` instead (a DSpark draft's,
   // gguf::planDSparkImages): each of `layers` layers' image, then the head's
-  // and the embedding's, every routed expert loading with its layer.
+  // and the embedding's, every routed expert loading with its layer, each a
+  // component of `directory` (draft/ for a draft's) of the model.
   GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
                    const std::vector<std::filesystem::path> &paths,
-                   const std::function<std::vector<gguf::Image>(const GgufFile &)> &plan, uint32_t layers);
+                   const std::function<std::vector<gguf::Image>(const GgufFile &)> &plan, uint32_t layers,
+                   std::string directory = "target/");
   GgufTargetLoader(const GgufTargetLoader &) = delete;
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
 
@@ -103,6 +105,8 @@ private:
   metal::MetalBackend &backend_;
   WeightImages &images_;
   std::shared_ptr<Planned> planned_;
+  // The model's directory its images are components of.
+  std::string directory_ = "target/";
 };
 
 } // namespace splash::model

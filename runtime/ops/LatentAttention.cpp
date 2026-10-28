@@ -21,7 +21,8 @@ uint64_t LatentAttention::partBytes(uint32_t heads, uint32_t rows) noexcept {
 namespace {
 
 void addKeyLists(metal::CommandGraph &graph, metal::MetalBuffer positions, metal::MetalBuffer selected,
-                 metal::MetalBuffer indices, metal::MetalBuffer counts, LatentAttentionKeysParams params) {
+                 metal::MetalBuffer indices, metal::MetalBuffer counts, LatentAttentionKeysParams params,
+                 metal::MetalBuffer limits = {}) {
   const uint32_t rows = params.rows, window = params.window, selectedStride = params.selected,
                  keyStride = params.key_stride;
   if (!rows || !window || params.ring < window || keyStride < uint64_t{window} + selectedStride)
@@ -30,9 +31,13 @@ void addKeyLists(metal::CommandGraph &graph, metal::MetalBuffer positions, metal
   requireBytes(selected, uint64_t{rows} * selectedStride * sizeof(uint32_t), "latent attention selected groups");
   requireBytes(indices, uint64_t{rows} * keyStride * sizeof(uint32_t), "latent attention key indices");
   requireBytes(counts, uint64_t{rows} * sizeof(uint32_t), "latent attention key counts");
-  // A selection of none binds the positions in its place, unread.
+  if (params.limited) requireBytes(limits, uint64_t{params.lane + 1} * sizeof(uint32_t), "latent attention row limits");
+  // A selection of none, and no limits, bind the positions in their place,
+  // unread.
   metal::MetalBuffer groups = selectedStride ? std::move(selected) : positions;
-  graph.add("latent_attention_keys", {std::move(positions), std::move(groups), std::move(indices), std::move(counts)},
+  if (!params.limited) limits = positions;
+  graph.add("latent_attention_keys",
+            {std::move(positions), std::move(groups), std::move(indices), std::move(counts), std::move(limits)},
             params, {rows, 1, 1}, {LATENT_ATTENTION_THREADS, 1, 1});
 }
 
@@ -42,14 +47,17 @@ void LatentAttention::addKeys(metal::CommandGraph &graph, metal::MetalBuffer pos
                               metal::MetalBuffer indices, metal::MetalBuffer counts, uint32_t window, uint32_t ring,
                               uint32_t selectedStride, uint32_t keyStride, uint32_t rows) {
   addKeyLists(graph, std::move(positions), std::move(selected), std::move(indices), std::move(counts),
-              {rows, window, ring, selectedStride, keyStride, 0, 0, 0});
+              {rows, window, ring, selectedStride, keyStride, 0, 0, 0, 0, 0});
 }
 
 void LatentAttention::addKeys(metal::CommandGraph &graph, metal::MetalBuffer positions, metal::MetalBuffer selected,
                               metal::MetalBuffer indices, metal::MetalBuffer counts, SplitKeys keys,
                               uint32_t selectedStride, uint32_t keyStride, uint32_t rows) {
+  const bool limited = static_cast<bool>(keys.limits);
   addKeyLists(graph, std::move(positions), std::move(selected), std::move(indices), std::move(counts),
-              {rows, keys.window, keys.ring, selectedStride, keyStride, keys.committed, 1, keys.ratio});
+              {rows, keys.window, keys.ring, selectedStride, keyStride, keys.committed, 1, keys.ratio, limited ? 1u : 0u,
+               keys.lane},
+              keys.limits);
 }
 
 void LatentAttention::add(metal::CommandGraph &graph, metal::MetalBuffer q, metal::MetalBuffer window,

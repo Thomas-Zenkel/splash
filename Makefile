@@ -297,6 +297,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/DeepSeek41.cpp \
 	runtime/model/DeepSeek41Target.cpp \
 	runtime/model/DSpark.cpp \
+	runtime/model/DSparkDraft.cpp \
 	runtime/model/GgufImage.cpp \
 	runtime/model/GgufTarget.cpp \
 	runtime/model/SafetensorsImage.cpp \

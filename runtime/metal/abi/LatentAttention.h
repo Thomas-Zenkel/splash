@@ -81,10 +81,14 @@ struct LatentAttentionKeysParams {
   uint32_t committed;
   uint32_t split;
   uint32_t ratio;
+  // With `limited`, a row from limits[lane] on (a verify lane's rows past
+  // the ones it verifies) has no keys.
+  uint32_t limited;
+  uint32_t lane;
 };
 
-static_assert(sizeof(LatentAttentionKeysParams) == 32,
-              "latent attention key list parameters are 32 bytes on both sides");
+static_assert(sizeof(LatentAttentionKeysParams) == 40,
+              "latent attention key list parameters are 40 bytes on both sides");
 
 // A sequence's ring of its window's last latents after a step
 // (latent_ring_update): each slot s of `ring` holds the latent of the last

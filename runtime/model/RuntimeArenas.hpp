@@ -101,8 +101,11 @@ struct RuntimeGeometry final {
     return result;
   }
 
+  // The pairs of the RoPE tables of a DFlash2 draft's rows; DSpark rotates
+  // its latents itself (ops::LatentRotation), and a model without a draft
+  // has none.
   [[nodiscard]] uint32_t draftRotaryPairs() const noexcept {
-    return draft.attentionHeadDimension / 2;
+    return draft.dflash() ? draft.attentionHeadDimension / 2 : 0;
   }
   [[nodiscard]] uint32_t maskWords() const noexcept {
     return maskWordsPerToken(target.vocabularySize);
@@ -515,8 +518,8 @@ public:
     // One private gate buffer is reused serially by the target dense FFN (when
     // present) and the always-dense DFlash draft (when the model has one).
     // Sparse target FFNs use their own route-major arena tensors, but must not
-    // remove the draft's scratch.
-    const uint64_t draft = geometry.draft.present()
+    // remove the draft's scratch. DSpark's experts run on its own.
+    const uint64_t draft = geometry.draft.dflash()
                                ? operators.gateUpWorkspace({geometry.draft.intermediateSize, geometry.draft.hiddenSize})
                                : 0;
     uint64_t target = 0;

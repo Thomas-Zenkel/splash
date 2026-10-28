@@ -7,6 +7,7 @@ import json
 import re
 import shutil
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -109,7 +110,9 @@ class UpstreamTest(unittest.TestCase):
                 )
         for family in DRAFTLESS:
             configs = CONFIGS / family.name.lower()
-            with self.assertRaisesRegex(models.ModelError, "decodes without a draft"):
+            with self.assertRaisesRegex(
+                models.ModelError, "decodes without a DFlash2 draft"
+            ):
                 upstream.check_model(
                     "gguf",
                     "none",
@@ -1782,6 +1785,69 @@ class UpstreamTest(unittest.TestCase):
             link.parent.mkdir(parents=True, exist_ok=True)
             link.symlink_to(self.root)
         self.assertEqual(set(models.selection_links(self.root / "models")), links)
+
+
+class DSparkDraftTest(unittest.TestCase):
+    """DeepSeek-V4.1-Flash's DSpark drafts: the one dspark*.gguf file of a
+    repository, or a --draft-model GGUF whatever its name, linked as
+    draft/<name>.gguf."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.target = types.SimpleNamespace(
+            family=families.named("DeepSeek-V4.1-Flash")
+        )
+
+    def files(self, *names):
+        paths = {}
+        for name in names:
+            (self.root / name).write_bytes(b"GGUF")
+            paths[name] = self.root / name
+        return paths
+
+    def test_a_repository_installs_its_one_dspark_gguf(self):
+        paths = self.files("dspark-Model-Q8_0.gguf", "Model-Q4_K_M.gguf", "config.json")
+        repo = hub.Repository("unsloth/Model-GGUF", "a" * 40, set(paths), paths)
+        self.assertEqual(
+            upstream.draft_files(repo, self.target),
+            {"draft/dspark-Model-Q8_0.gguf": paths["dspark-Model-Q8_0.gguf"]},
+        )
+
+    def test_a_repository_of_none_or_several_is_refused(self):
+        for names in (("Model-Q4_K_M.gguf",), ("dspark-a.gguf", "DSpark-b.gguf")):
+            paths = self.files(*names)
+            repo = hub.Repository("unsloth/Model-GGUF", "a" * 40, set(paths), paths)
+            with (
+                self.subTest(names=names),
+                self.assertRaisesRegex(
+                    models.ModelError, "does not hold one DSpark GGUF"
+                ),
+            ):
+                upstream.draft_files(repo, self.target)
+
+    def test_a_local_gguf_is_the_draft_whatever_its_name(self):
+        path = self.files("my-draft.gguf")["my-draft.gguf"]
+        repo = hub.Repository.local_draft(path)
+        self.assertEqual(
+            upstream.draft_files(repo, self.target), {"draft/my-draft.gguf": path}
+        )
+
+    def test_draft_model_keeps_the_name_of_a_link_to_a_blob(self):
+        # A Hub cache's snapshot links each file to its blob, which has no
+        # .gguf name.
+        blob = self.root / ("b" * 64)
+        blob.write_bytes(b"GGUF")
+        link = self.root / "dspark-Model-Q8_0.gguf"
+        link.symlink_to(blob)
+        with contextlib.chdir(self.root):
+            self.assertEqual(
+                models.parse_draft_model("dspark-Model-Q8_0.gguf"), str(link)
+            )
+        self.assertEqual(
+            hub.Repository.local_draft(link).files, {"dspark-Model-Q8_0.gguf"}
+        )
 
 
 if __name__ == "__main__":

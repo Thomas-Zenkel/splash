@@ -15,7 +15,7 @@ namespace splash::model {
 
 void requireCompatibleModel(const LoadedModel &model) {
   if (!model.descriptor.valid() ||
-      model.descriptor.draft != model.draft.layout ||
+      model.descriptor.draft != model.draft.layout || model.descriptor.draft.dspark() != model.dspark.has_value() ||
       !std::visit(
           [&](const auto &target) {
             return model.descriptor.target == TargetLayout{target.layout} &&
@@ -91,7 +91,7 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   // the vision tower's and the draft's here, the target's by its loader.
   const auto vision = planVisionLoader(root, result.descriptor);
   std::optional<DraftCheckpointLoader> draft;
-  if (result.descriptor.draft.present())
+  if (result.descriptor.draft.dflash())
     draft.emplace(backend, images, root / "draft", result.descriptor.draft);
   // The weights that stream from their files read on the engine's readers.
   const ExpertStoreOptions experts{.memoryBytes = options.expertMemoryBytes, .readers = options.readers};
@@ -119,6 +119,25 @@ LoadedModel loadModel(metal::MetalBackend &backend,
       result.descriptor.target);
   if (draft)
     result.draft = loadDFlashDraftWeights(backend, *draft, result.descriptor.draft);
+  if (result.descriptor.draft.dspark()) {
+    // DSpark, every expert loading with its layer, its images the model's
+    // draft/ components.
+    const auto *target = std::get_if<DeepSeek41Layout>(&result.descriptor.target);
+    const std::optional<std::filesystem::path> path = findDSparkGguf(root / "draft");
+    if (!target || !path) throw std::invalid_argument("a DSpark draft serves DeepSeek-V4.1 from its GGUF in draft/");
+    DSparkLayout layout;
+    {
+      const OpenGguf file(std::vector<std::filesystem::path>{*path});
+      layout = readDSparkLayout(file.file(), *target);
+    }
+    if (dsparkDraftLayout(layout) != result.descriptor.draft)
+      throw std::invalid_argument("the DSpark GGUF in draft/ is not the draft the model was described with");
+    const uint64_t before = backend.memoryStats().allocatedBytes;
+    result.dspark.emplace(loadDSparkWeights(backend, images, *path, layout));
+    result.draft.layout = result.descriptor.draft;
+    result.draft.files = result.dspark->files;
+    result.draft.actualAllocatedBytes = metal::allocationDelta(before, backend.memoryStats().allocatedBytes);
+  }
   result.vision = loadVisionWeights(backend, images, vision.get());
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),

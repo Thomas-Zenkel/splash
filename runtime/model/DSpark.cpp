@@ -4,6 +4,7 @@
 #include "model/GgufTarget.hpp"
 #include "model/QwenTargetLoader.hpp"
 
+#include <algorithm>
 #include <functional>
 #include <string>
 
@@ -54,6 +55,32 @@ DSparkLayout readDSparkLayout(const GgufFile &file, const DeepSeek41Layout &targ
   return layout;
 }
 
+DFlashDraftLayout dsparkDraftLayout(const DSparkLayout &layout) {
+  const DeepSeek41Layout &layers = layout.layers;
+  DFlashDraftLayout result{.kind = DraftKind::DSpark,
+                           .layers = layers.layers,
+                           .hiddenSize = layers.hiddenSize,
+                           .vocabularySize = layers.vocabularySize,
+                           .attentionHeadDimension = layers.attentionHeadDimension,
+                           .rotaryTheta = layers.rotaryTheta,
+                           .kvHeads = layers.attentionKvHeads,
+                           .targetLayerCount = layout.targetLayerCount,
+                           .blockSize = layout.blockSize};
+  std::ranges::copy(layout.targetLayers(), result.targetLayers.begin());
+  return result;
+}
+
+std::optional<std::filesystem::path> findDSparkGguf(const std::filesystem::path &directory) {
+  std::optional<std::filesystem::path> found;
+  if (!std::filesystem::is_directory(directory)) return found;
+  for (const std::filesystem::directory_entry &entry : std::filesystem::directory_iterator(directory)) {
+    if (entry.path().extension() != ".gguf") continue;
+    if (found) throw GgufError("a draft directory holds more than one GGUF: " + directory.string());
+    found = entry.path();
+  }
+  return found;
+}
+
 DSparkWeights loadDSparkWeights(metal::MetalBackend &backend, WeightImages &images,
                                 const std::filesystem::path &path, const DSparkLayout &layout) {
   const DeepSeek41Layout &layers = layout.layers;
@@ -62,7 +89,7 @@ DSparkWeights loadDSparkWeights(metal::MetalBackend &backend, WeightImages &imag
       [&](const GgufFile &file) {
         return gguf::planDSparkImages(file, layers, layout.targetLayerCount, layout.markovRank);
       },
-      layers.layers);
+      layers.layers, "draft/");
   const MoeExperts experts = openMoeExperts(backend, QwenTargetFiles{std::ref(loader)}, layers);
   const BlockTargetFormat format;
   DSparkWeights result;

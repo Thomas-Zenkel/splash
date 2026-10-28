@@ -1,5 +1,6 @@
 #include "model/ModelSizing.hpp"
 
+#include "model/DSpark.hpp"
 #include "model/DraftCheckpoint.hpp"
 #include "model/ExpertStore.hpp"
 #include "model/GgufTarget.hpp"
@@ -86,6 +87,21 @@ void addEngramTables(StreamableWeights &weights, const GgufFile &target, const D
                             SparseRowStore::cacheBytesFor(1, tables.table.rowBytes);
 }
 
+// The bytes of the images of DSpark's GGUF in `directory`, its experts
+// with its layers.
+uint64_t dsparkImageBytes(const std::filesystem::path &directory, const ModelDescriptor &descriptor) {
+  const auto *target = std::get_if<DeepSeek41Layout>(&descriptor.target);
+  const std::optional<std::filesystem::path> path = findDSparkGguf(directory);
+  if (!target || !path) throw std::invalid_argument("a DSpark draft serves DeepSeek-V4.1 from its GGUF in draft/");
+  const OpenGguf file(std::vector<std::filesystem::path>{*path});
+  const DSparkLayout layout = readDSparkLayout(file.file(), *target);
+  uint64_t bytes = 0;
+  for (const gguf::Image &image :
+       gguf::planDSparkImages(file.file(), layout.layers, layout.targetLayerCount, layout.markovRank))
+    bytes += image.bytes;
+  return bytes;
+}
+
 } // namespace
 
 StreamableWeights streamableWeights(const std::filesystem::path &root, const ModelDescriptor &descriptor,
@@ -111,7 +127,8 @@ StreamableWeights streamableWeights(const std::filesystem::path &root, const Mod
             streams);
       },
       descriptor.target);
-  if (descriptor.draft.present()) result.loadedBytes += draftImageBytes(root / "draft", descriptor.draft);
+  if (descriptor.draft.dflash()) result.loadedBytes += draftImageBytes(root / "draft", descriptor.draft);
+  if (descriptor.draft.dspark()) result.loadedBytes += dsparkImageBytes(root / "draft", descriptor);
   if (descriptor.hasVision()) result.loadedBytes += visionImageBytes(descriptor.vision);
   return result;
 }

@@ -34,6 +34,9 @@
 //   fewer are above -inf) and the candidate blocks: each block's highest
 //   score, the last reached block forced, the top blocks, and a later layer's
 //   scores kept to them;
+// - DSpark's Markov step (kernels/decode/dspark.metal): each lane's token,
+//   the argmax of its logits plus its Markov bias, the lower id among ties,
+//   its confidence and its draft distribution;
 // - the Engram: the host's hash of each token's table rows against the
 //   reference's engram_hashes (products past int64 that wrap, negative ones
 //   that Python's modulo takes), and the gate of the projected value into
@@ -61,6 +64,8 @@
 #include "../../../runtime/ops/ManifoldHyperConnection.hpp"
 #include "../../../runtime/ops/MoE.hpp"
 #include "../../../runtime/ops/Weights.hpp"
+#include "metal/abi/DSpark.h"
+#include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/LatentAttention.h"
 #include "metal/abi/LatentIndex.h"
 #include "metal/abi/LatentRotation.h"
@@ -602,6 +607,94 @@ void streamMeanTest(MetalBackend &backend) {
   check(same, "manifold hyper-connection stream mean: each row's streams averaged into its slot alone");
 }
 
+// Step `position` of DSpark's Markov chain (kernels/decode/dspark.metal) of
+// three lanes over the model's vocabulary: each lane's token, the argmax of
+// its row's logits plus its bias, the lower id of two tied tokens; its
+// confidence, the sigmoid of the head's dot with the row's pre-sum of the
+// streams rounded to bf16 and the Markov embedding; its draft distribution,
+// the token alone; and at the block's last step the positions past it, its
+// token at confidence zero. Nothing else is written.
+void markovStepTest(MetalBackend &backend, uint32_t position) {
+  constexpr uint32_t lanes = 3, laneRows = 8, vocabulary = 129280, rank = 256, block = 5;
+  constexpr uint32_t proposals = SPLASH_DRAFT_PROPOSAL_TOKENS, candidates = SPLASH_DRAFT_CANDIDATES;
+  constexpr uint32_t rows = lanes * laneRows, sentinel = 0xAAAAAAAAu;
+  std::mt19937 rng(41 + position);
+  std::vector<float> logits = randoms(rng, size_t(rows) * vocabulary, 4.0f);
+  std::vector<float> bias = randoms(rng, size_t(lanes) * vocabulary, 1.0f);
+  // Lane 1's row ties two tokens at its largest value.
+  for (const uint32_t token : {64000u, 1500u}) {
+    logits[(size_t(laneRows) + position) * vocabulary + token] = 90.0f;
+    bias[size_t(vocabulary) + token] = 10.0f;
+  }
+  const std::vector<float> streams = randoms(rng, size_t(rows) * kWidth, 1.0f);
+  const std::vector<float> mixes = randoms(rng, size_t(rows) * kMixes, 1.0f);
+  const std::vector<float> weights = randoms(rng, kHidden + rank, 0.01f);
+  std::vector<uint16_t> markov(size_t(lanes) * rank);
+  for (uint16_t &value : markov) value = bf16(std::normal_distribution<float>(0.0f, 1.0f)(rng));
+  MetalBuffer logitBuffer = upload(backend, logits), biasBuffer = upload(backend, bias);
+  MetalBuffer streamBuffer = upload(backend, streams), mixBuffer = upload(backend, mixes);
+  MetalBuffer markovBuffer = upload(backend, markov), weightBuffer = upload(backend, weights);
+  MetalBuffer tokens = upload(backend, std::vector<uint32_t>(lanes * proposals, sentinel));
+  MetalBuffer confidence = upload(backend, std::vector<float>(lanes * proposals, -1.0f));
+  MetalBuffer ids = upload(backend, std::vector<uint32_t>(lanes * proposals * candidates, sentinel));
+  MetalBuffer probabilities = upload(backend, std::vector<float>(lanes * proposals * candidates, -1.0f));
+  MetalBuffer previous = upload(backend, std::vector<uint32_t>(lanes, sentinel));
+  const DSparkStepParams params{lanes, vocabulary, kHidden, rank, block, position, laneRows};
+  CommandGraph graph;
+  graph.add("dspark_markov_step",
+            {logitBuffer, biasBuffer, streamBuffer, mixBuffer, markovBuffer, weightBuffer, tokens, confidence, ids,
+             probabilities, previous},
+            params, {lanes, 1, 1}, {DSPARK_STEP_THREADS, 1, 1});
+  run(backend, graph);
+  const std::vector<uint32_t> gotTokens = download<uint32_t>(tokens, lanes * proposals);
+  const std::vector<float> gotConfidence = download<float>(confidence, lanes * proposals);
+  const std::vector<uint32_t> gotIds = download<uint32_t>(ids, lanes * proposals * candidates);
+  const std::vector<float> gotProbabilities = download<float>(probabilities, lanes * proposals * candidates);
+  const std::vector<uint32_t> gotPrevious = download<uint32_t>(previous, lanes);
+  bool tokensOk = true, confidenceOk = true, distributionOk = true, untouched = true;
+  double worst = 0.0;
+  const uint32_t end = position + 1 == block ? proposals : position + 1;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    const size_t row = size_t(lane) * laneRows + position;
+    uint32_t want = 0;
+    float best = -INFINITY;
+    for (uint32_t token = 0; token < vocabulary; ++token) {
+      const float value = logits[row * vocabulary + token] + bias[size_t(lane) * vocabulary + token];
+      if (value > best) best = value, want = token;
+    }
+    if (lane == 1) tokensOk = tokensOk && want == 1500;
+    double score = 0.0;
+    for (uint32_t c = 0; c < kHidden; ++c) {
+      float value = 0.0f;
+      for (uint32_t k = 0; k < kStreams; ++k)
+        value = std::fma(mixes[row * kMixes + k], streams[(row * kStreams + k) * kHidden + c], value);
+      score += double(weights[c]) * f32(bf16(value));
+    }
+    for (uint32_t c = 0; c < rank; ++c) score += double(weights[kHidden + c]) * f32(markov[size_t(lane) * rank + c]);
+    const double sigmoidScore = 1.0 / (1.0 + std::exp(-score));
+    tokensOk = tokensOk && gotPrevious[lane] == want;
+    for (uint32_t at = 0; at < proposals; ++at) {
+      const size_t index = size_t(lane) * proposals + at;
+      if (at < position || at >= end) {
+        untouched = untouched && gotTokens[index] == sentinel && gotConfidence[index] == -1.0f;
+        continue;
+      }
+      tokensOk = tokensOk && gotTokens[index] == want;
+      const double wantConfidence = at == position ? sigmoidScore : 0.0;
+      worst = std::max(worst, std::fabs(gotConfidence[index] - wantConfidence));
+      for (uint32_t c = 0; c < candidates; ++c)
+        distributionOk = distributionOk && gotIds[index * candidates + c] == want &&
+                         gotProbabilities[index * candidates + c] == (c ? 0.0f : 1.0f);
+    }
+  }
+  confidenceOk = worst <= 1e-5;
+  const std::string step = "DSpark Markov step " + std::to_string(position) + " of " + std::to_string(block);
+  check(tokensOk, step + ": each lane's token the argmax of its logits plus its bias, the lower of tied ones");
+  check(confidenceOk, step + ": the confidence head's sigmoid within 1e-5 (" + scientific(worst) + ")");
+  check(distributionOk, step + ": the draft distribution the token alone");
+  check(untouched, step + ": no other proposal position written");
+}
+
 void latentRotationTest(MetalBackend &backend, const std::string &name, const ops::LatentRotationShape &shape,
                         bool floatInput, bool compressed, const std::vector<uint32_t> &positions) {
   const uint32_t rows = uint32_t(positions.size()), width = shape.width;
@@ -849,6 +942,21 @@ void pagedLatentTest(MetalBackend &backend, uint32_t rows) {
   }
   check(lists, at + "split key lists, the ring's slots before the step, its own latents after them, then the "
                     "places of its groups");
+  // The same lists limited to lane 1's verify rows: those rows' lists as
+  // before, the rows past them none.
+  {
+    const uint32_t verified = rows / 2 + 1;
+    MetalBuffer limits = upload(backend, std::vector<uint32_t>{rows, verified, rows}),
+                limitedCounts = upload(backend, std::vector<uint32_t>(rows, 0xAAAAAAAAu));
+    CommandGraph graph;
+    ops::LatentAttention::addKeys(graph, positionBuffer, selectedBuffer, indices, limitedCounts,
+                                  {kWindow, kWindow, committed, ratio, limits, 1}, topK, keyStride, rows);
+    run(backend, graph);
+    const std::vector<uint32_t> limited = download<uint32_t>(limitedCounts, rows);
+    bool same = true;
+    for (uint32_t r = 0; r < rows; ++r) same = same && limited[r] == (r < verified ? gotCounts[r] : 0u);
+    check(same, at + "key lists limited to a lane's verify rows: none past them");
+  }
 
   // The attention over the ring, the step's latents and the pages, bitwise
   // the pooled attention's over the ring and the step's latents in one
@@ -1319,6 +1427,9 @@ int main(int argc, const char *argv[]) {
       keyListTest(backend);
       streamInitTest(backend);
       streamMeanTest(backend);
+      // A step inside DSpark's block, and its last.
+      markovStepTest(backend, 2);
+      markovStepTest(backend, 4);
       compressTest(backend, 1, 2, false);
       compressTest(backend, 37, 2, false);
       compressTest(backend, 5, 1, false);

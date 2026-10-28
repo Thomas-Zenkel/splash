@@ -63,12 +63,16 @@ struct LatentAttention final {
   // slot p % ring of the ring, one at or past it the step's latent p -
   // committed (slot ring + p - committed); and, with `ratio`, whose selected
   // groups are a sequence's pages' (CompressedKeys::pageTable), group g the
-  // position (g + 1) * ratio - 1 of its place.
+  // position (g + 1) * ratio - 1 of its place. With `limits` (uint32 per
+  // lane), its rows from limits[lane] on have no keys: a verify lane's rows
+  // past the ones it verifies, which attend nothing.
   struct SplitKeys final {
     uint32_t window = 0;
     uint32_t ring = 0;
     uint32_t committed = 0;
     uint32_t ratio = 0;
+    metal::MetalBuffer limits{};
+    uint32_t lane = 0;
   };
   static void addKeys(metal::CommandGraph &graph, metal::MetalBuffer positions, metal::MetalBuffer selected,
                       metal::MetalBuffer indices, metal::MetalBuffer counts, SplitKeys keys, uint32_t selectedStride,

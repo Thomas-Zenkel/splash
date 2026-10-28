@@ -2,6 +2,7 @@
 
 #include "ops/Vision.hpp"
 #include "DFlashDraft.hpp"
+#include "DSpark.hpp"
 #include "ModelDescriptor.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -51,7 +53,10 @@ struct LoadedModel final {
   // The memory of every image the weights below are views of.
   std::shared_ptr<WeightImages> images;
   TargetWeights target;
+  // The draft's layout, files and memory; a DFlash2 draft's weights there,
+  // DSpark's in dspark (DFlashDraftLayout::kind).
   DFlashDraftWeights draft;
+  std::optional<DSparkWeights> dspark;
   QwenVisionWeights vision;
   std::string manifestFingerprintSha256;
 

@@ -157,19 +157,22 @@ def split_model_id(value: str) -> tuple[str, str | None]:
 
 
 def parse_draft_model(value: str) -> str:
-    # NO_DRAFT installs the target without a draft. A local draft directory
-    # is recorded as an absolute path, so the installation it selects does
-    # not depend on the working directory.
+    # NO_DRAFT installs the target without a draft. A local draft directory,
+    # or a DSpark draft's GGUF, is recorded as an absolute path, so the
+    # installation it selects does not depend on the working directory.
     if value == NO_DRAFT:
         return value
     if value and (local := Path(value).expanduser()).is_dir():
         return str(local.resolve())
+    # A GGUF keeps its name, which a Hub cache's link to its blob holds.
+    if value and local.suffix == ".gguf" and local.is_file():
+        return os.path.abspath(local)
     try:
         return validate_repo_id(value)
     except ModelError:
         raise argparse.ArgumentTypeError(
-            "must be a local DFlash2 draft directory or a Hugging Face "
-            f"repository ID (owner/repo), or {NO_DRAFT} for no draft"
+            "must be a local DFlash2 draft directory, a local DSpark GGUF, a "
+            f"Hugging Face repository ID (owner/repo), or {NO_DRAFT} for no draft"
         ) from None
 
 

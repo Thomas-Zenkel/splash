@@ -74,7 +74,11 @@ automatically where the family has one:
 DeepSeek-V4.1-Flash has no DFlash2 draft and decodes one token a cycle. Its
 IQ1_M build (120.7 GB) streams its routed experts from the SSD, and its Engram
 tables, a file of their own (110.6 GB) that installs with it, always stream; a
-48 GB Mac serves it at 7–9 tokens per second.
+48 GB Mac serves it at 7–9 tokens per second. With `--draft-model
+unsloth/DeepSeek-V4.1-Flash-1017-GGUF` (or a local `dspark-*.gguf`) it decodes
+with its own block drafter DSpark (8 GB, which its experts then lack): on a
+48 GB Mac about 8% faster on prose, more with memory to spare
+([drafts](DEVELOPMENT.md#drafts)).
 
 Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats
 up to `UD-Q8_K_XL`, whose BF16 tensors load too. Whole-BF16 and F16 models are

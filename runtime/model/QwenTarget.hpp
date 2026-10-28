@@ -113,7 +113,9 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   uint32_t moeExpertFormat = GGUF_FMT_COUNT;
   bool moeRegisterFormats = true;
   uint32_t moeRouterFormat = ops::QuantizedSegment::kFloat32;
-  // The layers whose output rows the DFlash2 draft reads, ascending.
+  // The layers whose output rows the DFlash2 draft reads, ascending; of
+  // DeepSeek-V4.1, the layers at whose input DSpark reads the mean of the
+  // streams.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;
   // The target's KV layout in the format the runtime stores KV in, and its
@@ -184,10 +186,10 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   }
   // The layout itself was checked by requireQwenLayout when the target
   // loaded (DeepSeek-V4.1's by requireDeepSeek41Layout, whose pages hold its
-  // KV sources' compressed groups and its cells its windows alone, and which
-  // has no draft). The draft reads 1 to ExecutionLimits::maximumDraftTargetLayers
-  // of its layers, ascending, and a model without a draft none. A target
-  // without GDN layers has no GDN shape.
+  // KV sources' compressed groups and its cells its windows alone). The draft
+  // reads 1 to ExecutionLimits::maximumDraftTargetLayers of its layers,
+  // ascending, and a model without a draft none. A target without GDN layers
+  // has no GDN shape.
   // The projection lists hold every projection the weights dispatch, which
   // each have sizes; a target with dense FFNs, a MoE target's leading layers
   // too, holds their gate and up projections.
@@ -205,7 +207,7 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
     };
     const bool dense = intermediateSize && sized(gateUpProjections);
     if (deepseek.present())
-      return !captureLayerCount && !stateLayout.layers && kvLayout.attentionLayers == deepseekKvSources() &&
+      return captured() && !stateLayout.layers && kvLayout.attentionLayers == deepseekKvSources() &&
              kvLayout.kvHeads == 1 && kvLayout.headDimension == attentionHeadDimension && sized(prefillProjections) &&
              sized(decodeProjections) && moeShape().valid();
     return captured() && stateLayout.layers + kvLayout.attentionLayers == layers &&

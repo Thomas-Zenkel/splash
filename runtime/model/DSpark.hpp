@@ -13,6 +13,7 @@
 // its Markov head corrects token by token from the token drafted before
 // (rank markovRank), and its confidence head scores each.
 
+#include "model/DFlashDraft.hpp"
 #include "model/DeepSeek41.hpp"
 #include "model/GgufFile.hpp"
 #include "model/WeightImages.hpp"
@@ -20,6 +21,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -45,6 +47,15 @@ struct DSparkLayout final {
 // its Markov head's rank) for `target`, whose widths, attention and
 // vocabulary it shares and whose layers it reads. Throws GgufError past them.
 [[nodiscard]] DSparkLayout readDSparkLayout(const GgufFile &file, const DeepSeek41Layout &target);
+
+// What the runtime sizes DSpark of `layout` by (DFlashDraftLayout): its
+// layers, its target's widths and vocabulary, its latent as one KV head, the
+// target layers it reads, its rotary base and its block.
+[[nodiscard]] DFlashDraftLayout dsparkDraftLayout(const DSparkLayout &layout);
+
+// The DSpark GGUF of a model's draft/ directory, if it holds one: the one
+// .gguf file there.
+[[nodiscard]] std::optional<std::filesystem::path> findDSparkGguf(const std::filesystem::path &directory);
 
 struct DSparkWeights final {
   DSparkLayout layout;

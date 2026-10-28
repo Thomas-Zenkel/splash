@@ -37,30 +37,6 @@ constexpr uint32_t kLatent = LATENT_ATTENTION_DIM;
 
 template <class T> T *contents(const metal::MetalBuffer &buffer) { return static_cast<T *>(buffer.contents()); }
 
-// RoPE's inverse frequencies of its pairs: of a compressed layer, base
-// compress_rope_theta stretched by YaRN, else rope_theta (the reference's
-// rope_angles).
-std::vector<float> ropeFrequencies(const DeepSeek41Layout &layout, bool compressed) {
-  const DeepSeek41Dimensions &d = layout.deepseek;
-  const uint32_t dim = 2 * layout.rotaryPairs;
-  const float base = compressed ? d.compressRopeTheta : layout.rotaryTheta;
-  std::vector<float> freqs(dim / 2);
-  for (uint32_t i = 0; i < dim / 2; ++i) freqs[i] = 1.0F / std::pow(base, float(2 * i) / float(dim));
-  if (!compressed) return freqs;
-  const double original = d.yarnOriginalContextTokens, factor = d.yarnFactor;
-  const auto corrected = [&](double rotations) {
-    return dim * std::log(original / (rotations * 2 * M_PI)) / (2 * std::log(double(base)));
-  };
-  const double low = std::max(std::floor(corrected(d.yarnBetaFast)), 0.0);
-  const double high = std::min(std::ceil(corrected(d.yarnBetaSlow)), double(dim - 1));
-  for (uint32_t i = 0; i < dim / 2; ++i) {
-    const float ramp = float(std::clamp((double(i) - low) / std::max(high - low, 1e-3), 0.0, 1.0));
-    const float smooth = 1.0F - ramp;
-    freqs[i] = freqs[i] / float(factor) * (1.0F - smooth) + freqs[i] * smooth;
-  }
-  return freqs;
-}
-
 // A float projection (BF16 or F32 as the GGUF stores it) into fp32 rows, on
 // the float tile a router runs on.
 void addFloatProjection(metal::CommandGraph &graph, const metal::MetalBuffer &input, const ops::Projection &projection,
@@ -86,6 +62,9 @@ struct DeepSeek41Target::Rows {
   // The positions of its groups from its first on (ratio * group), of a
   // paired source's and a single one's.
   std::array<metal::MetalBuffer, 2> groupPositions;
+  // A drafted verify's rows each lane verifies (a uint32 per lane), past
+  // which its rows attend nothing; none for a prefill's.
+  metal::MetalBuffer verifyRows;
 };
 
 // A step's scratch: what lives across a chunk's layers, its own; a layer's
@@ -220,9 +199,6 @@ DeepSeek41Target::DeepSeek41Target(const DeepSeek41Weights &weights, const QwenT
   // which the memory plan always gives memory (StreamedPart::streamsOnly).
   if (!weights.streamedTable || weights.engramFirstRows.size() != static_cast<size_t>(std::popcount(d_.engramLayers)))
     throw std::invalid_argument("DeepSeek-V4.1 runs with its Engram tables streaming, which these weights do not");
-  // It decodes without a draft (ModelDescriptor): a verify retains each
-  // lane's anchor alone, whose rows after it repeat it (addAttention).
-  if (geometry.captureLayerCount) throw std::invalid_argument("DeepSeek-V4.1 decodes without a draft");
   mhc_ = {layout.hiddenSize, d_.sinkhornIterations, d_.hcEpsilon, d_.normEpsilon};
   moeShape_ = geometry_.moeShape();
   for (uint32_t layer = 0; layer < layout.layers; ++layer)
@@ -247,8 +223,8 @@ DeepSeek41Target::DeepSeek41Target(const DeepSeek41Weights &weights, const QwenT
     std::memcpy(buffer.contents(), values.data(), values.size() * sizeof(T));
     return buffer;
   };
-  frequencies_ = {upload(ropeFrequencies(layout, false), "deepseek41/rope"),
-                  upload(ropeFrequencies(layout, true), "deepseek41/rope-yarn")};
+  frequencies_ = {upload(deepSeek41RopeFrequencies(layout, false), "deepseek41/rope"),
+                  upload(deepSeek41RopeFrequencies(layout, true), "deepseek41/rope-yarn")};
   std::vector<float> first(uint64_t{kPrefillRows} * MHC_MIXES, 0.0F);
   for (uint32_t row = 0; row < kPrefillRows; ++row) first[uint64_t{row} * MHC_MIXES] = 1.0F;
   firstMixes_ = upload(first, "deepseek41/first-mixes");
@@ -502,11 +478,13 @@ void DeepSeek41Target::addAttention(metal::CommandGraph &graph, const Scratch &s
     ops::LatentRotation::add(graph, s.q, false, layer.queryNorm.buffer, freqs, positions, s.qRotated,
                              {heads, kLatent, pairs, false, ops::LatentRounding::None, false, 0.0F}, n);
     for (const Rows &sequence : sequences) {
-      // A verify attends a lane's anchor alone, the one row it retains: the
-      // rows after it repeat it, and no row it reads is theirs (positions
-      // past its own).
+      // Without a draft a verify attends a lane's anchor alone, the one row
+      // it retains: the rows after it repeat it, and no row it reads is
+      // theirs (positions past its own).
       const uint32_t first = std::max(sequence.rowBegin, begin);
-      const uint32_t end = decode ? first + 1 : std::min(sequence.rowBegin + sequence.rows, begin + n);
+      const uint32_t end = decode && !geometry_.captureLayerCount
+                               ? first + 1
+                               : std::min(sequence.rowBegin + sequence.rows, begin + n);
       if (first >= end) continue;
       const uint32_t count = end - first, at = first - begin;
       // A row reads the groups of its KV source its last indexer selected,
@@ -520,7 +498,9 @@ void DeepSeek41Target::addAttention(metal::CommandGraph &graph, const Scratch &s
       const metal::MetalBuffer rowPositions = rowsOf<uint32_t>(s.positions, first, count, 1);
       ops::LatentAttention::addKeys(
           graph, rowPositions, groups ? rowsOf<uint32_t>(s.selected, first, count, topK) : rowPositions, keyIndices,
-          keyCounts, {window, window, sequence.committed, groups ? ratioOf(source) : 0}, selectedStride, keyStride,
+          keyCounts,
+          {window, window, sequence.committed, groups ? ratioOf(source) : 0, sequence.verifyRows, sequence.lane},
+          selectedStride, keyStride,
           count);
       ops::LatentAttention::add(
           graph, rowsOf<uint16_t>(s.qRotated, at, count, width),
@@ -551,6 +531,16 @@ void DeepSeek41Target::addAttention(metal::CommandGraph &graph, const Scratch &s
                                             sequence.committed, capture.row, window);
     }
   ops::ManifoldHyperConnection::addPost(graph, s.streams, s.branch, s.attentionMixes, mhc_, rows);
+}
+
+void DeepSeek41Target::addStreamCapture(metal::CommandGraph &graph, const metal::MetalBuffer &streams, uint32_t slot,
+                                        const metal::MetalBuffer &captured, uint32_t destinationRow,
+                                        uint32_t rows) const {
+  const uint32_t width = geometry_.capturedHiddenSize();
+  if (slot >= geometry_.captureLayerCount)
+    throw std::logic_error("DeepSeek-V4.1 capture slot past the captured hidden rows");
+  ops::ManifoldHyperConnection::addStreamMean(graph, streams, rowsOf<uint16_t>(captured, destinationRow, rows, width),
+                                              width, slot * weights_.layout.hiddenSize, mhc_, rows);
 }
 
 std::vector<metal::MetalBuffer> DeepSeek41Target::addPrefill(metal::CommandGraph &graph,
@@ -640,6 +630,15 @@ std::vector<metal::MetalBuffer> DeepSeek41Target::addPrefill(metal::CommandGraph
       if (layer.engram)
         addEngram(graph, s, chunk.buffers.linearScratch, false, 0, index, chunk.rows,
                   engramLayers * chunk.rows * perToken);
+      if (const auto slot = geometry_.captureSlot(index))
+        for (const QwenTargetPrefillSequence &sequence : chunk.sequences)
+          for (uint32_t i = 0; i < sequence.captureCount; ++i) {
+            const QwenTargetPrefillCapture &capture = sequence.captures[i];
+            addStreamCapture(graph,
+                             rowsOf<float>(s.streams, capture.sourceStart, capture.rows,
+                                           MHC_STREAMS * layout.hiddenSize),
+                             *slot, chunk.buffers.captured, capture.destinationStart, capture.rows);
+          }
       addAttention(graph, s, chunk.buffers.linearScratch, false, 0, index, sequences[c], chunk.rows,
                    chunk.buffers.normalized, index ? s.ffnMixes : firstMixes_, kvLayers);
       ops::ManifoldHyperConnection::addMix(graph, s.streams, layer.ffnMix.fn, layer.ffnMix.scale, layer.ffnMix.base,
@@ -753,6 +752,8 @@ void DeepSeek41Target::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuf
                .lane = lane,
                .pageTable = buffers.pageTables[lane],
                .stateIn = buffers.auxiliary[lane]};
+    // With a draft, a lane's rows past those it verifies attend nothing.
+    if (geometry_.captureLayerCount) lanes.verifyRows = buffers.verifyRows;
     for (uint32_t row = 0; row < kVerifyRows; ++row) positions[lane * kVerifyRows + row] = committed + row;
     for (uint32_t ratio = 1; ratio <= 2; ++ratio) {
       lanes.groupPositions[ratio == 2 ? 0 : 1] =
@@ -769,6 +770,8 @@ void DeepSeek41Target::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuf
     if (layer.engram)
       addEngram(graph, s, buffers.linearScratch, true, lanes, index, rows,
                 engramLayers * rows * (d_.engramNgram - 1) * d_.engramHeads);
+    if (const auto slot = geometry_.captureSlot(index))
+      addStreamCapture(graph, s.streams, *slot, buffers.capturedTargetHidden, 0, rows);
     addAttention(graph, s, buffers.linearScratch, true, lanes, index, sequences, rows, buffers.normalized,
                  index ? s.ffnMixes : firstMixes_, kvLayers);
     ops::ManifoldHyperConnection::addMix(graph, s.streams, layer.ffnMix.fn, layer.ffnMix.scale, layer.ffnMix.base,

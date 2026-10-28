@@ -4,7 +4,9 @@
 #include "model/QwenTargetLoader.hpp"
 #include "model/WeightSource.hpp"
 
+#include <algorithm>
 #include <bit>
+#include <cmath>
 #include <memory>
 #include <string>
 
@@ -80,6 +82,28 @@ DeepSeek41LayerWeights readDeepSeek41Layer(WeightFile &file, const BlockTargetFo
   layer.ffn = readMoeBlock(file, layout, experts, index);
   return layer;
 }
+
+std::vector<float> deepSeek41RopeFrequencies(const DeepSeek41Layout &layout, bool compressed) {
+  const DeepSeek41Dimensions &d = layout.deepseek;
+  const uint32_t dim = 2 * layout.rotaryPairs;
+  const float base = compressed ? d.compressRopeTheta : layout.rotaryTheta;
+  std::vector<float> freqs(dim / 2);
+  for (uint32_t i = 0; i < dim / 2; ++i) freqs[i] = 1.0F / std::pow(base, float(2 * i) / float(dim));
+  if (!compressed) return freqs;
+  const double original = d.yarnOriginalContextTokens, factor = d.yarnFactor;
+  const auto corrected = [&](double rotations) {
+    return dim * std::log(original / (rotations * 2 * M_PI)) / (2 * std::log(double(base)));
+  };
+  const double low = std::max(std::floor(corrected(d.yarnBetaFast)), 0.0);
+  const double high = std::min(std::ceil(corrected(d.yarnBetaSlow)), double(dim - 1));
+  for (uint32_t i = 0; i < dim / 2; ++i) {
+    const float ramp = float(std::clamp((double(i) - low) / std::max(high - low, 1e-3), 0.0, 1.0));
+    const float smooth = 1.0F - ramp;
+    freqs[i] = freqs[i] / float(factor) * (1.0F - smooth) + freqs[i] * smooth;
+  }
+  return freqs;
+}
+
 
 void requireDeepSeek41Layout(const DeepSeek41Layout &layout) {
   const DeepSeek41Dimensions &d = layout.deepseek;

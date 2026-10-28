@@ -105,6 +105,12 @@ private:
   // it, by its index among them, and its ratio.
   [[nodiscard]] uint32_t sourceOf(uint32_t index) const;
   [[nodiscard]] uint32_t ratioOf(uint32_t source) const;
+  // The mean of the four streams of `rows` rows (`streams`, from the first
+  // row of the capture on), into capture slot `slot` of the captured hidden
+  // rows from row `destinationRow`: what DSpark reads at the input of each
+  // of its target layers.
+  void addStreamCapture(metal::CommandGraph &graph, const metal::MetalBuffer &streams, uint32_t slot,
+                        const metal::MetalBuffer &captured, uint32_t destinationRow, uint32_t rows) const;
   // A sequence's state: layer `layer`'s ring, and paired source `paired`'s
   // open group.
   [[nodiscard]] metal::MetalBuffer ring(const metal::MetalBuffer &state, uint32_t layer) const;

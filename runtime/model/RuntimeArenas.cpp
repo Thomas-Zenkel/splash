@@ -123,7 +123,8 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   // prefill plan, the draft's context projections' too where it has one.
   const auto &draft = geometry.draft;
   std::vector<ops::ProjectionShape> prefillProjections = geometry.target.prefillProjections;
-  if (draft.present()) {
+  // DSpark's projections run on scratch of its own (DSparkDraft).
+  if (draft.dflash()) {
     prefillProjections.push_back({draft.hiddenSize, draft.targetHiddenSize()});
     prefillProjections.push_back({draft.contextKvSize(), draft.hiddenSize});
   }
@@ -186,10 +187,10 @@ std::array<uint64_t, decodeTensorCount>
 decodeTensorBytes(const RuntimeGeometry &geometry,
                   const ops::ExecutionPlans &operators) {
   std::array<uint64_t, decodeTensorCount> result{};
-  // A model without a draft has no draft attention, nor its scratch.
+  // A model without a DFlash2 draft has no draft attention, nor its scratch.
   const ops::DraftAttentionWorkspace draftWorkspace =
-      geometry.draft.present() ? operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape())
-                               : ops::DraftAttentionWorkspace{};
+      geometry.draft.dflash() ? operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape())
+                              : ops::DraftAttentionWorkspace{};
   const auto samplingWorkspace = ops::Sampling::workspace(kDecodeRows);
   const auto selectorWorkspace = ops::DraftSelector::workspace(kDraftProposalTokens);
   auto put = [&](DecodeTensor tensor, uint64_t bytes) {
@@ -352,7 +353,8 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   ops::LinearScratchSize result;
   // Includes the vocabulary head shared with the draft.
   for (const auto &p : geometry.target.decodeProjections) result.include(operators.linear().decodeScratchSize(p));
-  if (!d.present())
+  // DSpark's projections run on scratch of its own (DSparkDraft).
+  if (!d.dflash())
     return result;
   for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
        {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
