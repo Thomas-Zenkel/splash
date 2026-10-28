@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from server.chat_format import FLINT, QWEN, ChatFormat
+from server.chat_format import DEEPSEEK, FLINT, QWEN, ChatFormat
 
 
 @dataclass(frozen=True)
@@ -21,8 +21,8 @@ class ModelFamily:
     # The repository of the DFlash2 draft released for the family, as its
     # release publishes it (config.json and BF16 safetensors). Installations
     # follow its default branch as they follow the target's. None while no
-    # draft is released for the family: an installation names one with
-    # --draft-model.
+    # draft is released for the family: an installation decodes without one
+    # unless --draft-model names one.
     draft_repo: str | None
     # How the family's model reasons and calls tools, and the tokens it
     # shares with the engine (server/chat_format.py).
@@ -42,6 +42,8 @@ FAMILIES = (
     ModelFamily("Qwen3.8-Flash-Next", "incoai/Qwen3.8-Flash-Next-DFlash2", QWEN),
     # It has no vision tower.
     ModelFamily("Flint", "incoai/Flint-DFlash2", FLINT, vision=False),
+    # No draft is released for it, and Splash serves its text alone.
+    ModelFamily("DeepSeek-V4.1-Flash", None, DEEPSEEK, vision=False),
 )
 
 

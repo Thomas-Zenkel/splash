@@ -1,21 +1,24 @@
-// Streamed experts (model::ExpertStore) at four MoE shapes in turn, a small
-// one, the 35B's routing, Qwen3.8-Flash-Next's and Flint's: routed experts read from a
+// Streamed experts (model::ExpertStore) at five MoE shapes in turn, a small
+// one, the 35B's routing, Qwen3.8-Flash-Next's, Flint's and DeepSeek-V4.1's
+// (whose decode steps predict the next block's routes with its router's
+// selection bias): routed experts read from a
 // file into an arena of one block's experts and three more, which two blocks
 // share, run decode steps and prefill chunks bitwise as the resident experts
 // do, their slots holding the reference repack's planes, in as many rounds as
 // the staging needs, and read ahead the next round's experts or the next
 // block's a long chunk routes or a decode step predicts; a decode step's
 // experts outlive long chunks of other blocks; the union of a block's steps
-// loads at once; a size of one block holds every expert, through a release
-// and a restore; long chunks load in rounds through half the staging, also
+// loads at once; blocks of other formats share the slots of the widest
+// expert's size, through a release and a restore; long chunks load in rounds
+// through half the staging, also
 // across a release while the next block's experts are read ahead; a read
 // ahead that fails fails no load that does not route its expert, a read of a
 // routed expert that fails fails the load, and a source written since it was
 // opened fails the load's command, which the store reports; a command buffer
 // that fails before a load's first round fails its command with its own error
 // alone, the load's later rounds not run; memory one byte short of a block's
-// slots is refused; and a size whose slots would take more than the largest
-// buffer keeps its blocks in arenas that fit.
+// slots is refused; and blocks whose arena would take more than the largest
+// buffer share arenas that fit.
 #include "MoeFixture.hpp"
 #include "TestAdmission.hpp"
 #include "TestChecks.hpp"
@@ -74,9 +77,12 @@ using namespace moe_fixture;
 
 // The shapes the store runs at: 16 experts, top 4, hidden 1024, 512 wide; the
 // 35B's 256 experts, top 8, at hidden 256 and 512 wide; Qwen3.8-Flash-Next's
-// 512 experts, top 10, hidden 256, 640 wide; and Flint's 256 experts, top 6
-// by a sigmoid router, 512 wide, with a shared expert of two ungated slices,
-// at hidden 256.
+// 512 experts, top 10, hidden 256, 640 wide; Flint's 256 experts, top 6 by a
+// sigmoid router, 512 wide, with a shared expert of two ungated slices, at
+// hidden 256; and DeepSeek-V4.1's 384 experts, top 6 by a biased
+// sqrt-softplus router (whose bias a decode step's prediction of the next
+// block's routes reads), with an ungated shared expert, at hidden 256 and 512
+// wide.
 constexpr MoeShape kShapes[] = {{1024, 16, 4, 512},
                                 {256, 256, 8, 512},
                                 {256, 512, 10, 640},
@@ -86,6 +92,15 @@ constexpr MoeShape kShapes[] = {{1024, 16, 4, 512},
                                  .expertIntermediateSize = 512,
                                  .router = splash::ops::MoeRouter::SigmoidNormalized,
                                  .sharedSlices = 2,
+                                 .sharedGate = false},
+                                {.hiddenSize = 256,
+                                 .experts = 384,
+                                 .expertsPerToken = 6,
+                                 .expertIntermediateSize = 512,
+                                 .router = splash::ops::MoeRouter::SqrtSoftplusNormalized,
+                                 .routeScale = 1.5f,
+                                 .swigluLimit = 10.0f,
+                                 .sharedSlices = 1,
                                  .sharedGate = false}};
 
 // Memory a store gets past the slots a test asks for, less than any slot
@@ -134,18 +149,20 @@ struct ExpertFile {
   StreamedBlocks blocks;
 };
 
-// The arena bytes of `slots` experts of the model's formats, each plane in a
-// region of its own (model/ExpertStore.cpp).
-uint64_t arenaBytes(const Model &m, uint64_t slots) {
+// The bytes of a slot of the model's experts: every plane of an expert in
+// turn, each from a multiple of 256 bytes (model/ExpertStore.cpp).
+uint64_t slotBytes(const Model &m) {
   uint64_t bytes = 0;
   for (size_t p = 0; p < 3; ++p) {
     const splash::model::GgufPlaneBytes planes = splash::model::ggufPlaneBytes(
         kQuantFormats[m.formats[p]], m.routed[p].rows / m.shape.experts, m.routed[p].columns);
-    for (const uint64_t plane : {planes.plane0, planes.plane1, planes.meta})
-      bytes += splash::model::alignWeightOffset(slots * plane);
+    for (const uint64_t plane : {planes.plane0, planes.plane1, planes.meta}) bytes += (plane + 255) / 256 * 256;
   }
   return bytes;
 }
+
+// The arena bytes of `slots` experts of the model's formats.
+uint64_t arenaBytes(const Model &m, uint64_t slots) { return slots * slotBytes(m); }
 
 // The readers every store of the test reads on.
 const std::shared_ptr<splash::model::SsdReaders> &readers() {
@@ -215,9 +232,12 @@ bool slotsHoldTheirExperts(const Model &m, const BlockMoeWeights &streamed, cons
       const std::pair<const MetalBuffer *, const MetalBuffer *> pairs[] = {
           {&slots.plane0, &experts.plane0}, {&slots.plane1, &experts.plane1}, {&slots.meta, &experts.meta}};
       const uint64_t bytes[] = {planes.plane0, planes.plane1, planes.meta};
+      // A store's slots are routedSlotBytes apart in every plane.
+      const uint64_t stride = streamed.routedSlotBytes;
       for (size_t plane = 0; plane < 3; ++plane) {
         if (!bytes[plane]) continue;
-        const auto *got = static_cast<const uint8_t *>(pairs[plane].first->contents()) + table[expert] * bytes[plane];
+        const auto *got = static_cast<const uint8_t *>(pairs[plane].first->contents()) +
+                          table[expert] * (stride ? stride : bytes[plane]);
         const auto *want = static_cast<const uint8_t *>(pairs[plane].second->contents()) + expert * bytes[plane];
         if (std::memcmp(got, want, bytes[plane])) return false;
       }
@@ -543,27 +563,29 @@ int streamedFaultBeforeRound(const std::string &metallibPath, const MoeShape &sh
   return 0;
 }
 
-// A size of one block in a format of its own (a layer a dynamic quantization
-// gave other formats) holds every one of its experts: the store reads them
-// when it is built and again when it is restored, and that block's steps
-// load nothing (no host step, no read), while each load of the streamed size
-// runs its rounds. Each step gives the resident experts' bits.
-int streamedLoneBlockSize(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
+// Blocks whose experts take other formats (a layer a dynamic quantization
+// gave formats of its own) share one arena of slots of the widest expert's
+// size: the trunk's two blocks in Q4_K and the head's block in Q8_0 all
+// stream through its slots, each step bitwise the resident experts', the
+// head's too, before and after a release and a restore, after which no
+// expert is resident; each load runs its rounds.
+int streamedMixedLayouts(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
   const Model trunk = makeModel(backend, shape, Q4K, true), head = makeModel(backend, shape, Q80, true);
   ExpertFile trunkFile(trunk, directory / "trunk.bin"), headFile(head, directory / "head.bin");
   StreamedBlocks blocks = trunkFile.blocks;
   blocks.blocks.push_back(headFile.blocks.blocks.front());
   blocks.checks.push_back(headFile.blocks.checks.front());
-  const uint64_t trunkSlots = shape.experts + 3;
-  ExpertStore store(backend, blocks, shape,
-                    storeOptions(arenaBytes(trunk, trunkSlots) + arenaBytes(head, shape.experts) + kSpareBytes,
-                                 blocks, shape));
-  require(store.stats().slots == trunkSlots + shape.experts && store.stats().resident == shape.experts,
-          "a size of one block holds another number of slots, or not every expert of its block");
+  const uint64_t slots = shape.experts + 3, width = std::max(slotBytes(trunk), slotBytes(head));
+  ExpertStore store(backend, blocks, shape, storeOptions(slots * width + kSpareBytes, blocks, shape));
+  require(store.stats().slots == slots && store.stats().resident == 0,
+          "blocks of other formats hold another number of slots, or some expert before any load");
   std::array<BlockMoeWeights, 3> streamed{trunk.weights, trunk.weights, head.weights};
   for (uint32_t block = 0; block < 3; ++block) store.bind(block, streamed[block]);
-  require(streamed[0].stream && streamed[1].stream && !streamed[2].stream,
-          "a block of a size of one block streams, or a streamed block does not");
+  // Gate plane0 starts every slot: one arena holds them all.
+  require(streamed[0].stream && streamed[1].stream && streamed[2].stream &&
+              streamed[0].gate.routed.plane0.contents() == streamed[2].gate.routed.plane0.contents() &&
+              streamed[2].routedSlotBytes == width,
+          "a block of another format streams apart from the others, or in slots of another size");
   const MoePlan chunk = prefillPlan(shape, kMaximumRows);
   const MoePlan decode = MoE::decodePlan(shape, 1, MoeConfig{});
   int failures = 0;
@@ -576,8 +598,8 @@ int streamedLoneBlockSize(MetalBackend &backend, const MoeShape &shape, const st
   for (const Step &step : steps) {
     if (step.restores) {
       store.release();
-      require(store.restore(splash::test::admitAll) && store.stats().resident == shape.experts,
-              "a restored store does not hold every expert of a size of one block");
+      require(store.restore(splash::test::admitAll) && store.stats().resident == 0,
+              "a restored store holds experts before any load");
     }
     const Model &m = step.block == 2 ? head : trunk;
     Buffers b;
@@ -586,23 +608,17 @@ int streamedLoneBlockSize(MetalBackend &backend, const MoeShape &shape, const st
     const ExpertStoreStats before = store.stats();
     const std::vector<uint16_t> got = runWeights(backend, streamed[step.block], b, *step.plan);
     const ExpertStoreStats after = store.stats();
-    uint64_t hostSteps = 0, read = 0;
-    for (size_t use = 0; use < 2; ++use) {
-      hostSteps += after.uses[use].pickup.count - before.uses[use].pickup.count;
-      read += after.uses[use].read - before.uses[use].read;
-    }
+    uint64_t hostSteps = 0;
+    for (size_t use = 0; use < 2; ++use) hostSteps += after.uses[use].pickup.count - before.uses[use].pickup.count;
     if (got != want || !slotsHoldTheirExperts(m, streamed[step.block], b, *step.plan) ||
-        hostSteps != (step.block == 2 ? 0 : loadSteps(shape, *step.plan, step.block == 0)) ||
-        (step.block == 2 && read)) {
-      printf("  block %u%s: %llu host steps read %llu experts, or its output or slots differ from the resident "
-             "experts' FAIL\n",
-             step.block, step.restores ? " after a restore" : "", (unsigned long long)hostSteps,
-             (unsigned long long)read);
+        hostSteps != loadSteps(shape, *step.plan, step.block < 2)) {
+      printf("  block %u%s: %llu host steps, or its output or slots differ from the resident experts' FAIL\n",
+             step.block, step.restores ? " after a restore" : "", (unsigned long long)hostSteps);
       ++failures;
     }
   }
-  printf("streamed experts beside a size of one block, which holds every expert and loads none, before and after "
-         "a restore: bitwise the resident experts' %s\n",
+  printf("streamed experts of two formats in slots of the wider one's size, before and after a restore: bitwise the "
+         "resident experts' %s\n",
          failures ? "FAIL" : "ok");
   return failures;
 }
@@ -797,9 +813,9 @@ int streamedRefusal(MetalBackend &backend, const MoeShape &shape, const std::fil
   return 0;
 }
 
-// A streamed size whose slots would take more than the largest buffer
-// (ExpertStoreOptions::bufferBytes) keeps its blocks in arenas that each fit,
-// each recycling its own slots: four blocks of one layout, in memory for two
+// Blocks whose arena would take more than the largest buffer
+// (ExpertStoreOptions::bufferBytes) share arenas of consecutive blocks that
+// each fit, each recycling its own slots: four blocks, in memory for two
 // arenas of a block's experts and three more, under a largest buffer of one,
 // take two arenas of two blocks. Each block's long chunk and decode step give
 // the resident experts' bits.
@@ -900,7 +916,7 @@ int main(int argc, const char *argv[]) {
         failures += streamedExperts(backend, shape, directory.path()) +
                     streamedChunkOrder(backend, shape, directory.path()) +
                     streamedUnionLoads(backend, shape, directory.path()) +
-                    streamedLoneBlockSize(backend, shape, directory.path()) +
+                    streamedMixedLayouts(backend, shape, directory.path()) +
                     streamedRounds(backend, shape, directory.path()) +
                     streamedReadFailures(argv[1], shape, directory.path()) +
                     streamedFaultBeforeRound(argv[1], shape, directory.path()) +

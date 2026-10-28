@@ -60,7 +60,7 @@ in Chat. Anthropic Messages requests reason only when they set `thinking`.
 ## Models
 
 Splash supports these model families, with a matching DFlash2 draft selected
-automatically:
+automatically where the family has one:
 
 | Model | GGUF example | MLX 4-bit |
 | --- | --- | --- |
@@ -69,6 +69,12 @@ automatically:
 | Ornith-1.5-122B | `unsloth/Ornith-1.5-122B-GGUF:UD-Q4_K_XL` | `ornith-ai/Ornith-1.5-122B-MLX-4bit` |
 | Qwen3.8-Flash-Next | `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0` | — |
 | Flint | `unsloth/flint-GGUF:UD-Q4_K_XL` | — |
+| DeepSeek-V4.1-Flash | `ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF:IQ1_M` | — |
+
+DeepSeek-V4.1-Flash has no DFlash2 draft and decodes one token a cycle. Its
+IQ1_M build (120.7 GB) streams its routed experts from the SSD, and its Engram
+tables, a file of their own (110.6 GB) that installs with it, always stream; a
+48 GB Mac serves it at 7–9 tokens per second.
 
 Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats
 up to `UD-Q8_K_XL`, whose BF16 tensors load too. Whole-BF16 and F16 models are

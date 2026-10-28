@@ -21,10 +21,12 @@ struct MoeRouteParams {
   uint32_t input_size;
   uint32_t experts;
   uint32_t top_k;
+  // The factor of the routed experts' weights (ops::MoeShape::routeScale).
+  float route_scale;
 };
 
-static_assert(sizeof(MoeRouteParams) == 16,
-              "MoE routing parameters are 16 bytes on both sides");
+static_assert(sizeof(MoeRouteParams) == 20,
+              "MoE routing parameters are 20 bytes on both sides");
 
 // Every row carries top_k routed experts followed by the slices of the shared
 // expert, ids `experts` on, whose routing weight is the sigmoid of the
@@ -103,24 +105,31 @@ static_assert(sizeof(MoeGatherParams) == 12,
 // A GGUF expert pass (ops/MoE.cpp): the routed experts of the projection are
 // one segment of slots * output_size rows, routed expert e's planes starting
 // at tile slots[e] * output_size / QUANT_TILE_ROWS of it, where slots is the
-// block's slot table (ops::BlockMoeWeights); the shared expert's slices (ids
-// `experts` on) have a segment of their own, slice s's planes from tile
-// s * output_size / QUANT_TILE_ROWS on. Formats are GGUF_FMT_*
-// (metal/abi/QuantFormat.h).
+// block's slot table (ops::BlockMoeWeights); or, with routed_slot_bytes, in
+// slots that far apart, routed expert e's planes from each plane's base plus
+// slots[e] * routed_slot_bytes on (an expert store's, model/ExpertStore.cpp).
+// The shared expert's slices (ids `experts` on) have a segment of their own,
+// slice s's planes from tile s * output_size / QUANT_TILE_ROWS on. Formats
+// are GGUF_FMT_* (metal/abi/QuantFormat.h).
 struct MoeGgufExpertParams {
   uint32_t input_size;
   uint32_t output_size; // per expert
   uint32_t experts;
   uint32_t routed_format;
   uint32_t shared_format;
+  // The up pass's SwiGLU clamp (ops::MoeShape::swigluLimit), 0 for none.
+  float swiglu_limit;
+  // The bytes from a routed expert's slot to the next one's, 0 for planes of
+  // the experts in turn.
+  uint32_t routed_slot_bytes;
 };
 
-static_assert(sizeof(MoeGgufExpertParams) == 20,
-              "MoE GGUF expert parameters are 20 bytes on both sides");
+static_assert(sizeof(MoeGgufExpertParams) == 28,
+              "MoE GGUF expert parameters are 28 bytes on both sides");
 
 // The gate and up passes in one (moe_expert_gguf_m<rows>_gate_up[_mixed]): their
-// sizes and expert count, as MoeGgufExpertParams holds them, and each pass's
-// routed and shared formats.
+// sizes, expert count and routed experts' slots, as MoeGgufExpertParams holds
+// them, and each pass's routed and shared formats.
 struct MoeGgufGateUpParams {
   uint32_t input_size;
   uint32_t output_size; // per expert
@@ -129,10 +138,12 @@ struct MoeGgufGateUpParams {
   uint32_t gate_shared_format;
   uint32_t up_routed_format;
   uint32_t up_shared_format;
+  float swiglu_limit;
+  uint32_t routed_slot_bytes;
 };
 
-static_assert(sizeof(MoeGgufGateUpParams) == 28,
-              "MoE GGUF gate/up parameters are 28 bytes on both sides");
+static_assert(sizeof(MoeGgufGateUpParams) == 36,
+              "MoE GGUF gate/up parameters are 36 bytes on both sides");
 
 // One projection (gate, up or down) of the experts a load writes into their
 // slots (moe_expert_load, model/ExpertStore.cpp): rows x columns in `format`,

@@ -238,20 +238,30 @@ class LocalModelTest(unittest.TestCase):
         ):
             self.prepare(target)
 
-    def test_a_family_without_a_released_draft_needs_a_draft(self):
+    def test_a_family_without_a_released_draft_prepares_without_one(self):
         target = self.gguf(self.root / "model-Q2_0.gguf", FLASH_NEXT)
         unreleased = dataclasses.replace(FLASH_NEXT, draft_repo=None)
         with mock.patch.object(families, "FAMILIES", (unreleased,)):
-            with self.assertRaisesRegex(
-                models.ModelError,
-                "no DFlash2 draft is released for Qwen3.8-Flash-Next; pass the "
-                "directory of one as draft",
-            ):
-                self.prepare(target)
+            alone = self.prepare(target)
             record = assembly.verify(
                 self.prepare(target, draft_dir(self.root / "draft", FLASH_NEXT))
             )
+        self.assertEqual(
+            assembly.verify(alone)["sources"]["draft"],
+            {"repo": models.NO_DRAFT, "revision": None},
+        )
+        self.assertFalse((alone / "draft").exists())
         self.assertEqual(record["family"], FLASH_NEXT.name)
+
+    def test_draft_none_prepares_the_target_alone(self):
+        target = self.gguf(self.root / "model-Q2_0.gguf", FLASH_NEXT)
+        alone = self.prepare(target, models.NO_DRAFT)
+        record = assembly.verify(alone)
+        self.assertEqual(
+            record["sources"]["draft"], {"repo": models.NO_DRAFT, "revision": None}
+        )
+        self.assertFalse((alone / "draft").exists())
+        self.assertNotIn("draft/config.json", record["files"])
 
     def test_an_mlx_target_serves_images_with_its_own_tower(self):
         shards = {

@@ -33,6 +33,9 @@ The paths an assembly links, and what reads each:
   vision/<shard>         the MLX shards holding vision_tower.*
                          (VisionLoader.cpp, through SafetensorsCheckpoint.mm)
   vision/mmproj.gguf     the GGUF vision projector (VisionLoader.cpp)
+  engram/<name>.gguf     a DeepSeek-V4.1 target's Engram tables, the file its
+                         metadata names (gguf.engram_file), apart from the
+                         target's parts
 """
 
 from __future__ import annotations

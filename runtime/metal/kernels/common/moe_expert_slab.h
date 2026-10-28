@@ -56,10 +56,13 @@ inline uint moe_shared_slice(uint id, uint first) { return id - first; }
 // the routed experts of the projection are one segment of slots *
 // output_size rows, so routed expert e's planes start at tile slots[e] *
 // output_size / QUANT_TILE_ROWS (metal/abi/QuantFormat.h), slots being the
-// block's slot table; the Shared slices of the shared expert (ids `experts`
-// on) have a segment of their own, possibly in another format, slice s's
-// planes from tile s * output_size / QUANT_TILE_ROWS on. w1 is the meta
-// plane for formats without a second plane, as the host binds it.
+// block's slot table; or, with slot_bytes, in slots that far apart, every
+// plane of routed expert e from its base plus slots[e] * slot_bytes on (an
+// expert store's, which keeps an expert's planes together in its slot); the
+// Shared slices of the shared expert (ids `experts` on) have a segment of
+// their own, possibly in another format, slice s's planes from tile s *
+// output_size / QUANT_TILE_ROWS on. w1 is the meta plane for formats without
+// a second plane, as the host binds it.
 struct MoeGgufSegment {
   device uchar *w0;
   device uchar *w1;
@@ -76,9 +79,9 @@ inline MoeGgufSegment moe_gguf_planes(constant QuantFormat &f, uint format, devi
 }
 template <uint Shared>
 inline MoeGgufSegment moe_gguf_segment(uint expert, uint experts, uint input_size, uint output_size,
-                                       uint routed_format, uint shared_format, device const uint *slots,
-                                       device uchar *w0, device uchar *w1, device uchar *meta,
-                                       device uchar *shared_w0, device uchar *shared_w1,
+                                       uint routed_format, uint shared_format, uint slot_bytes,
+                                       device const uint *slots, device uchar *w0, device uchar *w1,
+                                       device uchar *meta, device uchar *shared_w0, device uchar *shared_w1,
                                        device uchar *shared_meta) {
   const uint slice = moe_shared_slice(expert, experts);
   if (slice < Shared) {
@@ -86,8 +89,13 @@ inline MoeGgufSegment moe_gguf_segment(uint expert, uint experts, uint input_siz
     return moe_gguf_planes(f, shared_format, shared_w0, shared_w1, shared_meta, ulong(slice) * output_size,
                            input_size / 32);
   }
+  const ulong slot = slots[expert];
+  if (slot_bytes) {
+    const ulong at = slot * slot_bytes;
+    return {w0 + at, w1 + at, meta + at, routed_format};
+  }
   constant QuantFormat &f = kQuantFormats[routed_format];
-  return moe_gguf_planes(f, routed_format, w0, w1, meta, ulong(slots[expert]) * output_size, input_size / 32);
+  return moe_gguf_planes(f, routed_format, w0, w1, meta, slot * output_size, input_size / 32);
 }
 template <uint Shared>
 inline MoeGgufSegment moe_gguf_segment(uint expert, constant MoeGgufExpertParams &p, device const uint *slots,
@@ -95,5 +103,5 @@ inline MoeGgufSegment moe_gguf_segment(uint expert, constant MoeGgufExpertParams
                                        device uchar *shared_w0, device uchar *shared_w1,
                                        device uchar *shared_meta) {
   return moe_gguf_segment<Shared>(expert, p.experts, p.input_size, p.output_size, p.routed_format, p.shared_format,
-                                  slots, w0, w1, meta, shared_w0, shared_w1, shared_meta);
+                                  p.routed_slot_bytes, slots, w0, w1, meta, shared_w0, shared_w1, shared_meta);
 }

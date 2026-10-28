@@ -19,7 +19,11 @@ namespace splash::ops {
 // by the softmax of their scores; SigmoidNormalized, by each one's
 // sigmoid(score) over the sum of theirs plus 1e-20, in fp32. A sigmoid
 // router selects by score as it would by sigmoid(score), which is monotonic.
-enum class MoeRouter : uint8_t { Softmax, SigmoidNormalized };
+// SqrtSoftplusNormalized (DeepSeek-V4.1's) selects by sqrt(softplus(score))
+// plus the block's selection bias (BlockMoeWeights::selectionBias) and weights
+// each expert by its sqrt(softplus(score)) over the sum of theirs plus 1e-20,
+// times MoeShape::routeScale.
+enum class MoeRouter : uint8_t { Softmax, SigmoidNormalized, SqrtSoftplusNormalized };
 
 // The routings the MoE kernels compile (kernels/shared/moe.metal,
 // kernels/shared/moe_gguf.metal, kernels/decode/linear_gguf_sgmatrix.metal):
@@ -39,6 +43,9 @@ inline constexpr std::array kCompiledMoeRoutings{
     // Flint's: a sigmoid router, and an ungated shared expert twice the
     // routed experts' width.
     CompiledMoeRouting{MoeRouter::SigmoidNormalized, 2, false, "_sigmoid_s2", "_s2"},
+    // DeepSeek-V4.1's: a biased sqrt-softplus router, and an ungated shared
+    // expert of the routed experts' width.
+    CompiledMoeRouting{MoeRouter::SqrtSoftplusNormalized, 1, false, "_sqrtsoftplus_s1", ""},
 };
 
 // The shared expert is sharedSlices experts every row visits after its
@@ -59,6 +66,12 @@ struct MoeShape final {
   // (quant_register_tensor).
   bool registerFormats = true;
   MoeRouter router = MoeRouter::Softmax;
+  // The factor of the routed experts' weights (DeepSeek-V4.1's 1.5).
+  float routeScale = 1.0f;
+  // The SwiGLU clamp of every expert, routed and shared: up to [-limit,
+  // limit] and gate to at most limit before silu(gate) * up (DeepSeek-V4.1's
+  // 10); 0 for none.
+  float swigluLimit = 0.0f;
   uint32_t sharedSlices = 1;
   bool sharedGate = true;
   // The format of the router's rows (QuantizedSegment::rows), which picks its
@@ -94,7 +107,8 @@ struct MoeShape final {
 // A GGUF expert projection: the routed experts in one segment of slots * N
 // rows, routed expert e's planes from tile slot(e) * N / QUANT_TILE_ROWS on
 // (moe_gguf_segment in kernels/common/moe_expert_slab.h, slot(e) from the
-// block's slot table), and the shared expert's segment, whose format may
+// block's slot table), or from each plane's base plus slot(e) *
+// BlockMoeWeights::routedSlotBytes on, and the shared expert's segment, whose format may
 // differ, of its sharedSlices slices' N rows each in their order (the rows
 // of slice s of a shared gate or up, rows s * N on; the column window s of a
 // shared down, which a planner lays out so: gguf::TensorRows::windows).
@@ -118,15 +132,22 @@ enum class MoePhase : uint8_t { Prefill, Decode };
 // slotTable[e] (one uint32 per expert): every expert and the identity
 // table when they are all resident, or an expert store's slots and the
 // block's table there when they stream (`stream`, the block's index in it
-// `streamBlock`).
+// `streamBlock`). A plane holds its slots' experts in turn, or, with
+// routedSlotBytes, each slot's expert that many bytes after the slot
+// before's: an expert store's slots of one size, which keep every plane of
+// an expert together, the segments views of them from each plane's place in
+// a slot on.
 struct BlockMoeWeights final {
   QuantizedSegment router;           // [experts][hidden]
   QuantizedSegment sharedScalarGate; // [1][hidden]
+  // A SqrtSoftplusNormalized router's selection bias, F32 [experts].
+  metal::MetalBuffer selectionBias;
   BlockExpertProjection gate;
   BlockExpertProjection up;
   BlockExpertProjection down;
   metal::MetalBuffer slotTable;
   uint32_t slots = 0;
+  uint32_t routedSlotBytes = 0;
   const MoeExpertStream *stream = nullptr;
   uint32_t streamBlock = 0;
 };
@@ -350,11 +371,12 @@ struct MoE final {
   // `sharedScalarGate` (unread without shape.sharedGate): the router's fp32
   // scores in `scores` (rows of shape.routerWidth()), then each row's top-k
   // experts and the shared slices with their routing weights in `selected`
-  // and `routingWeights` (shape.routesPerToken() per row).
+  // and `routingWeights` (shape.routesPerToken() per row). A
+  // SqrtSoftplusNormalized router ranks by `selectionBias` too.
   static void addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input, const QuantizedSegment &router,
                         const QuantizedSegment &sharedScalarGate, const metal::MetalBuffer &scores,
                         const metal::MetalBuffer &selected, const metal::MetalBuffer &routingWeights, uint32_t rows,
-                        MoeShape shape, FloatTile routerTile);
+                        MoeShape shape, FloatTile routerTile, const metal::MetalBuffer &selectionBias = {});
   // A streamed experts' load (MoeExpertStream::addLoad): the gate, up and
   // down projections of up to `jobs` experts, job j's projection z's native
   // rows in `staging` from sources[3j + z] (bytes) on, repacked into the

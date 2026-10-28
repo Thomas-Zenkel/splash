@@ -29,7 +29,8 @@ class QwenStateStorage;
 class SsdReaders;
 class VisionLoader;
 
-using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights, FlintWeights>;
+using TargetWeights =
+    std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights, FlintWeights, DeepSeek41Weights>;
 
 // How a model loads beside its descriptor: with streamedTableBytes, the rows
 // of a table the target's GGUF holds (model/ModelSizing.hpp) stream from its
@@ -57,11 +58,7 @@ struct LoadedModel final {
   [[nodiscard]] const std::string &name() const noexcept {
     return descriptor.name;
   }
-  [[nodiscard]] kv::Layout targetKvLayout(kv::Format format) const noexcept {
-    auto layout = descriptor.targetKvLayout;
-    layout.format = format;
-    return layout;
-  }
+  [[nodiscard]] kv::Layout targetKvLayout(kv::Format format) const noexcept { return descriptor.kvLayout(format); }
   [[nodiscard]] CompositeStateLayout stateLayout(ops::GdnStateFormat format) const noexcept {
     auto layout = descriptor.stateLayout;
     layout.target.format = format;

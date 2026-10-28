@@ -37,7 +37,7 @@ import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
 
-from . import hub, models, paths, upstream
+from . import gguf, hub, models, paths, upstream
 from .models import ModelError
 
 __all__ = ["ModelError", "prepare_local_model"]
@@ -54,11 +54,12 @@ def prepare_local_model(
     tokenizer files and a safetensors checkpoint) or else a single GGUF
     target, whole or split, beside any vision projector named mmproj.
     draft: the directory of a DFlash2 draft (config.json and safetensors
-    weights) trained for the target's family. Without one, the draft
-    released for the family is taken from the Hugging Face cache
-    (HF_HUB_CACHE), at the commit a download of its default branch, such as
-    `hf download REPO`, last recorded there; `splash serve` downloads by
-    commit, which records none.
+    weights) trained for the target's family, or "none" (models.NO_DRAFT)
+    to decode one token a cycle without one, as a family no draft is
+    released for does. Without one, the draft released for the family is
+    taken from the Hugging Face cache (HF_HUB_CACHE), at the commit a
+    download of its default branch, such as `hf download REPO`, last
+    recorded there; `splash serve` downloads by commit, which records none.
     mmproj: a GGUF target's vision projector, a GGUF file, with which it
     serves images; a GGUF target serves text only without one, as one of a
     family without a vision tower (Flint) always does. An MLX target's
@@ -86,7 +87,8 @@ def prepare_local_model(
     its reason; an OSError is a failure of the file system.
     """
     target = _path(target)
-    draft = None if draft is None else _path(draft)
+    if draft is not None and draft != models.NO_DRAFT:
+        draft = _path(draft)
     mmproj = None if mmproj is None else _path(mmproj)
     models_root = Path(models_dir).expanduser().resolve()
     try:
@@ -102,7 +104,7 @@ def _prepare(target, draft, mmproj, language_only, models_root):
             f"{mmproj} is a vision projector, which a model that serves text "
             "only (language_only) does not load"
         )
-    if draft and not draft.is_dir():
+    if draft and draft != models.NO_DRAFT and not draft.is_dir():
         raise ModelError(
             f"draft {draft} is not a directory: a DFlash2 draft is the "
             "directory of its config.json and safetensors weights"
@@ -117,7 +119,9 @@ def _prepare(target, draft, mmproj, language_only, models_root):
     with tempfile.TemporaryDirectory(prefix="splash-target-") as scratch:
         source, inspected = _inspect(target, mmproj, language_only, Path(scratch))
         repo = _draft(inspected.family, draft)
-        files = upstream.draft_files(repo, inspected)
+        files = (
+            {} if repo is upstream.NO_DRAFT else upstream.draft_files(repo, inspected)
+        )
     files |= {path: source.paths[name] for path, name in inspected.files.items()}
     record = upstream.assembly_record(str(target), inspected, source, repo)
     return upstream.publish(models_root, link, record, files)
@@ -149,7 +153,11 @@ def _inspect(target, mmproj, language_only, scratch):
                 raise models.VisionError(
                     f"{error}; pass language_only=True to serve text only"
                 ) from None
-        directory, names = target, _gguf_in(repo.files)
+        # A DeepSeek-V4.1 target's Engram file beside it is no target.
+        directory, names = (
+            target,
+            _gguf_in({n for n in repo.files if not _holds_engram(target, n)}),
+        )
     elif target.is_file():
         if not target.name.endswith(".gguf"):
             raise ModelError(
@@ -159,6 +167,15 @@ def _inspect(target, mmproj, language_only, scratch):
     else:
         raise ModelError("it does not exist")
     files = {name: directory / name for name in names}
+    # A DeepSeek-V4.1 target's Engram file lies beside it (gguf.engram_file),
+    # which upstream.gguf_target screens; a header it cannot read here, it
+    # refuses there.
+    try:
+        engram = gguf.engram_file(gguf.Metadata(directory / names[0]))
+    except (ModelError, OSError):
+        engram = None
+    if engram and (directory / engram).is_file():
+        files[engram] = directory / engram
     projector = None
     if mmproj:
         if mmproj.name in files:
@@ -176,6 +193,19 @@ def _inspect(target, mmproj, language_only, scratch):
             "model, without a vision tower, does not load"
         )
     return repo, inspected
+
+
+def _holds_engram(directory, name):
+    """Whether the file name of directory is a GGUF at its root that holds a
+    DeepSeek-V4.1 target's Engram tables (gguf.ENGRAM_ARCHITECTURE)."""
+    path = directory / name
+    if "/" in name or not name.endswith(".gguf") or not path.is_file():
+        return False
+    try:
+        architecture = gguf.Metadata(path).values.get("general.architecture")
+    except (ModelError, OSError):
+        return False
+    return architecture == gguf.ENGRAM_ARCHITECTURE
 
 
 def _model_of(name):
@@ -244,14 +274,12 @@ def _draft(family, draft):
     """The draft's files: the directory draft, or else, without one, the
     draft released for family at the commit the Hugging Face cache records
     for its default branch, with no request to the Hub
-    (hub.Repository.resolve)."""
+    (hub.Repository.resolve). "none", and a family no draft is released for
+    without one, install none (upstream.NO_DRAFT)."""
+    if draft == models.NO_DRAFT or (not draft and family.draft_repo is None):
+        return upstream.NO_DRAFT
     if draft:
         return hub.Repository.local_directory(draft)
-    if family.draft_repo is None:
-        raise ModelError(
-            f"no DFlash2 draft is released for {family.name}; pass the "
-            "directory of one as draft"
-        )
     try:
         return hub.Repository.resolve(
             family.draft_repo,

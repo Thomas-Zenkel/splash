@@ -6,15 +6,18 @@
 // routed expert through its block's slot table (ops::BlockMoeWeights), so
 // resident and streamed experts run the same kernels.
 //
-// Experts of one size (the formats and shapes of their gate, up and down
-// projections) share an arena of slots, or several, each of some of its
-// blocks, when one would take more than the device's largest buffer. A size
-// of several blocks streams: an arena's slots are recycled across its blocks
-// by adaptive replacement (SlotRecycler), which keeps the experts decode steps
-// route again and again, and recycles a long prefill chunk's loads first. A
-// size of one block (a layer whose experts take formats no other layer's do, as a
-// dynamic quantization leaves some) holds every one of its experts: they are
-// read when the store is built or restored, and nothing loads them again.
+// Every block's experts share one arena of slots of one size, the widest
+// expert's: a slot holds every plane of an expert's gate, up and down
+// projections, whatever formats its layer takes (a dynamic quantization
+// mixes them by layer), and the kernels read a slot's expert at the slot
+// times that size (ops::BlockMoeWeights::routedSlotBytes). When one arena
+// would take more than the device's largest buffer, consecutive blocks
+// share an arena each. An arena of several blocks streams: its slots are
+// recycled across its blocks by adaptive replacement (SlotRecycler), which
+// keeps the experts decode steps route again and again, and recycles a long
+// prefill chunk's loads first. An arena of one block (a target of one MoE
+// layer) holds every one of its experts: they are read when the store is
+// built or restored, and nothing loads them again.
 //
 // A streamed block's load runs after its steps' grouping (ops::
 // MoeExpertStream), in rounds: each a host step of the command, which claims
@@ -47,7 +50,7 @@
 //
 // The arena and the staging are memory the engine gives back while idle
 // (model::WeightMemory): released, every slot is free; a restore reads the
-// experts of the sizes of one block again, and the loads after it every
+// experts of an arena of one block again, and the loads after it every
 // expert they route.
 //
 // Reads run on the engine's SSD readers (model::SsdReaders), which try a
@@ -94,7 +97,8 @@ struct StreamedBlocks final {
 struct ExpertStoreOptions final {
   // Every byte the store allocates (--expert-memory): its staging and tables
   // (ExpertStore::fixedBytes), and in the rest the arenas' slots, which hold
-  // at least a block's experts of each size and all of a size of one block.
+  // at least a block's experts in each arena and all of an arena of one
+  // block.
   uint64_t memoryBytes = 0;
   // The readers its reads run on: the engine's one pool, which the other
   // streamed weights and KV reads share.
@@ -107,24 +111,26 @@ struct ExpertStoreOptions final {
 class ExpertStore final : public ops::MoeExpertStream, public WeightMemory {
 public:
   // Allocates the arenas, the staging and the slot tables, and reads the
-  // experts of the sizes of one block. Throws std::invalid_argument when a
+  // experts of an arena of one block. Throws std::invalid_argument when a
   // block's experts differ from `shape`, or when options.memoryBytes, less
   // the staging and tables (fixedBytes), holds fewer slots than a block's
-  // experts of each streamed size and every expert of a size of one block.
+  // experts in each arena.
   ExpertStore(metal::MetalBackend &backend, StreamedBlocks blocks, ops::MoeShape shape, ExpertStoreOptions options);
   ~ExpertStore() override;
   ExpertStore(const ExpertStore &) = delete;
   ExpertStore &operator=(const ExpertStore &) = delete;
 
-  // Block `block`'s routed segments (views of its size's arena) and slot
-  // table, which `weights` reads them through, and, when its experts stream,
-  // the store, which loads them; the store keeps the block's router and
-  // shared-expert gate, set before, which predict its routes.
+  // Block `block`'s routed segments (views of its arena from each plane's
+  // place in a slot on, its slots routedSlotBytes apart) and slot table,
+  // which `weights` reads them through, and, when its experts stream,
+  // the store, which loads them; the store keeps the block's router,
+  // shared-expert gate and selection bias, set before, which predict its
+  // routes.
   void bind(uint32_t block, ops::BlockMoeWeights &weights);
   void addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLoadPart> parts, uint32_t block) const override;
   [[nodiscard]] ExpertStoreStats stats() const;
   // The arena and the staging, while no command is in flight; restore()
-  // takes both back in one part and reads the experts of the sizes of one
+  // takes both back in one part and reads the experts of an arena of one
   // block again.
   [[nodiscard]] bool released() const noexcept override;
   void release() override;
@@ -133,9 +139,8 @@ public:
   // staging, slot tables, jobs and the decode prediction's buffers.
   [[nodiscard]] static uint64_t fixedBytes(const StreamedBlocks &blocks, ops::MoeShape shape);
   // The smallest store of these blocks (ExpertStoreOptions::memoryBytes),
-  // which the constructor refuses a byte less than: its fixed bytes, a
-  // block's experts of each streamed size and every expert of a size of one
-  // block.
+  // which the constructor refuses a byte less than: its fixed bytes and a
+  // block's experts in slots of the widest expert's size.
   [[nodiscard]] static uint64_t minimumBytes(const StreamedBlocks &blocks, ops::MoeShape shape);
 
 private:

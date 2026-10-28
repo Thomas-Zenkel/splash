@@ -1,0 +1,690 @@
+"""DeepSeek-V4.1-Flash's chat format: its calls in DSML, one block of them
+after the text, read, constrained and rendered as Qwen's and Flint's calls
+are; its embedded template, which renders DeepSeek's own encoding cases;
+and a generation prompt that opens or closes the think block by the
+request's reasoning."""
+
+import json
+import unittest
+from dataclasses import replace
+from pathlib import Path
+
+from llguidance import LLMatcher
+from tokenizers import (
+    AddedToken,
+    Regex,
+    Tokenizer,
+    decoders,
+    models,
+    pre_tokenizers,
+    processors,
+    trainers,
+)
+from transformers import PreTrainedTokenizerFast
+
+from dev.tests import server_fixtures as fixtures
+from dev.tests.tool_output import project, put, streamed_text, tool_policy
+from server import constraints, tool_schema
+from server import output as model_output
+from server.chat_format import DEEPSEEK, DEEPSEEK_DSML, DSML
+from server.chat_templates import (
+    NATIVE,
+    ChatTemplates,
+    render_chat_template,
+    template_options,
+)
+from server.serve_options import REASONING_EFFORTS
+from server.tokenization import PromptTokenizer
+
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures/chat_templates"
+TEMPLATE = (FIXTURES / "deepseek41.jinja").read_text()
+# DeepSeek's control tokens, special in its GGUF, and the tags its template
+# writes in text, added tokens that are not special.
+SPECIAL = (
+    "<｜begin▁of▁sentence｜>",
+    "<｜end▁of▁sentence｜>",
+    "<｜System｜>",
+    "<｜User｜>",
+    "<｜Assistant｜>",
+    "<｜latest_reminder｜>",
+)
+TAGS = ("<think>", "</think>", DSML)
+SCHEMAS = {
+    "weather": {
+        "type": "object",
+        "properties": {
+            "city": {"type": "string"},
+            "days": {"type": "integer"},
+            "units": {"enum": ["metric", "imperial"]},
+            "detail": {"type": "object"},
+            "note": {},
+        },
+        "required": ["city"],
+    },
+    "time": {"type": "object", "properties": {}},
+}
+# The reasoning effort each of Splash's efforts renders as, through the
+# aliases of those DeepSeek's template does not know.
+BUDGETS = {"minimal": 50, "low": 50, "medium": 75, "high": 75, "xhigh": 100, "max": 100}
+
+
+def deepseek_tokenizer():
+    """A byte-level BPE tokenizer with DeepSeek's added tokens, each kind as
+    its GGUF adds it, and its embedded chat template."""
+    backend = Tokenizer(models.BPE())
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    backend.train_from_iterator(
+        ["Paris weather in metric units\n"],
+        trainers.BpeTrainer(
+            vocab_size=300,
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+            show_progress=False,
+        ),
+    )
+    backend.add_special_tokens([AddedToken(text, normalized=False) for text in SPECIAL])
+    backend.add_tokens([AddedToken(text, normalized=False) for text in TAGS])
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, bos_token=SPECIAL[0], eos_token=SPECIAL[1]
+    )
+    tokenizer.chat_template = TEMPLATE
+    return tokenizer
+
+
+def deepseek_format(tokenizer):
+    """DeepSeek's chat format over `tokenizer`'s token IDs."""
+    ids = tokenizer.convert_tokens_to_ids
+    return replace(
+        DEEPSEEK,
+        vocabulary=len(tokenizer),
+        stop_tokens=tuple((text, ids(text)) for text, _ in DEEPSEEK.stop_tokens),
+        think_end_id=ids("</think>"),
+        call_open_id=ids(DSML),
+    )
+
+
+def _text(value):
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+
+
+def qwen_call(name, arguments):
+    """A call as Qwen's template writes it."""
+    return (
+        f"<tool_call>\n<function={name}>\n"
+        + "".join(
+            f"<parameter={key}>\n{_text(value)}\n</parameter>\n"
+            for key, value in arguments.items()
+        )
+        + "</function>\n</tool_call>"
+    )
+
+
+def dsml_call(name, arguments):
+    """A call as DeepSeek's template writes it: each value a string as its
+    text, marked so, and any other as JSON."""
+    parameters = "\n".join(
+        f'<{DSML} parameter name="{key}" '
+        f'string="{"true" if isinstance(value, str) else "false"}">'
+        f"{_text(value)}</{DSML} parameter>"
+        for key, value in arguments.items()
+    )
+    return f'<{DSML} invoke name="{name}">\n{parameters}\n</{DSML} invoke>'
+
+
+def dsml_calls(*calls):
+    """The block DeepSeek's template writes a turn's calls in, after its
+    text: each call a (name, arguments) pair."""
+    return (
+        f"\n\n<{DSML} calls>\n"
+        + "\n".join(dsml_call(*call) for call in calls)
+        + f"\n</{DSML} calls>"
+    )
+
+
+class DsmlReadingTests(unittest.TestCase):
+    """DeepSeek's calls read as Qwen's read: the same content and calls from
+    the same calls in either layout, however the output is cut into pieces,
+    without the space that frames DeepSeek's block."""
+
+    def assert_reads_alike(self, text, *calls):
+        policy = tool_policy(SCHEMAS)
+        expected = project(
+            text + "".join(qwen_call(*call) for call in calls), policy, "x"
+        )[:2]
+        for size in (None, *range(1, 12)):
+            with self.subTest(size=size):
+                content, read, events = project(
+                    text + dsml_calls(*calls),
+                    policy,
+                    "x",
+                    size=size,
+                    syntax=DEEPSEEK_DSML,
+                )
+                self.assertEqual((content, read), expected)
+                self.assertEqual(streamed_text(events), content)
+        return expected
+
+    def test_values_convert_by_the_types_their_tool_declares(self):
+        content, calls = self.assert_reads_alike(
+            "Let me check.",
+            (
+                "weather",
+                {"city": "São Paulo", "days": 3, "units": "metric", "detail": {}},
+            ),
+        )
+        self.assertEqual(content, "Let me check.")
+        self.assertEqual(
+            calls[0]["function"]["arguments"],
+            '{"city":"São Paulo","days":3,"units":"metric","detail":{}}',
+        )
+
+    def test_parallel_calls_share_one_block(self):
+        content, calls = self.assert_reads_alike(
+            "", ("weather", {"city": "Paris"}), ("time", {}), ("time", {})
+        )
+        self.assertEqual(content, "")
+        self.assertEqual(
+            [call["function"]["arguments"] for call in calls],
+            ['{"city":"Paris"}', "{}", "{}"],
+        )
+
+    def test_a_value_marked_as_json_reads_as_it_where_its_schema_gives_no_type(self):
+        # A declared type decides how a value reads, whatever its mark; the
+        # mark decides it where the schema gives none.
+        text = (
+            f'<{DSML} calls>\n<{DSML} invoke name="weather">\n'
+            f'<{DSML} parameter name="days" string="true">3</{DSML} parameter>\n'
+            f'<{DSML} parameter name="note" string="false">{{"a": [1]}}'
+            f"</{DSML} parameter>\n"
+            f'<{DSML} parameter name="other" string="true">{{"a": [1]}}'
+            f"</{DSML} parameter>\n"
+            f"</{DSML} invoke>\n</{DSML} calls>"
+        )
+        for size in (None, 3):
+            with self.subTest(size=size):
+                _, calls, _ = project(
+                    text, tool_policy(SCHEMAS), size=size, syntax=DEEPSEEK_DSML
+                )
+                self.assertEqual(
+                    json.loads(calls[0]["function"]["arguments"]),
+                    {"days": 3, "note": {"a": [1]}, "other": '{"a": [1]}'},
+                )
+
+    def test_the_space_around_the_block_frames_the_calls(self):
+        call = ("time", {})
+        for text in (
+            "Sure." + dsml_calls(call) + "\n",
+            f'Sure.<{DSML} calls><{DSML} invoke name="time"></{DSML} invoke>'
+            f"</{DSML} calls>",
+        ):
+            with self.subTest(text=text):
+                content, calls, events = project(
+                    text, tool_policy(SCHEMAS), syntax=DEEPSEEK_DSML
+                )
+                self.assertEqual((content, streamed_text(events)), ("Sure.", "Sure."))
+                self.assertEqual([c["function"]["name"] for c in calls], ["time"])
+
+    def test_a_cut_call_keeps_the_arguments_it_has(self):
+        text = dsml_calls(("weather", {"city": "Paris", "days": 3}))
+        # From the end of the function's name on.
+        for cut in range(text.index('">\n') + 1, len(text)):
+            with self.subTest(cut=cut):
+                _, calls, _ = project(
+                    text[:cut],
+                    tool_policy(SCHEMAS),
+                    incomplete=True,
+                    syntax=DEEPSEEK_DSML,
+                )
+                self.assertEqual(
+                    [call["function"]["name"] for call in calls], ["weather"]
+                )
+
+    def test_without_tools_a_block_is_text(self):
+        text = "Here:" + dsml_calls(("weather", {"city": "Paris"}))
+        projector = model_output.StreamingToolCallProjector(None, "x")
+        put(projector, text + "</think>")
+        self.assertEqual(projector.finish(False)[:2], (text, []))
+
+
+class DsmlGrammarTests(unittest.TestCase):
+    """DeepSeek's constrained output: its reasoning where the generation
+    prompt opened it, then its text and one block of calls, compiled over a
+    tokenizer that adds DeepSeek's tokens as its GGUF does."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tokenizer = deepseek_tokenizer()
+        cls.chat_format = deepseek_format(cls.tokenizer)
+        cls.factory = constraints.ConstraintFactory(cls.tokenizer, cls.chat_format)
+
+    def policy(self, choice="auto", parallel=True, strict=False):
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": name, "parameters": schema, "strict": strict},
+            }
+            for name, schema in SCHEMAS.items()
+        ]
+        return tool_schema.normalize_tools(tools, choice, parallel)[1]
+
+    def grammar(self, policy, thinking=False):
+        return tool_schema.tool_grammar(policy, thinking, chat_format=self.chat_format)
+
+    def accepts(self, grammar, text):
+        matcher = self.factory.create(grammar).matcher
+        tokens = self.tokenizer.encode(text, add_special_tokens=False)
+        return matcher.consume_tokens(tokens) and matcher.is_accepting()
+
+    def assert_accepts(self, grammar, cases):
+        for text, accepted in cases:
+            with self.subTest(text=text):
+                self.assertEqual(self.accepts(grammar, text), accepted)
+
+    def test_the_calls_follow_the_text_in_one_block(self):
+        weather, time = ("weather", {"city": "Paris", "days": 3}), ("time", {})
+        self.assert_accepts(
+            self.grammar(self.policy()),
+            (
+                ("Paris it is.", True),
+                ("Let me <b>check</b>." + dsml_calls(weather), True),
+                (dsml_calls(weather, time, time), True),
+                ("Done." + dsml_calls(time) + "\n", True),
+                ("Done." + dsml_calls(time) + " More text.", False),
+                ("Done." + dsml_calls(time) + dsml_calls(time), False),
+                (f"A stray {DSML} tag.", False),
+                ("Closed again.</think>", False),
+            ),
+        )
+        self.assert_accepts(
+            self.grammar(self.policy(parallel=False)),
+            (
+                ("Check." + dsml_calls(weather), True),
+                ("Check." + dsml_calls(weather, time), False),
+            ),
+        )
+
+    def test_a_required_call_comes_first_after_the_reasoning(self):
+        block = dsml_calls(("weather", {"city": "Paris"}), ("time", {}))
+        self.assert_accepts(
+            self.grammar(self.policy("required"), thinking=True),
+            (
+                ("Paris, then.</think>" + block, True),
+                ("</think>" + block, True),
+                ("No close." + block, False),
+                ("Paris.</think>Sure." + block, False),
+                ("Paris.</think>No call.", False),
+            ),
+        )
+
+    def test_strict_arguments_are_generated_with_their_marks(self):
+        grammar = self.grammar(self.policy("required", strict=True))
+        cases = [
+            ({"city": "Paris", "days": 3, "units": "metric"}, True),
+            ({"city": "Paris", "detail": {}, "note": [1, "a"]}, True),
+            ({"city": "Paris", "note": "text"}, True),
+            ({"city": "Paris", "days": "three"}, False),
+            ({"city": "Paris", "units": "kelvin"}, False),
+            ({"city": "Paris", "detail": {"extra": 1}}, False),
+            ({"days": 3}, False),
+            ({"city": "Paris", "other": 1}, False),
+        ]
+        self.assert_accepts(
+            grammar,
+            [(dsml_calls(("weather", arguments)), ok) for arguments, ok in cases]
+            + [
+                # A number written as text, or a string as JSON.
+                (dsml_calls(("weather", {"city": "Paris", "days": "3"})), False),
+                (
+                    dsml_calls(("weather", {"city": "Paris"})).replace(
+                        'string="true">Paris', 'string="false">"Paris"'
+                    ),
+                    False,
+                ),
+                # The template's empty line where a call has no arguments.
+                (dsml_calls(("time", {})), True),
+            ],
+        )
+
+    def test_what_the_grammar_writes_reads_back_as_written(self):
+        arguments = {"city": "New York", "days": 2, "units": "imperial"}
+        text = "Check.</think>" + dsml_calls(("weather", arguments))
+        self.assertTrue(
+            self.accepts(self.grammar(self.policy("required", strict=True), True), text)
+        )
+        splitter = model_output.ReasoningSplitter(True, True, self.chat_format)
+        parts = splitter.put(text) + splitter.finish()
+        reasoning = "".join(v for kind, v in parts if kind == "reasoning_content")
+        content = "".join(v for kind, v in parts if kind == "content")
+        _, calls, _ = project(content, self.policy(), syntax=DEEPSEEK_DSML)
+        self.assertEqual(reasoning, "Check.")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), arguments)
+
+    def test_free_arguments_take_any_name_text_and_mark(self):
+        grammar = tool_schema._free_arguments(DEEPSEEK_DSML)
+        self.assertFalse(LLMatcher.validate_grammar(grammar, self.factory.tokenizer))
+        matcher = LLMatcher(self.factory.tokenizer, grammar)
+        text = (
+            f'<{DSML} parameter name="a b" string="true">any\ntext</{DSML} parameter>\n'
+            f'<{DSML} parameter name="c" string="false">[1]</{DSML} parameter>\n'
+        )
+        tokens = self.tokenizer.encode(text, add_special_tokens=False)
+        self.assertTrue(matcher.consume_tokens(tokens) and matcher.is_accepting())
+
+    def test_the_grammars_write_dsml_as_text(self):
+        grammars = json.loads(self.grammar(self.policy("required", parallel=False)))
+        main = grammars["grammars"][0]["lark_grammar"]
+        calls_open = json.dumps(f"<{DSML} calls>\n")
+        calls_close = json.dumps(f"</{DSML} calls>")
+        opening = json.dumps(f'<{DSML} invoke name="time">\n')
+        invoke_close = json.dumps(f"</{DSML} invoke>")
+        newline = json.dumps("\n")
+        self.assertIn(
+            f"start: WS {calls_open} (call_0 | call_1) {newline} {calls_close} WS\n",
+            main,
+        )
+        self.assertIn(
+            f"call_1: {opening} @free_arguments {newline}? {invoke_close}\n", main
+        )
+        self.assertIn(
+            "TEXT: /(?s:.*)/ & ~/(?s:.*)(｜DSML｜|<\\/think>)(?s:.*)/\n", main
+        )
+
+
+class DeepSeekTokenizerContractTests(unittest.TestCase):
+    def test_deepseek_s_tokens_are_checked_against_its_format(self):
+        tokenizer = deepseek_tokenizer()
+        chat_format = deepseek_format(tokenizer)
+        constraints.validate_tokenizer(tokenizer, chat_format)
+        for field, text in (("think_end_id", "</think>"), ("call_open_id", DSML)):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(
+                    fixtures.engine_runtime.EngineUnhealthy,
+                    f"tokenizer must encode '{text}' as native token",
+                ):
+                    constraints.validate_tokenizer(
+                        tokenizer,
+                        replace(
+                            chat_format, **{field: getattr(chat_format, field) + 1}
+                        ),
+                    )
+
+    def test_the_real_ids_are_deepseek_s(self):
+        # Those of the GGUF's vocabulary (dev/tests/install/test_gguf_deepseek41.py).
+        self.assertEqual(
+            (
+                DEEPSEEK.vocabulary,
+                DEEPSEEK.stop_tokens,
+                DEEPSEEK.think_start_id,
+                DEEPSEEK.think_end_id,
+                DEEPSEEK.call_open_id,
+            ),
+            (129280, (("<｜end▁of▁sentence｜>", 1),), None, 128822, 128825),
+        )
+        self.assertIs(DEEPSEEK.call_syntax, DEEPSEEK_DSML)
+        self.assertTrue(DEEPSEEK.reasoning_switch)
+        self.assertFalse(DEEPSEEK.calls_end_reasoning)
+
+
+class DeepSeekPromptTests(unittest.TestCase):
+    """DeepSeek's embedded template renders as its reference encoder does,
+    through the options a request passes it, and its generation prompt opens
+    the think block where the request thinks."""
+
+    def frontend(self):
+        tokenizer = deepseek_tokenizer()
+        return fixtures.make_frontend(
+            tokenizer,
+            None,
+            "test-model",
+            8192,
+            10,
+            2,
+            vision=False,
+            chat_format=deepseek_format(tokenizer),
+        )
+
+    def test_the_template_renders_deepseek_s_own_encoding_cases(self):
+        tokenizer = deepseek_tokenizer()
+        cases = sorted((FIXTURES / "deepseek41-encoding").glob("test_input_*.json"))
+        self.assertEqual(len(cases), 5)
+        for case in cases:
+            with self.subTest(case=case.name):
+                data = json.loads(case.read_text())
+                if isinstance(data, list):
+                    data = {"messages": data}
+                # A history call's arguments are an object, as the server
+                # reads them from JSON text.
+                for message in data["messages"]:
+                    for call in message.get("tool_calls") or ():
+                        function = call["function"]
+                        function["arguments"] = json.loads(function["arguments"])
+                thinking = data.get("thinking_mode") == "thinking"
+                options = template_options(
+                    reasoning_effort=data.get("reasoning_effort")
+                    if thinking
+                    else "none",
+                    preserve_thinking=None,
+                    tools=data.get("tools"),
+                    add_generation_prompt=True,
+                    enable_thinking=thinking,
+                )
+                expected = case.with_name(
+                    case.name.replace("input", "output").replace(".json", ".txt")
+                ).read_text()
+                self.assertEqual(
+                    render_chat_template(
+                        tokenizer, data["messages"], options | {"tokenize": False}
+                    ),
+                    expected,
+                )
+
+    def test_the_probe_finds_later_system_messages_native_and_two_prompts(self):
+        template = ChatTemplates(deepseek_tokenizer()).select(None)
+        self.assertEqual(template.later_system, NATIVE)
+        self.assertEqual(
+            {text for text, _ in template.generation_prompts.values()},
+            {"<｜Assistant｜><think>", "<｜Assistant｜></think>"},
+        )
+
+    def test_each_effort_opens_the_think_block_but_none(self):
+        frontend = self.frontend()
+        for effort in REASONING_EFFORTS:
+            with self.subTest(effort=effort):
+                body = fixtures.chat_body(reasoning_effort=effort)
+                job = frontend.prepare(body, deadline=fixtures.FOREVER)
+                prompt = frontend.apply_template(body, deadline=fixtures.FOREVER)
+                self.assertEqual(job.thinking, effort != "none")
+                if effort == "none":
+                    self.assertEqual(
+                        prompt,
+                        "<｜begin▁of▁sentence｜><｜User｜>hello<｜Assistant｜></think>",
+                    )
+                else:
+                    self.assertEqual(
+                        prompt,
+                        "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: "
+                        f"{BUDGETS[effort]} (range 1-100, the higher the value, "
+                        "the more thorough the reasoning)\n\n"
+                        "<｜User｜>hello<｜Assistant｜><think>",
+                    )
+
+    def test_a_tool_conversation_renders_in_dsml(self):
+        body = {
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "Weather in Paris?"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "Look it up.",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "weather",
+                                "arguments": '{"city": "Paris", "days": 2}',
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "Sunny"},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "weather", "parameters": SCHEMAS["weather"]},
+                }
+            ],
+        }
+        prompt = self.frontend().apply_template(body, deadline=fixtures.FOREVER)
+        self.assertTrue(prompt.startswith("<｜begin▁of▁sentence｜><｜System｜>"))
+        self.assertIn("Be brief.\n\n## Tools\n", prompt)
+        # With tools, the history keeps its reasoning.
+        self.assertTrue(
+            prompt.endswith(
+                "<｜User｜>Weather in Paris?<｜Assistant｜><think>Look it up.</think>"
+                + dsml_calls(("weather", {"city": "Paris", "days": 2}))
+                + "<｜end▁of▁sentence｜><｜User｜><tool_result>Sunny</tool_result>"
+                "<｜Assistant｜><think>"
+            ),
+            prompt,
+        )
+
+    def test_prompt_tokens_are_reused_after_the_last_assistant_turn(self):
+        # Splits before the byte-level BPE, as DeepSeek's tokenizer has, and
+        # the GGUF tokenizer's byte-level post-processor.
+        tokenizer = deepseek_tokenizer()
+        backend = tokenizer.backend_tokenizer
+        backend.pre_tokenizer = pre_tokenizers.Sequence(
+            [
+                pre_tokenizers.Split(Regex(r"\d{1,3}"), behavior="isolated"),
+                pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+            ]
+        )
+        backend.post_processor = processors.ByteLevel(trim_offsets=False)
+        cache = PromptTokenizer(tokenizer, DEEPSEEK.message_boundary)
+        self.assertTrue(cache.enabled)
+        first = "<｜User｜>" + "Paris 12345 " * 400 + "<｜Assistant｜></think>"
+        later = first + "Sunny.<｜end▁of▁sentence｜><｜User｜>Rome?<｜Assistant｜>"
+        for text in (first, later):
+            self.assertEqual(
+                cache.encode(text),
+                tokenizer(text, add_special_tokens=False)["input_ids"],
+            )
+        self.assertEqual(cache.stats()["hits"], 1)
+
+
+class DeepSeekServingTests(fixtures.HarnessTestCase):
+    """DeepSeek's output through the server: the reasoning its generation
+    prompt opened and its block of calls, streamed or not, read from the
+    tokens the engine returns."""
+
+    FRAGMENTS = {
+        41: "Check the weather.",
+        42: "</think>",
+        43: "Let me look.",
+        44: f'\n\n<{DSML} calls>\n<{DSML} invoke name="wea',
+        45: f'ther">\n<{DSML} parameter name="ci',
+        46: 'ty" string="true">Par',
+        47: (
+            f'is</{DSML} parameter>\n<{DSML} parameter name="days" string="false">'
+            f"3</{DSML} parameter>\n</{DSML} invoke>\n</{DSML} calls>"
+        ),
+    }
+    # DeepSeek's format over the fake vocabulary's IDs.
+    CHAT_FORMAT = replace(DEEPSEEK, think_end_id=42, call_open_id=48)
+
+    def harness(self, *plans, **options):
+        # Prompts render with DeepSeek's template; the engine's tokens decode
+        # to the fragments.
+        tokenizer = fixtures.TemplateTokenizer(TEMPLATE)
+        tokenizer.fragments = self.FRAGMENTS
+        tokenizer.backend_tokenizer = fixtures.byte_backend(self.FRAGMENTS)
+        return super().harness(
+            fixtures.FakeRuntime(*plans),
+            tokenizer=tokenizer,
+            chat_format=self.CHAT_FORMAT,
+            **options,
+        )
+
+    def body(self, **extra):
+        return fixtures.chat_body(
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "weather", "parameters": SCHEMAS["weather"]},
+                }
+            ],
+            **extra,
+        )
+
+    def test_reasoning_text_and_a_call_read_from_the_output(self):
+        output = [[41], [42], [43], [44], [45], [46], [47]]
+        harness = self.harness(fixtures.Plan(output), fixtures.Plan(output))
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body()
+        )
+        self.assertEqual(status, 200, payload)
+        response = json.loads(payload)
+        message = response["choices"][0]["message"]
+        self.assertEqual(message["reasoning_content"], "Check the weather.")
+        self.assertEqual(message["content"], "Let me look.")
+        self.assertEqual(
+            [
+                (call["function"]["name"], call["function"]["arguments"])
+                for call in message["tool_calls"]
+            ],
+            [("weather", '{"city":"Paris","days":3}')],
+        )
+        self.assertEqual(response["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(
+            response["usage"]["completion_tokens_details"]["reasoning_tokens"], 1
+        )
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body(stream=True)
+        )
+        self.assertEqual(status, 200, payload)
+        deltas = [
+            event["choices"][0]["delta"]
+            for event in fixtures.stream_events(payload)
+            if event.get("choices")
+        ]
+        self.assertEqual(
+            "".join(delta.get("reasoning_content") or "" for delta in deltas),
+            "Check the weather.",
+        )
+        self.assertEqual(
+            "".join(delta.get("content") or "" for delta in deltas), "Let me look."
+        )
+        self.assertEqual(
+            "".join(
+                call["function"].get("arguments", "")
+                for delta in deltas
+                for call in delta.get("tool_calls") or ()
+            ),
+            '{"city":"Paris","days":3}',
+        )
+
+    def test_a_required_call_is_constrained_in_dsml(self):
+        factory = fixtures.FakeConstraintFactory()
+        harness = self.harness(
+            fixtures.Plan([[41], [42], [44], [45], [46], [47]]),
+            constraint_factory=factory,
+        )
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body(tool_choice="required")
+        )
+        self.assertEqual(status, 200, payload)
+        (grammar,) = factory.grammars
+        main = json.loads(grammar)["grammars"][0]["lark_grammar"]
+        calls_open = json.dumps(f"<{DSML} calls>\n")
+        calls_close = json.dumps(f"</{DSML} calls>")
+        self.assertIn(
+            f'start: think WS {calls_open} ((call_0) "\\n")+ {calls_close} WS\n', main
+        )
+        self.assertIn("think: TEXT <[42]>\n", main)
+
+
+if __name__ == "__main__":
+    unittest.main()

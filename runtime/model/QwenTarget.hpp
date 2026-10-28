@@ -173,13 +173,21 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   // hyper-connected streams write their output to a branch of the target's
   // own scratch instead (qwenTargetScratchBytes).
   [[nodiscard]] constexpr bool mixersAddToHidden() const noexcept { return !hyperConnections; }
+  // Whether the attention layers run the runtime's paged attention
+  // (ops::PagedAttention) on its arenas' attention tensors; DeepSeek-V4.1's
+  // latent attention runs on its target's own scratch instead, and the
+  // arenas hold none of them.
+  [[nodiscard]] constexpr bool pagedAttention() const noexcept { return !deepseek.present(); }
   [[nodiscard]] constexpr ops::GdnShape gdnShape() const noexcept {
     return {gdnKeyHeads, gdnValueHeads, gdnHeadDimension,
             convolutionDimension, packedGdnWidth, gdnSigmoidGate};
   }
   // The layout itself was checked by requireQwenLayout when the target
-  // loaded. The draft reads 1 to ExecutionLimits::maximumDraftTargetLayers
-  // of its layers, ascending. A target without GDN layers has no GDN shape.
+  // loaded (DeepSeek-V4.1's by requireDeepSeek41Layout, whose pages hold its
+  // KV sources' compressed groups and its cells its windows alone, and which
+  // has no draft). The draft reads 1 to ExecutionLimits::maximumDraftTargetLayers
+  // of its layers, ascending, and a model without a draft none. A target
+  // without GDN layers has no GDN shape.
   // The projection lists hold every projection the weights dispatch, which
   // each have sizes; a target with dense FFNs, a MoE target's leading layers
   // too, holds their gate and up projections.
@@ -190,11 +198,16 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
       });
     };
     const auto captured = [&] {
-      if (!captureLayerCount || captureLayerCount > ExecutionLimits::maximumDraftTargetLayers) return false;
+      if (!captureLayerCount) return true;
+      if (captureLayerCount > ExecutionLimits::maximumDraftTargetLayers) return false;
       const auto ids = captureLayers();
       return std::ranges::adjacent_find(ids, std::ranges::greater_equal{}) == ids.end() && ids.back() < layers;
     };
     const bool dense = intermediateSize && sized(gateUpProjections);
+    if (deepseek.present())
+      return !captureLayerCount && !stateLayout.layers && kvLayout.attentionLayers == deepseekKvSources() &&
+             kvLayout.kvHeads == 1 && kvLayout.headDimension == attentionHeadDimension && sized(prefillProjections) &&
+             sized(decodeProjections) && moeShape().valid();
     return captured() && stateLayout.layers + kvLayout.attentionLayers == layers &&
            (!stateLayout.layers || gdnShape().valid()) &&
            kvLayout.kvHeads == attentionKvHeads &&

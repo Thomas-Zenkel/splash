@@ -22,7 +22,7 @@ from .api_shapes import (
     template_messages,
 )
 from .backend import Job, ReasoningRequest, remaining_request_time
-from .chat_format import THINK_END, THINK_START, TOOL_CALL_OPEN
+from .chat_format import THINK_END, THINK_START
 from .chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
     RESERVED_TEMPLATE_KWARGS,
@@ -1106,18 +1106,17 @@ class Frontend:
         )
 
     def _call_openings(self, policy, thinking):
-        """The tokens that begin each strict tool's call, after the close of
-        the reasoning the generation prompt opened. Its parameter names may
-        come next, so a tool with more of them than the parser admits fails
-        there."""
+        """The tokens that begin each strict tool's call as a turn's first,
+        after the close of the reasoning the generation prompt opened. Its
+        parameter names may come next, so a tool with more of them than the
+        parser admits fails there."""
         chat_format = self.chat_format
         reasoning = [chat_format.think_end_id] if thinking else []
         return [
             (
                 reasoning
                 + self._tokenize(
-                    TOOL_CALL_OPEN + chat_format.call_syntax.function_opening(name),
-                    add_special_tokens=False,
+                    chat_format.call_syntax.opening(name), add_special_tokens=False
                 )["input_ids"],
                 f"tool {name} has too many parameters to constrain",
             )

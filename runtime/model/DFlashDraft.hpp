@@ -90,6 +90,9 @@ struct DFlashDraftLayout final {
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> targetLayers{};
   uint32_t targetLayerCount = 0;
 
+  // Whether the model has a draft. One installed without (--draft-model none)
+  // has no layers and every size zero, and decodes one token a cycle.
+  [[nodiscard]] constexpr bool present() const noexcept { return layers != 0; }
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
     return {layers, kvHeads, attentionHeadDimension, hiddenSize};
   }

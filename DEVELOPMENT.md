@@ -87,7 +87,7 @@ access. It also completes local paths for `--model-dir`, `--draft-model` and
 | `--model-dir` | None | Prepare a local GGUF file or GGUF/MLX model directory without the Hub. See [local model files](#local-model-files). |
 | `--mmproj` | None | A local GGUF target's vision projector; requires `--model-dir`. |
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
-| `--draft-model` | The family's released DFlash2 draft | A compatible repository or local directory in its place; required for a family without a released draft. See [drafts](#drafts). |
+| `--draft-model` | The family's released DFlash2 draft, none for a family without one | A compatible repository or local directory in its place, or `none` to decode one token a cycle without a draft. See [drafts](#drafts). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](#vision). |
 | `--offline` | Off | Start the installed model without asking the Hub, as `HF_HUB_OFFLINE=1` does. See [revisions](#revisions). |
 | `--port` | `SPLASH_PORT` or `8000` | HTTP port. |
@@ -100,7 +100,7 @@ access. It also completes local paths for `--model-dir`, `--draft-model` and
 | `--max-context` | Auto | Set the context limit, e.g. `100K` or `1M` (K = 1024 tokens, M = 1,000,000), up to 1,010,000 tokens; past the 256K native window it turns on YaRN. See [memory and context](#memory-and-context). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
-| `--ple-memory` | Auto | Qwen3.8-Flash-Next: read the PLE n-gram table from the SSD through a host row cache of this size, e.g. `2G`; `off` loads the whole table. Auto loads it where memory holds it, else streams it through its share of the budget. See [PLE table streaming](#ple-table-streaming). |
+| `--ple-memory` | Auto | Qwen3.8-Flash-Next: read the PLE n-gram table from the SSD through a host row cache of this size, e.g. `2G`; `off` loads the whole table. Auto loads it where memory holds it, else streams it through its share of the budget. DeepSeek-V4.1-Flash's Engram tables always stream this way, and `off` is refused. See [PLE table streaming](#ple-table-streaming). |
 | `--expert-memory` | Auto | MoE targets: hold routed experts in this much memory, e.g. `16G`, and read the others from the SSD when a step routes them; `off` loads every expert. Auto loads them all where memory holds them, else gives them what the context leaves. See [streamed experts](#streamed-experts). |
 | `--sparse-kv-memory` | Auto | Qwen3.8-Flash-Next: memory for the KV blocks read back from the SSD for requests whose KV is there, e.g. `1200M`; never below its floor, which auto keeps. See [KV on the SSD](#kv-on-the-ssd). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both, though `POST /v1/memory/release` still frees the weights. See [weight loading](#weight-loading). |
@@ -359,10 +359,10 @@ such as `--expert-memory 16G`, its routed experts stay in their files on the
 SSD, and a store holds as many of them as fit in all that the plan leaves
 them, or in SIZE bytes (`ExpertStore`, `runtime/model/ExpertStore.hpp`): the
 weights shrink by the routed experts' bytes, and the store counts in their
-place (`target_weights_bytes`). A store holds at least a layer's experts of
-each format mix and every expert of a layer whose mix no other layer shares;
-the engine refuses a SIZE below that, and `--expert-memory off` loads every
-expert, as a SIZE that holds them all does.
+place (`target_weights_bytes`). A store holds at least a layer's experts, in
+slots of the widest expert's size, which every layer's experts share whatever
+formats a layer mixes; the engine refuses a SIZE below that, and
+`--expert-memory off` loads every expert, as a SIZE that holds them all does.
 
 - Each MoE layer of a command loads the experts its rows route that are not
   resident: after the layer's routing, a host step of the command claims
@@ -382,16 +382,20 @@ expert, as a SIZE that holds them all does.
   at 9.3 GB/s instead of 8.1, with less than half the CPU).
 - While the GPU repacks a round or runs a layer, the next round's experts or
   the next block's likely experts are read ahead: those the next block's
-  router picks from this block's input in a decode step; after a long prefill
+  router picks from this block's input in a decode step (by its selection
+  bias too, where it has one, as DeepSeek-V4.1's has); after a long prefill
   chunk's last repack, one more host step reads nearly all of the next
   block's into the whole staging. A load takes the read-ahead over without
   waiting for its reads of experts it does not route, and a read ahead of an
   expert no load routes may fail without failing anything. A decode step
   loads and predicts only the experts its lanes' verify rows route
   ([Drafts](#drafts)); the selector writes those rows before the step's load.
-- Experts of one format share an arena of slots; when it would take more than
-  the device's largest buffer (`maxBufferLength`), their layers are split
-  between arenas that each fit, each recycling its own slots.
+- Every layer's experts share one arena of slots of one size, the widest
+  expert's: a slot keeps all of an expert's planes together, so experts of
+  any formats take any slot, and the kernels read a slot's expert at its slot
+  times that size (`BlockMoeWeights::routedSlotBytes`). When the arena would
+  take more than the device's largest buffer (`maxBufferLength`), consecutive
+  layers share arenas that each fit, each recycling its own slots.
 - A decode step's loads keep the GPU awake through their host steps
   ([Host steps](#host-steps)), so the work after a load starts at once and at
   full clocks rather than after the GPU's wake-up.
@@ -749,8 +753,10 @@ environment. Unset, the model's template default is unchanged. An effort, the
 default or a request's own, reaches the template as `enable_thinking`, false
 for `none`, and as `reasoning_effort`, not as a token budget, so a template that
 switches reasoning by either follows it. A template that rejects an effort
-renders an alias: `xhigh` for `high` and `max`, `low` for `minimal`; one that
-rejects `none` renders by `enable_thinking` alone while thinking is off. A
+renders an alias: `xhigh` for `high` and `max`, `low` for `minimal`, `high`
+for `medium` and `max` for `xhigh`, as DeepSeek-V4.1's knows `low`, `high`
+and `max` alone; one that rejects `none` renders by `enable_thinking` alone
+while thinking is off. A
 template that cannot give the thinking a request asks for, one that always or
 never thinks, renders as it can, and the request reasons as its prompt does. A
 template that refuses a request's messages returns 400 with its reason.
@@ -1310,9 +1316,12 @@ syntax ([chat formats](#chat-formats)). In Qwen's XML a call opens at
 `\n</parameter>\n` where the next parameter, `</function>` or `</tool_call>`
 follows; in Flint's GLM tags a call opens at `<tool_call>`, the function's name
 follows it up to the first tag, and a value ends at `</arg_value>` where the
-next `<arg_key>` or `</tool_call>` follows. A value may hold the tags in any
-other order, as a file an agent writes may. Tags written otherwise are text.
-Besides:
+next `<arg_key>` or `</tool_call>` follows; in DeepSeek's DSML a call opens at
+`<｜DSML｜ invoke name="`, its name ends at the quote, a parameter's name ends
+at `" string="true">` or `" string="false">`, and a value ends at
+`</｜DSML｜ parameter>` and the newline where the next parameter or
+`</｜DSML｜ invoke>` follows. A value may hold the tags in any other order, as
+a file an agent writes may. Tags written otherwise are text. Besides:
 
 - names lose the space around them, and a call that names no function is
   dropped, as is a `</think>` in text;
@@ -1328,11 +1337,15 @@ Besides:
   as a `tool_use` block's `input` in a Messages history, five levels into the
   body;
 - a call's opening also ends the reasoning where a call may follow, but for a
-  model that opens its reasoning itself, as Flint does, which closes it before
-  a call.
+  model that closes its reasoning before a call, as Flint's and DeepSeek's do;
+- DeepSeek's block of calls, `<｜DSML｜ calls>` to `</｜DSML｜ calls>`, is dropped
+  from the content with the blank line its template sets before it, and a value
+  marked `string="false"` reads as the JSON it spells where its schema gives it
+  no type (a declared type decides as for any family).
 
 `dev/tests/server/test_tool_call_reading.py` holds model outputs with the calls
-and content they read as, and `dev/tests/server/test_chat_formats.py` Flint's.
+and content they read as, `dev/tests/server/test_chat_formats.py` Flint's and
+`dev/tests/server/test_deepseek_format.py` DeepSeek's.
 
 A strict tool's schema is checked against its JSON Schema dialect on arrival,
 and every tool's arguments are framed through schema composition and local
@@ -1842,7 +1855,19 @@ part from 1 to N must be present. The parts install side by side in
 `target/`, and the native loader reads them as one GGUF (`findTargetGgufs`,
 `OpenGguf`): the first part's metadata, whose `split.count` and
 `split.tensors.count` must describe the parts, and every part's tensors. The
-installer screens the merged header (`gguf.merged_split`).
+installer screens the merged header (`gguf.merged_split`). A repository may
+keep a split GGUF's parts at its root instead, `MODEL-VARIANT-0000K-of-0000N.gguf`
+beside other variants' (`upstream.root_split_gguf`), as ISTA-DASLab's
+DeepSeek-V4.1 GGUFs do.
+
+A DeepSeek-V4.1 target (`deepseek41`) keeps its Engram tables in a file of
+their own beside its parts, which its metadata names
+(`deepseek41.engram.file`, `gguf.engram_file`). The installer takes only a
+plain `*.gguf` name in the same folder, never a path, and holds the file to
+the backbone: its architecture `deepseek41-engram`, the backbone's
+`deepseek41.engram.source` and one table of a format for each Engram layer
+(`gguf.require_engram`). It installs in `engram/`, apart from the target's
+parts, which `target/` alone holds.
 
 BF16 and F16 are formats of the image like the quantized ones, for the tensors
 a quantized file keeps unquantized: UD-Q8_K_XL keeps the 27B's attention
@@ -1924,18 +1949,29 @@ the parameters, `GgufFile` and the planner check the rest).
 
 ### Drafts
 
-Every model decodes with a DFlash2 draft. Each family names the repository
+A model decodes with a DFlash2 draft. Each family names the repository
 of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
 it as the release publishes it: `config.json` and BF16 `model.safetensors`
 (or the shards its index names), and `mask_embedding.safetensors` when the
 release ships its mask token's embedding; a family whose draft is not released
-yet names none, and its installation names one with `--draft-model`.
-Installation downloads only those files and follows the repository's default
-branch as it follows the target's ([Revisions](#revisions)); `--draft-model`
-accepts another repository, followed the same way, or a local directory that
-holds them. A checkpoint is installed only when the engine accepts its
-configuration with the target's (its `model-check`), so a draft of another
-architecture never replaces one that loads.
+yet names none, and its installation has none unless `--draft-model` names
+one. Installation downloads only those files and follows the repository's
+default branch as it follows the target's ([Revisions](#revisions));
+`--draft-model` accepts another repository, followed the same way, or a local
+directory that holds them. A checkpoint is installed only when the engine
+accepts its configuration with the target's (its `model-check`), so a draft of
+another architecture never replaces one that loads.
+
+`--draft-model none` installs the target without a draft, as an installation
+of a family without a released draft is. Each decode cycle of such a model
+verifies its lanes' anchors alone and emits one token a lane: the rows after
+the anchor repeat it, the selection draws each row from its own distribution,
+and no proposal is accepted, so speculation counts stay zero and `/status`
+reports `verify_rows` as `anchor`. No draft weights, rings or context windows
+take memory, and a cached state holds the target's state alone; prefill keeps
+the draft context plan's bookkeeping and computes nothing for it. A family
+whose target keeps no state of its own (Flint) does not run without a draft
+yet.
 
 A draft's `config.json` states its layers, intermediate size, rotary base and
 the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
@@ -2149,18 +2185,29 @@ format of the family its installation found, which the assembly records:
   `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`,
   each tag a token; `<|end_of_text|>`, `<|user|>`, `<|observation|>` and
   `<|developer|>` stop.
+- DeepSeek-V4.1-Flash's (`DEEPSEEK`): the generation prompt opens the think
+  block where the request thinks and closes it where it does not; calls are
+  DSML (`DEEPSEEK_DSML`), one block
+  after the text, `<｜DSML｜ calls>`, an `<｜DSML｜ invoke name="NAME">` for each
+  call and a `<｜DSML｜ parameter name="K" string="true|false">V</｜DSML｜
+  parameter>` for each argument, whose `string` says whether the value is text
+  or JSON; `<｜end▁of▁sentence｜>` stops.
 
 A format holds the model's vocabulary and the engine's stop tokens, which are
 its target layout's; the tokens of `</think>`, of `<think>` where the model
-opens its reasoning itself, and of `<tool_call>`; the call syntax; and the
-special token after which prompt tokenization reuses a cached prompt's tokens,
-`<|im_end|>` or `<|assistant|>`. Startup checks that the tokenizer encodes each
-as the format has it. Grammars write reasoning and calls as the format lays
-them out: Flint's optional think block may come before any constrained output,
-and its tags, which the grammar compiler takes as tokens rather than text, are
-written as their tokens. A model that opens its reasoning itself closes it
-before a call, so a `<tool_call>` inside its think block is reasoning, as
-Flint's own parser reads it.
+opens its reasoning itself, and of the marker each call's opening holds,
+`<tool_call>` or DSML's `｜DSML｜`; the call syntax; and the special token
+after which prompt tokenization reuses a cached prompt's tokens,
+`<|im_end|>`, `<|assistant|>` or `<｜Assistant｜>`. Startup checks that the
+tokenizer encodes each as the format has it. Grammars write reasoning and
+calls as the format lays them out: Flint's optional think block may come
+before any constrained output, and its tags, which the grammar compiler takes
+as tokens rather than text, are written as their tokens. DSML's tags are
+text, its `｜DSML｜` a token that text outside calls cannot spell; the text
+before its block is lazy up to the block's opening, which a greedy lexeme
+would run into. A model that closes its reasoning before a call, as Flint's
+and DeepSeek's do, reads a call's opening inside its think block as
+reasoning, as their own parsers read it.
 
 Flint's template renders as shipped: its roles, the tools block it adds before
 the first message that is not a system message, each assistant turn's
@@ -2859,9 +2906,19 @@ split, and one lane on the staged 16-row tile bitwise against the 8-row tile; an
 `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
 plan, the staged 8- and 32-row tiles and the Apple9 register tile whatever GPU runs it, each in
 every format it takes as each routed and shared expert tensor, against fp64, and bitwise against
-the full grids and two gate/up passes; `gguf-moe-e512` runs it at Qwen3.8-Flash-Next's 512
-experts and `gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated
-shared slices. The goldens and how to regenerate them are
+the full grids and two gate/up passes, and against its routed experts read through a permuted slot
+table and from an expert store's slots of one size; `gguf-moe-e512` runs it at Qwen3.8-Flash-Next's 512
+experts, `gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated
+shared slices, and `gguf-moe-deepseek` at DeepSeek-V4.1's: 384 experts, the top 6 by
+sqrt(softplus) plus a selection bias, weights times 1.5, one ungated shared slice and the
+experts' SwiGLU clamp. `deepseek41-kernels` checks DeepSeek-V4.1's own kernels (its
+manifold-constrained hyper-connections, latent attention, rotations and FP8/FP4 grids,
+compressor, indexer, top-k selection and candidate blocks, the Engram hash and gate) against CPU
+references of `dev/tools/deepseek41_reference.py`, and those of a sequence's pages and state
+([Latent attention](#latent-attention)): the groups a store writes to their places and nowhere
+else, the indexer and the attention through a page table bitwise against pools of the same keys,
+a step's key lists, and the rings and open groups after a prefill's or a verify lane's retained
+rows; with `bench` it times them at the model's shapes. The goldens and how to regenerate them are
 in `dev/tests/fixtures/weight-goldens/`; with `SPLASH_GGML_ORACLE=<libggml-base.dylib>`,
 `gguf-reference` also compares the reference with GGML directly and prints GGML's hashes.
 
@@ -2988,6 +3045,51 @@ chunk, which returns the table and layer of the history staged for it; and
 `layerEnd` after a prefill layer, which hands the history's reads on to the
 next. A command none of whose requests holds such a page encodes as without
 them.
+
+### Latent attention
+
+DeepSeek-V4.1-Flash's layers attend latents (`model/DeepSeek41Target.hpp`,
+`ops::LatentAttention`): a row's 64 query heads share its keys, latents of 512
+values that are their own values too, beside a sink per head. A row's keys
+are the window, the latents of its layer at the last 128 positions, and up to
+512 compressed groups of its KV source that its indexer selects. The KV
+sources are the compressor layers, each of which compresses the projections
+of its rows into groups of one position or, a paired source, of two; the
+layers after one up to the next read its groups. The engine keeps them as
+follows:
+
+- A sequence's pages hold each KV source's groups (`QwenHybridLayout::kvLayout`,
+  a layer of one head of 512 per source): a group's latent as the key at the
+  place of the position that completes it, its index key in that place's
+  value, token-major. They are BF16 whatever `--kv-format` says, which holds
+  their FP4 values exactly (`fixedKvFormat`); half the places of a paired
+  source stay unused.
+- A sequence's state (`gdnStateLayout`: the auxiliary bytes of its state
+  cells, 5 MiB) holds each layer's ring of its window's last 128 latents and
+  each paired source's open group, the fp32 kv and gate projections of a
+  group's first position until its second arrives.
+- A step's rows attend the ring before the step and the step's own latents
+  (`LatentAttention::SplitKeys`), and the groups through the sequence's page
+  table. A prefill stores each source's groups as its rows complete them, of
+  the open group's projections too, and writes the rings and open group after
+  its rows and at each state capture. A verify stores the groups of all its
+  rows, which the next step's rows overwrite where they were not retained, and
+  leaves the state to its commit, which writes each lane's rings and open
+  groups after its retained rows from the step's latents and projections.
+- A prefill runs a layer's queries, attention and output projections in tiles
+  of 256 rows, each sequence's rows of a tile through its indexer in pieces
+  whose scores of every group fit 64 MiB. The model has no draft: a decode
+  cycle verifies each lane's anchor alone.
+- The runtime's arenas hold no paged attention's scratch for it
+  (`QwenTargetGeometry::pagedAttention`): the target keeps its own, a
+  prefill chunk's and a verify's, beside them (`qwenTargetScratchBytes`).
+- The Engram layers' table rows stream from their file
+  ([PLE table streaming](#ple-table-streaming), the same `SparseRowStore`): a
+  prefill hashes its rows' n-grams on the host and stages their rows before
+  its command, and reads the next command's rows ahead while it runs; a
+  verify hashes them on the GPU from each lane's prior tokens and stages them
+  in a host step of its command. They never load whole: `--ple-memory off` is
+  refused (`StreamedPart::streamsOnly`).
 
 ### Neural Engine prefill
 

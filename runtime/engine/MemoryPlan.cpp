@@ -46,31 +46,40 @@ uint64_t extentsBytes(uint64_t pages, uint64_t extentPages, uint64_t pageBytes) 
 // A streamed part as its setting leaves it to the planner: the bytes the
 // floors charge it, and all of it; an Auto part streams through more than
 // its floor or loads whole as the budget allows, any other only as set. An
-// Auto part whose smallest store takes all it would loads whole.
+// Auto part whose smallest store takes all it would loads whole, unless it
+// only streams, which streams through a store of all it would take where a
+// setting would load it whole, and is refused off.
 struct Part final {
   uint64_t floor = 0;
   uint64_t all = 0;
   bool automatic = false;
   bool streams = false;
+  bool streamsOnly = false;
 };
 
 std::optional<Part> resolve(const StreamedPart &part, std::string_view option, std::string &error) {
   if (!part.allBytes) return Part{};
   switch (part.setting.mode) {
   case StreamedSetting::Mode::Auto:
-    if (part.floorBytes < part.allBytes) return Part{part.floorBytes, part.allBytes, true, false};
+    if (part.floorBytes < part.allBytes || part.streamsOnly)
+      return Part{part.floorBytes, part.allBytes, true, false, part.streamsOnly};
     [[fallthrough]];
   case StreamedSetting::Mode::Off:
-    return Part{part.allBytes, part.allBytes, false, false};
+    if (part.streamsOnly) {
+      error = std::string(option) + " off cannot load a part that only streams";
+      return std::nullopt;
+    }
+    return Part{part.allBytes, part.allBytes, false, false, false};
   case StreamedSetting::Mode::Size:
-    if (part.setting.bytes >= part.allBytes) return Part{part.allBytes, part.allBytes, false, false};
+    if (part.setting.bytes >= part.allBytes)
+      return Part{part.allBytes, part.allBytes, false, part.streamsOnly, part.streamsOnly};
     if (part.setting.bytes < part.floorBytes) {
       error = std::string(option) + " of " + std::to_string(part.setting.bytes / kMiB) +
               " MiB is less than its smallest store, " + std::to_string((part.floorBytes + kMiB - 1) / kMiB) +
               " MiB";
       return std::nullopt;
     }
-    return Part{part.setting.bytes, part.setting.bytes, false, true};
+    return Part{part.setting.bytes, part.setting.bytes, false, true, part.streamsOnly};
   }
   return Part{};
 }
@@ -248,7 +257,7 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
   plan.tableBytes = table.streams ? table.floor : 0;
   if (table.automatic) {
     const int64_t kept = rest - allowance(expertsStream);
-    if (kept < static_cast<int64_t>(table.all - table.floor))
+    if (table.streamsOnly || kept < static_cast<int64_t>(table.all - table.floor))
       plan.tableBytes = table.floor + static_cast<uint64_t>(std::clamp<int64_t>(kept, 0, tableShare));
   }
   return {plan, {}};
@@ -436,8 +445,9 @@ std::optional<std::string> ModelMemoryProfile::validationError() const {
   if (!targetKvLayout.valid()) return "invalid_target_kv_layout";
   if (spill.enabled && !targetKvLayout.spillable()) return "spill_plan_needs_a_spillable_layout";
   if (!ops::validFormat(stateFormat)) return "invalid_state_format";
+  // Draft weights, as vision weights, are absent from a model without them;
+  // loading requires them for a model with a draft (requireLoadedModel).
   if (!footprint.targetWeightsBytes) return "target_weight_bytes_required";
-  if (!footprint.draftWeightsBytes) return "draft_weight_bytes_required";
   if (!footprint.runtime.laneStatePlannedAllocatedBytes) {
     return "lane_state_bytes_required";
   }

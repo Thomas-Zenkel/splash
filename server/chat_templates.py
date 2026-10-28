@@ -96,7 +96,14 @@ class ChatTemplateError(ValueError):
 
 # What a template that rejects one of the REASONING_EFFORTS renders instead;
 # one that rejects none renders by enable_thinking alone (render_chat_template).
-REASONING_EFFORT_ALIASES = {"high": "xhigh", "max": "xhigh", "minimal": "low"}
+# DeepSeek-V4.1's knows low, high (its default) and max alone.
+REASONING_EFFORT_ALIASES = {
+    "high": "xhigh",
+    "max": "xhigh",
+    "minimal": "low",
+    "medium": "high",
+    "xhigh": "max",
+}
 
 
 def template_options(

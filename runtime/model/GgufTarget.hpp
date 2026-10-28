@@ -61,6 +61,10 @@ public:
   // The GGUF's header, for what a family reads beside its images (Flash-Next's
   // PLE hash).
   [[nodiscard]] const GgufFile &file() const noexcept { return planned_->source.file(); }
+  // The row store's options of a streamed table, its memory none where the
+  // table loads: a family whose table lies in a file of its own
+  // (DeepSeek-V4.1's Engram) streams it through them.
+  [[nodiscard]] const SparseRowStoreOptions &tableOptions() const noexcept { return planned_->table; }
   // The input rotation of a Prism ML GGUF, which planImages checked names
   // every quantized tensor of the target and its token table.
   [[nodiscard]] const std::optional<GgufRotation> &rotation() const noexcept { return file().rotation(); }

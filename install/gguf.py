@@ -170,12 +170,24 @@ FLINT_PATTERNS = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
     r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 )
+# The joyai-llm profile, as DeepSeek-V4.1's tokenizer.json splits text before
+# its byte-level BPE (llama.cpp's convert names that pre-tokenizer joyai-llm),
+# without a normalizer: digits in runs of up to three, runs of Han, hiragana
+# and katakana, then DeepSeek's pattern.
+DEEPSEEK_PATTERNS = (
+    r"\p{N}{1,3}",
+    "[一-龥぀-ゟ゠-ヿ]+",
+    r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+"
+    r"|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
+    r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+)
 # Each GGUF tokenizer profile (tokenizer.ggml.pre) Splash derives a tokenizer
 # for: the patterns that split text, each isolating its matches, in order,
 # and whether text is NFC-normalized before them.
 TOKENIZER_PROFILES = {
     "qwen35": ((QWEN35_PATTERN,), True),
     "flint": (FLINT_PATTERNS, False),
+    "joyai-llm": (DEEPSEEK_PATTERNS, False),
 }
 # The GGUF token types (llama_token_type) a byte-level BPE vocabulary uses:
 # control tokens are special added tokens, user-defined ones added tokens
@@ -323,6 +335,11 @@ def tokenizer_files(metadata):
 
 def text_architecture(metadata):
     arch = metadata.require("general.architecture", str)
+    if arch == ENGRAM_ARCHITECTURE:
+        raise ModelError(
+            "this GGUF holds the Engram tables of a DeepSeek-V4.1 model, which its "
+            "backbone loads from beside it; select a variant of the backbone"
+        )
     if arch not in ARCHITECTURES:
         raise ModelError("unsupported GGUF model architecture: " + arch)
     return arch
@@ -464,6 +481,102 @@ def flint_text_config(metadata, arch):
     }
 
 
+def deepseek41_text_config(metadata, arch):
+    """What DeepSeek-V4.1's config.json states beyond the sizes every
+    architecture's does, from its header, by that file's keys: the low-rank
+    query and grouped output projections, the RoPE and its YaRN scaling, the
+    router (scoring_func, its correction bias implied by the tensors), the
+    sliding window, the compressed KV and its sources, the two-level indexer,
+    the hyper-connections, the Engram tables and the token that ends a turn.
+    The SwiGLU clamp must be one value for every routed and shared expert."""
+
+    def number(key, kind=int):
+        value = metadata.require(f"{arch}.{key}", kind)
+        if kind is int and value < 0:
+            raise ModelError(f"invalid GGUF metadata: {arch}.{key}")
+        return value
+
+    def numbers(key, kind=int):
+        values = metadata.values.get(f"{arch}.{key}")
+        if (
+            type(values) is not list
+            or not values
+            or any(type(v) is not kind for v in values)
+        ):
+            raise ModelError(f"missing or invalid GGUF metadata: {arch}.{key}")
+        return values
+
+    if metadata.require(f"{arch}.expert_scoring_func", str) != "sqrtsoftplus":
+        raise ModelError(f"unsupported GGUF expert scoring function in {arch}")
+    if metadata.require(f"{arch}.rope.scaling.type", str) != "yarn":
+        raise ModelError(f"unsupported GGUF RoPE scaling in {arch}")
+    if number("attention.value_length") != number("attention.key_length"):
+        raise ModelError(f"invalid GGUF metadata: {arch}.attention.value_length")
+    clamps = set(numbers("swiglu_clamp_exp", float)) | set(
+        numbers("swiglu_clamp_shexp", float)
+    )
+    if len(clamps) != 1:
+        raise ModelError(f"unsupported GGUF SwiGLU clamps in {arch}")
+    return {
+        "moe_intermediate_size": metadata.positive(
+            arch + ".expert_feed_forward_length"
+        ),
+        "qk_rope_head_dim": metadata.positive(arch + ".rope.dimension_count"),
+        "q_lora_rank": metadata.positive(arch + ".attention.q_lora_rank"),
+        "o_lora_rank": metadata.positive(arch + ".attention.output_lora_rank"),
+        "o_groups": metadata.positive(arch + ".attention.output_group_count"),
+        "swiglu_limit": clamps.pop(),
+        "rms_norm_eps": number("attention.layer_norm_rms_epsilon", float),
+        "rope_theta": number("rope.freq_base", float),
+        "rope_scaling": {
+            "rope_type": "yarn",
+            "factor": number("rope.scaling.factor", float),
+            "beta_fast": number("rope.scaling.yarn_beta_fast", float),
+            "beta_slow": number("rope.scaling.yarn_beta_slow", float),
+            "original_max_position_embeddings": metadata.positive(
+                arch + ".rope.scaling.original_context_length"
+            ),
+        },
+        "n_routed_experts": metadata.positive(arch + ".expert_count"),
+        "n_shared_experts": metadata.positive(arch + ".expert_shared_count"),
+        "num_experts_per_tok": metadata.positive(arch + ".expert_used_count"),
+        "scoring_func": "sqrtsoftplus",
+        "norm_topk_prob": metadata.require(arch + ".expert_weights_norm", bool),
+        "routed_scaling_factor": number("expert_weights_scale", float),
+        "sliding_window": metadata.positive(arch + ".attention.sliding_window"),
+        "compress_ratios": numbers("attention.compress_ratios"),
+        "compress_rope_theta": number("attention.compress_rope_freq_base", float),
+        "kv_source_layer_ids": layer_ids(metadata, "kv_source_layer_ids"),
+        "index_source_layer_ids": layer_ids(metadata, "index_source_layer_ids"),
+        "index_n_heads": metadata.positive(arch + ".attention.indexer.head_count"),
+        "index_head_dim": metadata.positive(arch + ".attention.indexer.key_length"),
+        "index_topk": metadata.positive(arch + ".attention.indexer.top_k"),
+        "candidate_source_layer_id": number("attention.candidate_source_layer_id"),
+        "candidate_topk_blocks": metadata.positive(
+            arch + ".attention.candidate_topk_blocks"
+        ),
+        "candidate_block_size": metadata.positive(
+            arch + ".attention.candidate_block_size"
+        ),
+        "hc_mult": metadata.positive(arch + ".hyper_connection.count"),
+        "hc_sinkhorn_iters": metadata.positive(
+            arch + ".hyper_connection.sinkhorn_iterations"
+        ),
+        "hc_eps": number("hyper_connection.epsilon", float),
+        "engram_layer_ids": layer_ids(metadata, "engram.layer_ids"),
+        "engram_num_embeddings": numbers("engram.num_embeddings"),
+        "engram_max_ngram_size": metadata.positive(arch + ".engram_max_ngram_size"),
+        "engram_vocab_size": metadata.positive(arch + ".engram_vocab_size"),
+        "engram_n_heads": metadata.positive(arch + ".engram_n_heads"),
+        "engram_head_dim": metadata.positive(arch + ".engram_head_dim"),
+        "engram_pad_token_id": number("engram_pad_token_id"),
+        "engram_compressed_vocab_size": metadata.positive(
+            arch + ".engram_compressed_vocab_size"
+        ),
+        "eos_token_id": metadata.require("tokenizer.ggml.eos_token_id", int),
+    }
+
+
 def vision_config(vision):
     if (
         vision.require("general.architecture", str) != "clip"
@@ -541,6 +654,9 @@ TENSOR_TYPES = {
     40: "NVFP4",
     42: "Q2_0",
     142: "PQ2_0",
+    # The integers of DeepSeek-V4.1's Engram hashes (DEEPSEEK41_MODEL_TENSORS).
+    26: "I32",
+    27: "I64",
 }
 QUANTIZED_TYPES = {
     "Q2_K",
@@ -700,6 +816,171 @@ FLINT_MOE_TENSORS = {
     if name != "ffn_gate_inp_shexp.weight"
 }
 
+# DeepSeek-V4.1 (deepseek41): every layer a latent attention, its query and
+# its grouped output projections low-rank, with learned sinks, between two
+# Sinkhorn-balanced hyper-connection mixes (hc_*, F32 as the GGUFs keep
+# them), and a MoE whose router has a correction bias and whose shared
+# expert has no gate. The layers kv_source_layer_ids names also compress KV
+# (a pooling gate where their compress ratio pools two or more tokens) and
+# project the indexer's keys; those index_source_layer_ids names project its
+# queries; those engram.layer_ids names project the rows of their Engram
+# table, which the file engram.file beside the target holds (engram_file).
+# The model keeps the Engram hashes' integers.
+DEEPSEEK41_MODEL_TENSORS = MODEL_TENSORS | {
+    "engram_token_map.weight": {"I32"},
+    "engram_multipliers.weight": {"I64"},
+    "engram_primes.weight": {"I64"},
+    "engram_offsets.weight": {"I64"},
+}
+DEEPSEEK41_LAYER_TENSORS = (
+    {
+        "attn_norm.weight": NORM_TYPES,
+        "ffn_norm.weight": NORM_TYPES,
+        "attn_q_a.weight": FORMAT_TYPES,
+        "attn_q_a_norm.weight": NORM_TYPES,
+        "attn_q_b.weight": FORMAT_TYPES,
+        "attn_kv.weight": FORMAT_TYPES,
+        "attn_kv_a_norm.weight": NORM_TYPES,
+        "attn_output_a.weight": FORMAT_TYPES,
+        "attn_output_b.weight": FORMAT_TYPES,
+        "attn_sinks.weight": F32,
+        "exp_probs_b.bias": F32,
+    }
+    | {
+        f"hc_{part}_{name}.weight": F32
+        for part in ("attn", "ffn")
+        for name in ("fn", "base", "scale")
+    }
+    | FLINT_MOE_TENSORS
+)
+DEEPSEEK41_KV_SOURCE_TENSORS = {
+    "attn_compressor_kv.weight": FORMAT_TYPES,
+    "attn_compressor_norm.weight": NORM_TYPES,
+    "indexer.attn_k.weight": FORMAT_TYPES,
+    "indexer.k_norm.weight": NORM_TYPES,
+}
+DEEPSEEK41_POOLING_TENSORS = {"attn_compressor_gate.weight": FORMAT_TYPES}
+DEEPSEEK41_INDEX_SOURCE_TENSORS = {
+    "indexer.attn_q_b.weight": FORMAT_TYPES,
+    "indexer.proj.weight": FORMAT_TYPES,
+}
+DEEPSEEK41_ENGRAM_TENSORS = {
+    "engram_wkv.weight": FORMAT_TYPES,
+    "engram_q.weight": FLOAT_PROJECTION_TYPES,
+    "engram_k.weight": FLOAT_PROJECTION_TYPES,
+}
+# The architecture of a DeepSeek-V4.1 target's Engram file, which holds the
+# table of each Engram layer, blk.L.engram_embd.weight, of a format whose rows
+# the embedding kernels gather.
+ENGRAM_ARCHITECTURE = "deepseek41-engram"
+
+
+def layer_ids(metadata, key):
+    """The header's array `key` of layer indices, ascending, each a loaded
+    layer's."""
+    arch = text_architecture(metadata)
+    values = metadata.values.get(f"{arch}.{key}")
+    layers = loaded_layers(metadata, arch)
+    if (
+        type(values) is not list
+        or any(type(value) is not int or not 0 <= value < layers for value in values)
+        or values != sorted(set(values))
+    ):
+        raise ModelError(f"missing or invalid GGUF metadata: {arch}.{key}")
+    return values
+
+
+def compress_ratios(metadata):
+    """The compress ratio of each loaded layer of a DeepSeek-V4.1 target: 0
+    for a layer that attends its sliding window alone, else the tokens its
+    KV source pools into one compressed row."""
+    arch = text_architecture(metadata)
+    key = arch + ".attention.compress_ratios"
+    values = metadata.values.get(key)
+    layers = loaded_layers(metadata, arch)
+    if (
+        type(values) is not list
+        or len(values) < layers
+        or any(type(value) is not int or value < 0 for value in values)
+    ):
+        raise ModelError("missing or invalid GGUF metadata: " + key)
+    return values[:layers]
+
+
+def deepseek41_tensors(metadata, arch):
+    """The tensors of a DeepSeek-V4.1 target (DEEPSEEK41_LAYER_TENSORS and the
+    parts its layers' roles add)."""
+    ratios = compress_ratios(metadata)
+    kv_sources = set(layer_ids(metadata, "kv_source_layer_ids"))
+    index_sources = set(layer_ids(metadata, "index_source_layer_ids"))
+    engram = set(layer_ids(metadata, "engram.layer_ids"))
+    tensors = dict(DEEPSEEK41_MODEL_TENSORS)
+    for layer in range(loaded_layers(metadata, arch)):
+        parts = dict(DEEPSEEK41_LAYER_TENSORS)
+        if layer in kv_sources:
+            parts |= DEEPSEEK41_KV_SOURCE_TENSORS
+            if ratios[layer] > 1:
+                parts |= DEEPSEEK41_POOLING_TENSORS
+        if layer in index_sources:
+            parts |= DEEPSEEK41_INDEX_SOURCE_TENSORS
+        if layer in engram:
+            parts |= DEEPSEEK41_ENGRAM_TENSORS
+        for name, types in parts.items():
+            tensors[f"blk.{layer}.{name}"] = types
+    return tensors
+
+
+def engram_file(metadata):
+    """The name of the file that holds a DeepSeek-V4.1 target's Engram
+    tables (deepseek41.engram.file), which lies beside the target's GGUF;
+    None for a target of another architecture. The name comes from the
+    file: only a plain *.gguf name, no path, is taken."""
+    arch = text_architecture(metadata)
+    if not ARCHITECTURES[arch].engram:
+        return None
+    key = arch + ".engram.file"
+    name = metadata.values.get(key)
+    if (
+        type(name) is not str
+        or not name.endswith(".gguf")
+        or name in (".", "..")
+        or name.startswith(".")
+        or "/" in name
+        or "\\" in name
+        or "\0" in name
+        or Path(name).name != name
+    ):
+        raise ModelError("missing or unsafe GGUF metadata: " + key)
+    return name
+
+
+def require_engram(metadata, engram):
+    """Reject an Engram file that is not the one the DeepSeek-V4.1 target
+    metadata names: of another architecture or backbone
+    (deepseek41.engram.source), or without the table of each Engram layer in
+    a format whose rows the embedding kernels gather, each of
+    engram.num_embeddings rows."""
+    arch = text_architecture(metadata)
+    if engram.values.get("general.architecture") != ENGRAM_ARCHITECTURE:
+        raise ModelError(f"the Engram file is not a {ENGRAM_ARCHITECTURE} GGUF")
+    source = metadata.values.get(arch + ".engram.source")
+    if type(source) is not str or engram.values.get(arch + ".engram.source") != source:
+        raise ModelError("the Engram file belongs to another backbone")
+    layers = layer_ids(metadata, "engram.layer_ids")
+    rows = metadata.values.get(arch + ".engram.num_embeddings")
+    if type(rows) is not list or len(rows) != len(layers):
+        raise ModelError(
+            f"missing or invalid GGUF metadata: {arch}.engram.num_embeddings"
+        )
+    tables = {f"blk.{layer}.engram_embd.weight" for layer in layers}
+    if set(engram.tensors) != tables or any(
+        TENSOR_TYPES.get(engram.tensors[name]) not in EMBEDDING_TYPES for name in tables
+    ):
+        raise ModelError(
+            "the Engram file does not hold one table of a gathered format for each "
+            "Engram layer"
+        )
+
 
 @dataclass(frozen=True)
 class Architecture:
@@ -736,6 +1017,13 @@ class Architecture:
     # Whether its configuration is flat, the text model's at its top, as
     # Flint's is; otherwise under text_config, as Qwen's is.
     flat: bool = False
+    # The tensors of an architecture whose layers differ by the roles its
+    # header's arrays give them, given the metadata and the architecture's
+    # name (DeepSeek-V4.1's); None for those loaded_tensors derives.
+    tensors: Callable | None = None
+    # Whether its Engram tables lie in a file of their own beside the target
+    # (engram_file).
+    engram: bool = False
 
 
 # The GGUF text architectures Splash serves, by general.architecture; the
@@ -767,6 +1055,16 @@ ARCHITECTURES = {
         text_config=flint_text_config,
         flat=True,
     ),
+    "deepseek41": Architecture(
+        "deepseek_v41_text",
+        DEEPSEEK41_MODEL_TENSORS,
+        DEEPSEEK41_LAYER_TENSORS,
+        moe=True,
+        hybrid=False,
+        text_config=deepseek41_text_config,
+        tensors=deepseek41_tensors,
+        engram=True,
+    ),
 }
 
 
@@ -780,6 +1078,8 @@ def loaded_tensors(metadata):
     the two. A PLE layer reads the n-gram embedding's tensors too."""
     arch = text_architecture(metadata)
     architecture = ARCHITECTURES[arch]
+    if architecture.tensors is not None:
+        return architecture.tensors(metadata, arch)
     period = (
         metadata.positive(arch + ".full_attention_interval")
         if architecture.hybrid

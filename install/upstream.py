@@ -117,7 +117,7 @@ def select_gguf(files, variant):
         if len(ending) == 1:
             return [ending[0]], len(candidates) > 1
         choice = "no single GGUF matches :" + variant
-        if split := split_gguf(files, variant):
+        if split := split_gguf(files, variant) or root_split_gguf(files, variant):
             return split, False
     listed = ", ".join(candidates) or "none"
     raise models.ModelError(f"{choice} (files in the repository root: {listed})")
@@ -143,6 +143,24 @@ def split_gguf(files, variant):
     if not names:
         return None
     return split_order(names, f"the split GGUF in {variant}/")
+
+
+def root_split_gguf(files, variant):
+    """The split files of a target GGUF that a repository keeps at its root
+    beside its other variants' (MODEL-VARIANT-00001-of-0000N.gguf ...), as
+    ISTA-DASLab's DeepSeek-V4.1 GGUFs, in split order; None when no part is
+    named so. Every part from 1 to N must be present."""
+    suffix = "-" + variant.lower()
+    names = [
+        n
+        for n in root_ggufs(files)
+        if not projector_named(n)
+        and (match := SPLIT_NAME.search(n))
+        and n[: match.start()].lower().endswith(suffix)
+    ]
+    if not names:
+        return None
+    return split_order(names, f"the split GGUF of {variant} at the root")
 
 
 def split_order(names, split):
@@ -295,6 +313,15 @@ def gguf_target(repo, names, scratch, *, projector=None):
     # The family bounds the layers whose tensors the screening lists.
     family = check_model("gguf", "none", config, gguf_metadata=metadata)
     gguf.require_loadable(header)
+    # A DeepSeek-V4.1 target's Engram tables lie in a file of their own
+    # beside its parts, which engram/ keeps apart from them.
+    if engram := gguf.engram_file(header):
+        path = str(Path(names[0]).with_name(engram))
+        if path not in repo.files:
+            raise models.ModelError(f"{repo.name} has no {path} beside the target")
+        with repo.open(path) as stream:
+            gguf.require_engram(header, gguf.Metadata(stream, tensors=True))
+        files["engram/" + engram] = path
     vision_format = "none"
     if projector is not None and family.vision:
         name, vision_header = projector(repo)
@@ -701,20 +728,36 @@ def _changes(installed, family, draft):
     return changes
 
 
+class NoDraft:
+    """The draft source of an installation without a draft (--draft-model
+    none, or a family no draft is released for), which decodes one token a
+    cycle: no files, and recorded as the draft repository models.NO_DRAFT."""
+
+    name = models.NO_DRAFT
+    revision = None
+    unreachable_reason = None
+    files = frozenset()
+
+    @staticmethod
+    def identity():
+        return {"repo": models.NO_DRAFT, "revision": None}
+
+
+NO_DRAFT = NoDraft()
+
+
 def _resolve_draft(family, selection, installed, target):
     """The draft's repository, --draft-model or else the family's DFlash2
     release, at the commit its default branch names now: one Hub request, as
     for the target, made only when the Hub answered for the target. Else the
     installed draft stands in, unlisted, or without one a commit the Hub
     cache holds for this selection; the installed draft also stands in, with
-    the reason, when the draft cannot be resolved. A family no draft is
-    released for takes --draft-model's."""
+    the reason, when the draft cannot be resolved. --draft-model none, and a
+    family no draft is released for without --draft-model, install none
+    (NO_DRAFT)."""
     name = selection.draft_model or family.draft_repo
-    if name is None:
-        raise models.ModelError(
-            f"no DFlash2 draft is released for {family.name}; "
-            "name one with --draft-model"
-        )
+    if name is None or name == models.NO_DRAFT:
+        return NO_DRAFT
     recorded = installed and installed["sources"]["draft"]
     asked = _answered(target)
     if recorded and not asked:
@@ -744,7 +787,10 @@ def _draft(target, installed, draft):
     """The draft repository and its downloaded files, by assembly path: draft,
     as this start resolved it, when it is not the installed draft, or else
     the installed one, which is kept too when draft cannot be fetched
-    (downloaded and checked for the target)."""
+    (downloaded and checked for the target). An installation without a draft
+    has no files of one."""
+    if draft is NO_DRAFT:
+        return draft, {}
     family = target.family
     recorded = installed and installed["sources"]["draft"]
     if draft.identity() != recorded:

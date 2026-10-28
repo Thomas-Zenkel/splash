@@ -18,6 +18,7 @@ from dev.tests.installer_fixtures import (
     CONFIGS,
     DENSE,
     DRAFT_COMMIT,
+    DRAFTLESS,
     GGUF_ONLY,
     MODEL,
     MOE,
@@ -81,15 +82,21 @@ class UpstreamTest(unittest.TestCase):
                     ),
                     family,
                 )
-        # Qwen3.8-Flash-Next and Flint load from a GGUF: the config and
-        # metadata the installer derives from it name the family, with and
-        # without its draft (Flint's flat config, its release's keys, and a
-        # test draft naming one of its reserved tokens as its mask), and
-        # another family's draft is refused.
+        # Qwen3.8-Flash-Next, Flint and DeepSeek-V4.1-Flash load from a GGUF:
+        # the config and metadata the installer derives from it name the
+        # family, with and without its draft (Flint's flat config, its
+        # release's keys, and a test draft naming one of its reserved tokens as
+        # its mask; DeepSeek-V4.1-Flash, which has none, by its release's
+        # config), and another family's draft is refused.
         for family in GGUF_ONLY:
             configs = CONFIGS / family.name.lower()
             gguf_check = {"gguf_metadata": configs / "gguf-metadata.json"}
-            for arguments in ({}, {"draft": configs / "draft" / "config.json"}):
+            drafts = (
+                ({},)
+                if family in DRAFTLESS
+                else ({}, {"draft": configs / "draft" / "config.json"})
+            )
+            for arguments in drafts:
                 self.assertIs(
                     upstream.check_model(
                         "gguf",
@@ -99,6 +106,16 @@ class UpstreamTest(unittest.TestCase):
                         **arguments,
                     ),
                     family,
+                )
+        for family in DRAFTLESS:
+            configs = CONFIGS / family.name.lower()
+            with self.assertRaisesRegex(models.ModelError, "decodes without a draft"):
+                upstream.check_model(
+                    "gguf",
+                    "none",
+                    configs / "config.json",
+                    gguf_metadata=configs / "gguf-metadata.json",
+                    draft=draft_dir(self.root / "draft", DENSE) / "config.json",
                 )
         flash = families.named("Qwen3.8-Flash-Next")
         configs = CONFIGS / flash.name.lower()
@@ -695,6 +712,23 @@ class UpstreamTest(unittest.TestCase):
             "draft/" + upstream.DRAFT_MASK_EMBEDDING,
             assembly.verify(chosen.link)["files"],
         )
+
+    def test_draft_model_none_installs_the_target_alone(self):
+        fake = FakeHub(self, self.cache)
+        fake.publish(
+            "someone/my-favourite-model", "a" * 40, lambda p: mlx_target(p, MOE)
+        )
+        chosen = selection(
+            self.root, "someone/my-favourite-model", draft_model=models.NO_DRAFT
+        )
+        self.prepare(chosen)
+        self.prepare(chosen)
+        self.assertNotIn(MOE.draft_repo, [repo for repo, _ in fake.requests])
+        record = assembly.verify(chosen.link)
+        self.assertEqual(
+            record["sources"]["draft"], {"repo": models.NO_DRAFT, "revision": None}
+        )
+        self.assertFalse((chosen.link / "draft").exists())
 
     def test_source_assembly_pairs_the_draft_by_architecture(self):
         fake = FakeHub(self, self.cache)
