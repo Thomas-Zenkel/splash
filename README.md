@@ -14,7 +14,11 @@ It reuses cached prefixes and batches concurrent requests automatically.
 
 ## Quick start
 
-Apple M3 or newer, macOS 26.4 or later, and [Homebrew](https://brew.sh).
+[Download the Splash desktop app](https://github.com/incoai/splash/releases/latest/download/Splash.dmg)
+for an Apple M3 or newer on macOS 26.4 or later, open the disk image and drag
+Splash into Applications.
+
+The command line needs the same Mac and [Homebrew](https://brew.sh):
 
 ```bash
 brew install incoai/tap/splash
@@ -23,7 +27,7 @@ splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M
 
 The first run downloads the model and its matching draft and starts serving
 on `127.0.0.1:8000`. Later starts reuse the downloads; leave room on disk for
-them ([storage requirements](DEVELOPMENT.md#model-storage)).
+them ([storage requirements](docs/server.md#model-storage)).
 
 Once it prints `Ready`, leave this terminal open. Open <http://127.0.0.1:8000>
 in your browser, or run an installed coding agent from another terminal:
@@ -53,14 +57,14 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 Reasoning follows the model default; `"reasoning_effort": "none"` turns it off
 in Chat. Anthropic Messages requests reason only when they set `thinking`.
-[Reasoning settings](DEVELOPMENT.md#default-reasoning-effort) ·
-[Tool calls](DEVELOPMENT.md#tool-calls) ·
-[API details](DEVELOPMENT.md#api)
+[Reasoning settings](docs/server.md#default-reasoning-effort) ·
+[Tool calls](docs/api.md#tool-calls) ·
+[API details](docs/api.md)
 
 ## Models
 
 Splash supports these model families, with a matching DFlash2 draft selected
-automatically where the family has one:
+automatically:
 
 | Model | GGUF example | MLX 4-bit |
 | --- | --- | --- |
@@ -69,16 +73,17 @@ automatically where the family has one:
 | Ornith-1.5-122B | `unsloth/Ornith-1.5-122B-GGUF:UD-Q4_K_XL` | `ornith-ai/Ornith-1.5-122B-MLX-4bit` |
 | Qwen3.8-Flash-Next | `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0` | — |
 | Flint | `unsloth/flint-GGUF:UD-Q4_K_XL` | — |
-| DeepSeek-V4.1-Flash | `ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF:IQ1_M` | — |
 
-DeepSeek-V4.1-Flash has no DFlash2 draft and decodes one token a cycle. Its
-IQ1_M build (120.7 GB) streams its routed experts from the SSD, and its Engram
-tables, a file of their own (110.6 GB) that installs with it, always stream; a
-48 GB Mac serves it at 7–9 tokens per second. With `--draft-model
+Splash also serves DeepSeek-V4.1-Flash
+(`ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF:IQ1_M`), which has no
+DFlash2 draft and decodes one token a cycle. Its IQ1_M build (120.7 GB)
+streams its routed experts from the SSD, and its Engram tables, a file of
+their own (110.6 GB) that installs with it, always stream; a 48 GB Mac serves
+it at 8–11 tokens per second. With `--draft-model
 unsloth/DeepSeek-V4.1-Flash-1017-GGUF` (or a local `dspark-*.gguf`) it decodes
 with its own block drafter DSpark (8 GB, which its experts then lack): on a
 48 GB Mac about 20% faster on prose, more with memory to spare
-([drafts](DEVELOPMENT.md#drafts)).
+([drafts](docs/models.md#drafts)).
 
 Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats
 up to `UD-Q8_K_XL`, whose BF16 tensors load too. Whole-BF16 and F16 models are
@@ -96,8 +101,8 @@ checkpoints and NVFP4 GGUFs also load. Smaller variants run on
 [Flash-Next variants](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main)
 
 Vision and the tokenizer come from the target model's source.
-[Model loading and compatibility](DEVELOPMENT.md#upstream-model-loading) ·
-[Supported formats](DEVELOPMENT.md#gguf-targets)
+[Model loading and compatibility](docs/models.md#upstream-model-loading) ·
+[Supported formats](docs/models.md#gguf-targets)
 
 To serve files already on this Mac, pass the target's GGUF file or GGUF/MLX
 directory directly, and a compatible local DFlash2 draft:
@@ -111,7 +116,7 @@ splash serve --model local/qwen \
 This prepares local files without contacting the Hub; `--model` is the name
 reported by the API. Omit `--draft-model` to use the family's draft from the
 Hub cache, or add `--mmproj /models/mmproj-BF16.gguf` for a GGUF's vision.
-See [local model files](DEVELOPMENT.md#local-model-files) for details.
+See [local model files](docs/models.md#local-model-files) for details.
 
 ## Settings
 
@@ -133,11 +138,11 @@ window. To set your own limits or cache options, add these to `splash serve`:
 Use `--max-memory` to leave room for other applications.
 The server listens on localhost without authentication by default. For LAN
 access, authentication, browser apps on other origins, and other options, see
-[server configuration](DEVELOPMENT.md#server-configuration) or
+[server configuration](docs/server.md#server-configuration) or
 `splash serve --help`.
-[KV precision](DEVELOPMENT.md#kv-cache-precision) ·
-[SSD cache](DEVELOPMENT.md#ssd-cache) ·
-[Advanced memory settings](DEVELOPMENT.md#memory-and-context)
+[KV precision](docs/server.md#kv-cache-precision) ·
+[SSD cache](docs/server.md#ssd-cache) ·
+[Advanced memory settings](docs/server.md#memory-and-context)
 
 ## Performance
 
@@ -157,7 +162,7 @@ Strata serving the same GGUF on that Mac.
 
 [Launch benchmarks](https://inco.ai/blog/splash/) ·
 [Measurement details](docs/performance.md#splash-10-launch-benchmarks) ·
-[Run benchmarks locally](DEVELOPMENT.md#local-benchmarks)
+[Run benchmarks locally](docs/validate.md#local-benchmarks)
 
 ### GGUF against llama.cpp
 
@@ -195,7 +200,7 @@ ship precompiled, with no Xcode or local tuning required.
 
 ## More
 
-- [Development](DEVELOPMENT.md): configuration, API, internals, building, and testing.
+- [Documentation](docs/README.md): configuration, API, internals, building, and testing.
 - [Issues and feedback](https://github.com/incoai/splash/issues)
 - [Apache-2.0](LICENSE). GGUF kernels include MIT-licensed material from
   llama.cpp; see [third-party notices](THIRD_PARTY_NOTICES). Model weights keep their own licenses.

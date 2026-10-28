@@ -47,6 +47,8 @@ jobs:
         run: make check-native-build
       - name: Run native sanitizers
         run: make test-sanitizers
+      - name: Test the desktop app
+        run: make check-app
 
   python-compatibility:
     name: Python compatibility ${{ matrix.python-version }}
@@ -92,7 +94,7 @@ jobs:
     # quality gates. The job must fail on an engine/test result, not an
     # arbitrary job timer.
     timeout-minutes: 360
-    # The Metal suite once, then each model of DEVELOPMENT.md's Release check
+    # The Metal suite once, then each model of docs/validate.md's Release check
     # (MLX and GGUF, dense and MoE, each at one commit) against the runner's
     # retained baseline build, RUNNER_BASELINE, which release-check requires
     # and which must load every model: the previous release's build, or while

@@ -136,17 +136,20 @@ def template_options(
     return options
 
 
-def render_chat_template(tokenizer, messages, options):
+def render_chat_template(
+    tokenizer, messages, options, aliases=REASONING_EFFORT_ALIASES
+):
     """Render as requests and the startup probe do: a template that rejects
-    the reasoning effort renders its alias instead, and one that rejects
-    "none" while thinking is off renders by enable_thinking alone."""
+    the reasoning effort renders its alias instead (the probe renders without
+    aliases too, to find the efforts a template renders itself), and one that
+    rejects "none" while thinking is off renders by enable_thinking alone."""
     try:
         return tokenizer.apply_chat_template(messages, **options)
     except TemplateError as error:
         effort = options.get("reasoning_effort")
         retry = dict(options)
-        if effort in REASONING_EFFORT_ALIASES:
-            retry["reasoning_effort"] = REASONING_EFFORT_ALIASES[effort]
+        if effort in aliases:
+            retry["reasoning_effort"] = aliases[effort]
         elif effort == "none" and options.get("enable_thinking") is False:
             del retry["reasoning_effort"]
         else:
@@ -172,6 +175,10 @@ class ChatTemplate:
     generation_prompts: dict
     # The same for other options, probed on first use.
     probe: Callable
+    # What the reasoning efforts do to a question's prompt, and the listed
+    # effort each renders like (_reasoning).
+    reasoning: dict
+    effort_names: dict
 
     def accepts(self, messages):
         """Whether requests with these normalized messages are served: a
@@ -262,9 +269,12 @@ def _generation_description(prompts):
 
 
 def _renderer(tokenizer):
-    def render(source, messages, options):
+    def render(source, messages, options, aliases=REASONING_EFFORT_ALIASES):
         return render_chat_template(
-            tokenizer, messages, {**options, "chat_template": source, "tokenize": False}
+            tokenizer,
+            messages,
+            {**options, "chat_template": source, "tokenize": False},
+            aliases,
         )
 
     return render
@@ -304,6 +314,7 @@ def _prepare(render, encode, source):
         original,
         _generation_prompts(render, encode, source),
         probe,
+        *_reasoning(render, source),
     )
 
 
@@ -396,16 +407,78 @@ def _generation_key(options):
     )
 
 
+def _effort_options(effort):
+    """A request's template options with this reasoning effort alone."""
+    return template_options(
+        reasoning_effort=effort,
+        preserve_thinking=None,
+        tools=None,
+        add_generation_prompt=True,
+    )
+
+
+def _reasoning(render, source):
+    """What the reasoning efforts do to a question's prompt, as /v1/models
+    reports it, and each effort's name there. The report: whether a request
+    that sends none thinks; the efforts besides none that the template
+    renders, and differently, each named by the one of those rendering alike
+    that its alias does not stand in for, none where all render alike; and
+    the one a request that sends none renders like, None where it is none of
+    them. The names: each effort that renders like one of them -> that one.
+    An alias that renders alike stands in for an effort unless the template
+    renders the effort itself and not the alias: xhigh and max are each
+    other's aliases, and a template renders one of them for the other."""
+
+    def rendered(effort, aliases=REASONING_EFFORT_ALIASES):
+        options = _effort_options(effort)
+        return tuple(
+            _outcome(
+                lambda *rendering: render(*rendering, aliases),
+                source,
+                messages,
+                options,
+            )
+            for messages in ([_ASK], [_SYSTEM, _ASK])
+        )
+
+    groups = {}
+    for effort in REASONING_EFFORTS:
+        if effort != "none":
+            prompts = rendered(effort)
+            # An effort the template rejects renders no prompt (_outcome).
+            if all(isinstance(prompt, str) for prompt in prompts):
+                groups.setdefault(prompts, []).append(effort)
+
+    def itself(effort):
+        """Whether the template renders this effort without its alias."""
+        return all(isinstance(prompt, str) for prompt in rendered(effort, {}))
+
+    names = {}
+    if len(groups) > 1:
+        for group in groups.values():
+            name = next(
+                (
+                    e
+                    for e in group
+                    if REASONING_EFFORT_ALIASES.get(e) not in group
+                    or (itself(e) and not itself(REASONING_EFFORT_ALIASES[e]))
+                ),
+                group[0],
+            )
+            names |= dict.fromkeys(group, name)
+    default = rendered(None)
+    return {
+        "thinks": default != rendered("none"),
+        "efforts": list(dict.fromkeys(names.values())),
+        "default": names.get(groups.get(default, [None])[0]),
+    }, names
+
+
 def _generation_prompts(render, encode, source):
     """The generation prompt for each reasoning effort a request can pass."""
     prompts = {}
     for effort in (None, *REASONING_EFFORTS):
-        options = template_options(
-            reasoning_effort=effort,
-            preserve_thinking=None,
-            tools=None,
-            add_generation_prompt=True,
-        )
+        options = _effort_options(effort)
         if found := _generation_prompt(render, encode, source, options):
             prompts[_generation_key(options)] = found
     return prompts

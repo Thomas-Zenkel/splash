@@ -592,6 +592,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     "context_length": self.app.max_context,
                     "vision": self.app.vision,
                     "input_modalities": self.app.input_modalities,
+                    "reasoning": self.app.reasoning,
                     **(
                         {"root": self.app.response_model}
                         if name != self.app.response_model
@@ -1860,7 +1861,7 @@ def main():
             if effective_context % 1024 == 0
             else f"{effective_context:,}"
         )
-        mode = "" if readiness.vision else " · language only"
+        mode = "" if readiness.vision else " · text only"
         print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
         server.serve_forever()
     except (

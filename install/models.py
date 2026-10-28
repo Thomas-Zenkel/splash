@@ -53,7 +53,7 @@ MAX_JSON_BYTES = 64 * 1024 * 1024
 # package an earlier release installed.
 ASSEMBLY, PACKAGE = "assembly", "package"
 # The --draft-model of an installation without a draft, which decodes one
-# token a cycle (DEVELOPMENT.md, Drafts), as is the installation of a family
+# token a cycle (docs/models.md, Drafts), as is the installation of a family
 # no draft is released for.
 NO_DRAFT = "none"
 # Splash packages, the prebuilt format that predated upstream loading, are no
@@ -378,7 +378,11 @@ def parse_args(argv=None):
         help="skip vision preparation and loading",
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("prepare")
+    commands.add_parser("prepare").add_argument(
+        "--json-progress",
+        action="store_true",
+        help="also report download progress as JSON lines on stdout",
+    )
     commands.add_parser("verify").add_argument("--full", action="store_true")
     commands.add_parser("link", help="print the selection link")
     return parser.parse_args(argv)
@@ -397,13 +401,15 @@ def main(argv=None):
         print(selection.link)
         return 0
     # The installers import this module, so it imports them once it exists.
-    from . import assembly, upstream
+    from . import assembly, hub, upstream
 
     try:
         # The launcher starts this with the stop signals blocked, so that one
         # sent while it starts is not lost; it arrives here.
         signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
         if args.command == "prepare":
+            if args.json_progress:
+                hub.report_json_progress()
             upstream.prepare(selection)
         else:
             kind = installation_kind(selection.link)
@@ -435,4 +441,12 @@ if __name__ == "__main__":
     import importlib
 
     installer = importlib.import_module("install.models")
-    raise SystemExit(installer.main())
+    status = installer.main()
+    if status == 130:
+        # Interrupted, a download goes on in huggingface_hub's threads, which
+        # the interpreter would wait for at exit (hub._interruptible): end
+        # the process at once, its output written.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(status)
+    raise SystemExit(status)

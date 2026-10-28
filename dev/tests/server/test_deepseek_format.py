@@ -488,6 +488,12 @@ class DeepSeekPromptTests(unittest.TestCase):
 
     def test_each_effort_opens_the_think_block_but_none(self):
         frontend = self.frontend()
+        # Its template knows low, high (its default) and max, which /v1/models
+        # names the others by, as they render as their aliases.
+        self.assertEqual(
+            frontend.reasoning,
+            {"thinks": True, "efforts": ["low", "high", "max"], "default": "high"},
+        )
         for effort in REASONING_EFFORTS:
             with self.subTest(effort=effort):
                 body = fixtures.chat_body(reasoning_effort=effort)

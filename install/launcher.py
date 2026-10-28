@@ -233,6 +233,12 @@ def serve(args):
     if args.offline:
         # The installer and the server both read it.
         os.environ["HF_HUB_OFFLINE"] = "1"
+    if sys.dont_write_bytecode:
+        # A child inherits the environment, not -B: every Python program
+        # serve starts, down to the server's PDF workers, writes no bytecode
+        # either, so a runtime inside a signed app never gains __pycache__
+        # folders, which break its signature.
+        os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     # Keep both locks across exec until the foreground server exits.
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     with (
@@ -313,6 +319,16 @@ def serve(args):
         os.execve(command[0], command, environment)
 
 
+def _renders_later_system(port):
+    """Whether every chat template of the server renders a later system
+    message in place; a server that does not say renders none."""
+    status = _request_json("/status", port=port)
+    template = status.get("chat_template") if isinstance(status, dict) else None
+    outcome = template.get("later_system") if isinstance(template, dict) else None
+    outcomes = list(outcome.values()) if isinstance(outcome, dict) else [outcome]
+    return all(outcome in ("native", "patched") for outcome in outcomes)
+
+
 def coding_client(args):
     path = clients.find_executable(args.command)
     listing = _request_json("/v1/models", port=args.port)
@@ -353,6 +369,7 @@ def coding_client(args):
         input_modalities=models[0].get("input_modalities"),
         client_args=args.client_args,
         client_version=client_version,
+        later_system=args.command == "pi" and _renders_later_system(args.port),
     )
     print(f"Starting {args.command}: {model} · {context:,} context tokens", flush=True)
     if args.command == "claude":
@@ -437,6 +454,7 @@ def parse_args(argv=None):
             "/status report the effective context limit; a client may impose a\n"
             "smaller one. Keep this terminal open; Ctrl+C stops serving."
         ),
+        allow_abbrev=False,
     )
     # The launcher's own options join the shared options' groups: the model
     # options first, --port among the network options.

@@ -148,6 +148,32 @@ class InstallerTest(unittest.TestCase):
             alone.link, installer.Selection.of(self.root, self.MODEL_ID).link
         )
 
+    def test_prepare_json_progress_has_downloads_report_their_progress(self):
+        reporting = []
+        base = ["--models", str(self.root), "--model", self.MODEL_ID, "prepare"]
+        with (
+            mock.patch.object(hub, "json_progress", False),
+            mock.patch("huggingface_hub.utils.disable_progress_bars") as bars,
+            mock.patch(
+                "install.upstream.prepare",
+                side_effect=lambda selection: reporting.append(
+                    (hub.json_progress, bars.call_count)
+                ),
+            ),
+        ):
+            self.assertEqual(installer.main(base), 0)
+            self.assertEqual(installer.main([*base, "--json-progress"]), 0)
+        # JSON lines in place of huggingface_hub's bars, which would break them.
+        self.assertEqual(reporting, [(False, 0), (True, 1)])
+        # Only prepare downloads.
+        with (
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            installer.parse_args(
+                ["--model", self.MODEL_ID, "verify", "--json-progress"]
+            )
+
     def test_variant_model_ids_parse_and_name_selection_links(self):
         self.assertEqual(
             installer.split_model_id("owner/repo:UD-Q4_K_M"),
@@ -420,6 +446,41 @@ class ScriptEntryTests(unittest.TestCase):
                 timeout=60,
             )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_an_interrupted_installer_exits_without_waiting_for_its_downloads(self):
+        # Interrupted, a download goes on in huggingface_hub's pool, whose
+        # thread the interpreter would join at exit, a minute here.
+        script = (
+            "import runpy, time\n"
+            "from concurrent.futures import ThreadPoolExecutor\n"
+            "from install import upstream\n"
+            "def prepare(selection):\n"
+            "    ThreadPoolExecutor(1).submit(time.sleep, 60)\n"
+            "    raise KeyboardInterrupt\n"
+            "upstream.prepare = prepare\n"
+            "runpy.run_path('install/models.py', run_name='__main__')\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    script,
+                    "--models",
+                    temporary,
+                    "--model",
+                    "someone/model",
+                    "prepare",
+                ],
+                cwd=Path(installer.__file__).resolve().parents[1],
+                env={"HOME": temporary, "HF_HUB_OFFLINE": "1"},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        self.assertEqual(
+            (result.returncode, result.stdout, result.stderr), (130, "", "")
+        )
 
 
 if __name__ == "__main__":
