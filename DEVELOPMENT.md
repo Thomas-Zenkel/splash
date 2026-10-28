@@ -2110,7 +2110,14 @@ leave the target's experts that much less memory: on a 48 GB M4 Pro they got
 17.5 GiB instead of 25.5 GiB, and greedy prose of 128 tokens decoded at 11.6
 tokens per second over five runs (10.96 to 12.32) against 10.8 without DSpark
 (10.66 to 10.84), the budget verifying about 1.5 proposals a cycle and the
-target accepting 68-80% of them. Its own work takes about 10 ms of a cycle.
+target accepting 68-80% of them; with a decode step's load split around its
+resident experts' passes and its experts' repack writing whole tiles
+([Streamed experts](#streamed-experts)), 13.15 (12.67 to 13.47) against 10.8.
+Its own work takes about 10 ms of a cycle. Its cycles' verify budget starts
+from a prior of its own (`VerifyBudget::kDSparkPrior`, slope 0.82, its
+proposals' intercepts 0 to 0.4), the fit of its labels, as the budget's prior
+from Qwen's DFlash2 drafts underrates its later proposals by 0.6 to 1.2 in
+logit until its own labels outweigh it.
 
 ### Vision
 

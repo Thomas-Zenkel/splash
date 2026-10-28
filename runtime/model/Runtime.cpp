@@ -491,8 +491,9 @@ struct Runtime::Impl {
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
     penaltyTable =
         decodeArena->batchSlice(DecodeTensor::PenaltyState, kLaneCount);
+    // DSpark's confidences are its own: its cycles start from its prior.
     if (budgetsVerifyRows(model, value.verifyRows))
-      verifyBudget.emplace();
+      verifyBudget.emplace(model.draft.layout.dspark() ? VerifyBudget::kDSparkPrior : VerifyBudget::kPrior);
     preparePolicyPipelines();
   }
 
