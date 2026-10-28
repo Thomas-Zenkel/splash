@@ -46,3 +46,15 @@ struct ManifoldHyperParams {
 
 static_assert(sizeof(ManifoldHyperParams) == 20,
               "manifold hyper-connection parameters are 20 bytes on both sides");
+
+// Each row's streams averaged into bf16 columns from `offset` on of rows
+// `stride` wide (mhc_stream_mean): a DSpark draft's view of the target's
+// hidden rows at a layer's input.
+struct MhcMeanParams {
+  uint32_t rows;
+  uint32_t hidden;
+  uint32_t stride;
+  uint32_t offset;
+};
+
+static_assert(sizeof(MhcMeanParams) == 16, "manifold hyper-connection mean parameters are 16 bytes on both sides");

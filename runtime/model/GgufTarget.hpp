@@ -5,6 +5,7 @@
 // weights (BlockTargetFormat).
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -45,6 +46,12 @@ public:
                    const std::vector<std::filesystem::path> &paths, std::string_view architecture,
                    const QwenTargetDimensions &geometry, SparseRowStoreOptions table = {},
                    ExpertStoreOptions experts = {});
+  // The images `plan` makes of the GGUF at `paths` instead (a DSpark draft's,
+  // gguf::planDSparkImages): each of `layers` layers' image, then the head's
+  // and the embedding's, every routed expert loading with its layer.
+  GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
+                   const std::vector<std::filesystem::path> &paths,
+                   const std::function<std::vector<gguf::Image>(const GgufFile &)> &plan, uint32_t layers);
   GgufTargetLoader(const GgufTargetLoader &) = delete;
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
 

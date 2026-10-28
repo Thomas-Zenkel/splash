@@ -47,6 +47,11 @@ struct ManifoldHyperConnection final {
   static void addPreNorm(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer mixes,
                          metal::MetalBuffer norm, metal::MetalBuffer output, ManifoldHyperShape shape,
                          uint32_t rows);
+  // out = bf16 [rows][stride]: each row's streams averaged into its columns
+  // from `offset` on, `hidden` of them: a DSpark draft's view of the
+  // target's hidden rows at a layer's input (model/DSpark.hpp).
+  static void addStreamMean(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer out,
+                            uint32_t stride, uint32_t offset, ManifoldHyperShape shape, uint32_t rows);
   // The streams, in place, after a sublayer whose output `branch` (bf16
   // [rows][hidden]) they take by the post weights and comb matrix of
   // `mixes`.

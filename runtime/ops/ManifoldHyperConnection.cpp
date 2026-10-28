@@ -38,6 +38,18 @@ void ManifoldHyperConnection::addInit(metal::CommandGraph &graph, metal::MetalBu
             {rows, (shape.hidden + kThreads - 1) / kThreads, 1}, {kThreads, 1, 1});
 }
 
+void ManifoldHyperConnection::addStreamMean(metal::CommandGraph &graph, metal::MetalBuffer streams,
+                                            metal::MetalBuffer out, uint32_t stride, uint32_t offset,
+                                            ManifoldHyperShape shape, uint32_t rows) {
+  requireShape(shape, rows);
+  if (uint64_t{offset} + shape.hidden > stride) throw std::invalid_argument("invalid manifold hyper-connection mean");
+  requireStreams(streams, shape, rows);
+  requireBytes(out, (uint64_t{rows - 1} * stride + offset + shape.hidden) * sizeof(uint16_t),
+               "manifold hyper-connection mean");
+  graph.add("mhc_stream_mean", {std::move(streams), std::move(out)}, MhcMeanParams{rows, shape.hidden, stride, offset},
+            {rows, (shape.hidden + kThreads - 1) / kThreads, 1}, {kThreads, 1, 1});
+}
+
 uint64_t ManifoldHyperConnection::mixScratchBytes(ManifoldHyperShape shape, uint32_t rows) noexcept {
   const uint64_t chunks = (uint64_t{shape.width()} + MHC_MIX_CHUNK - 1) / MHC_MIX_CHUNK;
   return uint64_t{rows} * chunks * MHC_MIX_ROW_PARTIALS * sizeof(float);

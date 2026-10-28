@@ -144,6 +144,21 @@ kernel void mhc_init(device const bfloat *embedding [[buffer(0)]],
   for (uint s = 0; s < kStreams; ++s) x[s * p.hidden] = e;
 }
 
+// Each row's streams averaged (MhcMeanParams), as bf16 into columns from
+// p.offset on of rows p.stride wide. A thread per row and value.
+kernel void mhc_stream_mean(device const float *streams [[buffer(0)]],
+                            device bfloat *out [[buffer(1)]],
+                            constant MhcMeanParams &p [[buffer(2)]],
+                            uint2 group [[threadgroup_position_in_grid]],
+                            uint tid [[thread_index_in_threadgroup]]) {
+  const uint row = group.x, d = group.y * kThreads + tid;
+  if (row >= p.rows || d >= p.hidden) return;
+  device const float *x = streams + ulong(row) * kStreams * p.hidden + d;
+  float sum = 0.0f;
+  for (uint s = 0; s < kStreams; ++s) sum += x[s * p.hidden];
+  out[ulong(row) * p.stride + p.offset + d] = bfloat(sum / float(kStreams));
+}
+
 // A sublayer's input: the streams summed by a mix's pre weights, then RMS
 // normalized and scaled by the sublayer's norm, as bf16. A threadgroup per
 // row; each thread keeps its share of the row.

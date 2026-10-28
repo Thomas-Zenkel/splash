@@ -1068,6 +1068,84 @@ std::vector<Image> planImages(const GgufFile &file, std::string_view architectur
   return images;
 }
 
+std::vector<Image> planDSparkImages(const GgufFile &file, const QwenTargetDimensions &g, uint32_t mainLayers,
+                                    uint32_t markovRank) {
+  const GgufMetadata &metadata = file.metadata();
+  const std::string arch = "dflash";
+  if (metadata.architecture() != arch)
+    throw GgufError("GGUF architecture is " + metadata.architecture() + ", but a DSpark draft's is " + arch);
+  const DeepSeek41Dimensions &d = g.deepseek;
+  std::string mismatched;
+  const auto mismatch = [&](std::string_view key) { mismatched += (mismatched.empty() ? "" : ", ") + std::string(key); };
+  const auto expect = [&](const char *key, uint64_t value) {
+    if (metadata.unsignedValue(arch + "." + key) != value) mismatch(key);
+  };
+  const auto expectFloat = [&](const char *key, double value) {
+    const std::optional<double> found = metadata.floatValue(arch + "." + key);
+    if (!found || std::abs(*found - value) > value * 1e-6) mismatch(key);
+  };
+  expect("block_count", g.layers);
+  expect("embedding_length", g.hiddenSize);
+  expect("attention.head_count", g.attentionWidth / g.attentionHeadDimension);
+  expect("attention.head_count_kv", g.attentionKvHeads);
+  expect("attention.key_length", g.attentionHeadDimension);
+  expect("attention.value_length", g.attentionHeadDimension);
+  expect("rope.dimension_count", 2ull * g.rotaryPairs);
+  expect("attention.q_lora_rank", d.queryRank);
+  expect("attention.output_lora_rank", d.outputRank);
+  expect("attention.output_group_count", d.outputGroups);
+  expect("attention.sliding_window", g.slidingWindow);
+  expect("hyper_connection.count", MHC_STREAMS);
+  expect("hyper_connection.sinkhorn_iterations", d.sinkhornIterations);
+  expect("expert_count", g.experts);
+  expect("expert_used_count", g.expertsPerToken);
+  expect("expert_feed_forward_length", g.expertIntermediateSize);
+  expect("expert_shared_count", g.sharedExpertSlices);
+  expect("expert_gating_func", DeepSeek41Gguf::kSqrtSoftplusGating);
+  expect("expert_weights_norm", 1);
+  expectFloat("rope.freq_base", g.rotaryTheta);
+  expectFloat("attention.layer_norm_rms_epsilon", d.normEpsilon);
+  expectFloat("hyper_connection.epsilon", d.hcEpsilon);
+  expectFloat("expert_weights_scale", d.routeScale);
+  // Every layer attends its window alone, and clamps every SwiGLU.
+  const auto every = [&](const char *key, double value) {
+    const auto values = file.numericArray(arch + "." + key);
+    bool same = values && values->size() == g.layers;
+    for (uint32_t layer = 0; same && layer < g.layers; ++layer) same = (*values)[layer] == value;
+    if (!same) mismatch(key);
+  };
+  every("attention.compress_ratios", 0.0);
+  every("swiglu_clamp_exp", d.swigluLimit);
+  every("swiglu_clamp_shexp", d.swigluLimit);
+  if (!mismatched.empty()) throw GgufError("DSpark GGUF metadata does not match its target: " + mismatched);
+
+  std::vector<std::string> problems;
+  std::vector<Image> images;
+  for (uint32_t index = 0; index < g.layers; ++index) {
+    Builder layer(file, g, problems, "dspark-layer-" + std::to_string(index) + ".bin", index, 1);
+    DeepSeek41Gguf::layer(layer, g, index);
+    images.push_back(layer.finish());
+  }
+  Builder head(file, g, problems, "dspark-head.bin", g.layers, 2);
+  head.floatNorm("enc.output_norm.weight", g.hiddenSize);
+  head.quantized("fc.weight", g.hiddenSize, uint64_t{mainLayers} * g.hiddenSize);
+  head.floatNorm("output_norm.weight", g.hiddenSize);
+  head.floatTensor("markov_w2.weight", g.vocabularySize, markovRank);
+  head.floatNorm("conf_proj.weight", uint64_t{g.hiddenSize} + markovRank);
+  images.push_back(head.finish());
+  Builder markov(file, g, problems, "dspark-markov.bin", g.vocabularySize, markovRank);
+  if (const GgufTensor *rows = file.find("markov_w1.weight"); rows && rows->rows() != g.vocabularySize)
+    throw GgufError("unexpected shape for markov_w1.weight");
+  markov.nativeTable("markov_w1.weight", markovRank);
+  images.push_back(markov.finish());
+  if (!problems.empty()) {
+    std::string names;
+    for (const std::string &problem : problems) names += (names.empty() ? "" : ", ") + problem;
+    throw GgufError("DSpark GGUF tensors this build cannot load: " + names);
+  }
+  return images;
+}
+
 StreamedRows tableRows(const GgufFile &file, const std::string &name, uint64_t columns) {
   const GgufTensor &tensor = file.require(name);
   if (file.rotation()) throw GgufError("the tables of a rotated GGUF do not stream: " + name);

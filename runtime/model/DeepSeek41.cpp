@@ -32,8 +32,10 @@ ops::Projection floatProjection(WeightFile &file, const BlockTargetFormat &forma
   return projection;
 }
 
-DeepSeek41LayerWeights readLayer(WeightFile &file, const BlockTargetFormat &format, const DeepSeek41Layout &layout,
-                                 const MoeExperts &experts, uint32_t index) {
+} // namespace
+
+DeepSeek41LayerWeights readDeepSeek41Layer(WeightFile &file, const BlockTargetFormat &format,
+                                           const DeepSeek41Layout &layout, const MoeExperts &experts, uint32_t index) {
   const DeepSeek41Dimensions &d = layout.deepseek;
   const uint32_t hidden = layout.hiddenSize, latent = layout.attentionHeadDimension;
   const auto has = [&](uint64_t layers) { return DeepSeek41Dimensions::has(layers, index); };
@@ -78,8 +80,6 @@ DeepSeek41LayerWeights readLayer(WeightFile &file, const BlockTargetFormat &form
   layer.ffn = readMoeBlock(file, layout, experts, index);
   return layer;
 }
-
-} // namespace
 
 void requireDeepSeek41Layout(const DeepSeek41Layout &layout) {
   const DeepSeek41Dimensions &d = layout.deepseek;
@@ -167,7 +167,7 @@ DeepSeek41Weights loadDeepSeek41Weights(metal::MetalBackend &backend, DeepSeek41
   result.layers.reserve(layout.layers);
   for (uint32_t index = 0; index < layout.layers; ++index) {
     WeightFile file = loader.layer(index);
-    result.layers.push_back(readLayer(file, format, layout, experts, index));
+    result.layers.push_back(readDeepSeek41Layer(file, format, layout, experts, index));
     file.finish();
     result.files.push_back(file.record());
   }

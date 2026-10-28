@@ -29,8 +29,23 @@
 // rows from ENGRAM_GGUF are staged by a model::SparseRowStore per table and
 // gathered on the GPU (ops::Embedding over the staging), as the target will
 // read them.
+//
+// With DEEPSEEK41_DSPARK=<dspark GGUF> (model/DSpark.hpp, its experts loaded
+// whole beside the target's store) it generates speculatively instead: after
+// the prompt, each cycle DSpark drafts a block from the last token, and one
+// verify step of the target's decode plans takes it and the drafts (a lane's
+// rows), keeps the drafts up to the first its argmax rejects and the token it
+// predicts there; DSpark's rings take the latents of the kept rows' hidden
+// views (the target layers' input streams averaged). It prints the drafts
+// kept per cycle and the time of the drafts and of the verify steps, and the
+// tokens, which equal the greedy decode's up to the numerics of a step of
+// more rows. With DEEPSEEK41_DSPARK_THRESHOLD=<score> a cycle verifies only
+// the drafts up to the first whose confidence is below it, and the anchor
+// alone where the first is. It prints every cycle's drafts' confidences, the
+// drafts it verified and kept, and the verify steps' median time by rows.
 #include "metal/BackendInstrumentation.hpp"
 #include "metal/MetalBackend.hpp"
+#include "model/DSpark.hpp"
 #include "model/DeepSeek41.hpp"
 #include "model/EngramHash.hpp"
 #include "model/ExpertStore.hpp"
@@ -49,6 +64,7 @@
 #include "ops/Linear.hpp"
 #include "ops/ManifoldHyperConnection.hpp"
 #include "ops/MoE.hpp"
+#include "ops/Normalization.hpp"
 #include "ops/RowCopy.hpp"
 
 #include <algorithm>
@@ -234,11 +250,15 @@ public:
   // Starts a step of `tokens` at the sequence's next positions.
   void begin(const std::vector<uint32_t> &tokens) {
     rows_ = uint32_t(tokens.size());
-    decode_ = decodeKernels_ && rows_ == 1;
+    // A step of a lane's rows at most runs the decode plans of one lane, as a
+    // verify step does.
+    const bool lane = rows_ <= model::ExecutionLimits::targetVerifyRows;
+    decode_ = decodeKernels_ && lane;
     // The last step's commands ran: its buffers serve this one.
     for (auto &[bytes, buffer] : taken_) free_.emplace(bytes, std::move(buffer));
     taken_.clear();
-    pooled_ = rows_ == 1;
+    pooled_ = lane;
+    verifyRows_ = upload(std::vector<uint32_t>{rows_});
     if (!rows_ || past_ + rows_ > capacity_)
       throw std::runtime_error("the sequence holds " + std::to_string(capacity_) + " tokens");
     std::vector<uint32_t> positions(rows_);
@@ -252,9 +272,30 @@ public:
     previousMixes_ = upload(first);
     chunks_ = alloc(ops::ManifoldHyperConnection::mixScratchBytes(mhc_, rows_));
     routes_.clear();
+    if (captureLayers_) mainHidden_ = alloc(uint64_t{pad(rows_)} * captureLayers_ * layout_.hiddenSize * 2);
   }
-  // Ends the step: its rows are the sequence's.
+  // Ends the step: its rows are the sequence's, or the first `kept` of them.
   void end() { past_ += rows_; }
+  void end(uint32_t kept) {
+    if (kept > rows_) throw std::runtime_error("a step keeps more rows than it ran");
+    past_ += kept;
+  }
+  // Each step's hidden views of `layers` layers (capture), for DSpark.
+  void captures(uint32_t layers) { captureLayers_ = layers; }
+  // The streams at the input of the layer about to run, averaged into
+  // capture slot `slot` of the step's hidden views.
+  void capture(uint32_t slot) {
+    const uint32_t hidden = layout_.hiddenSize;
+    ops::ManifoldHyperConnection::addStreamMean(*pending_, streams_, mainHidden_, captureLayers_ * hidden,
+                                                slot * hidden, mhc_, rows_);
+  }
+  // The step's hidden views, bf16 [rows][capture layers * hidden], after the
+  // work added so far runs.
+  [[nodiscard]] const MetalBuffer &mainHidden() {
+    flush();
+    return mainHidden_;
+  }
+  [[nodiscard]] uint32_t past() const noexcept { return past_; }
 
   // Embeds the step's tokens into the streams, four copies of each row.
   void embed() {
@@ -584,7 +625,8 @@ private:
   const model::DeepSeek41Layout &layout_;
   const model::DeepSeek41Dimensions &d_;
   ops::ExecutionPlans operators_;
-  uint32_t capacity_ = 0, rows_ = 0, past_ = 0;
+  uint32_t capacity_ = 0, rows_ = 0, past_ = 0, captureLayers_ = 0;
+  MetalBuffer mainHidden_;
   metal::CommandTiming timing_{};
   // Decode steps' buffers: those the current step took, and the free ones by
   // size (alloc).
@@ -613,6 +655,268 @@ private:
   // none yet).
   MetalBuffer selected_;
   uint32_t selectedStride_ = 0;
+};
+
+// DSpark (model/DSpark.hpp) beside the forward pass: each of its layers' ring
+// of the latents of the target rows' hidden views at the last 128 positions,
+// and a block's draft from the target's last token, on the decode plans of
+// one lane; the Markov head's chain and the confidence on the host.
+class Drafter {
+public:
+  struct Draft final {
+    // The drafted tokens after the anchor, and each one's confidence.
+    std::vector<uint32_t> tokens;
+    std::vector<float> confidence;
+  };
+
+  Drafter(metal::MetalBackend &backend, const model::DeepSeek41Weights &target, const model::DSparkWeights &weights)
+      : backend_(backend), target_(target), weights_(weights), layout_(weights.layout.layers),
+        d_(layout_.deepseek), operators_(backend.capabilities()) {
+    const uint32_t hidden = layout_.hiddenSize, latent = layout_.attentionHeadDimension;
+    mhc_ = {hidden, d_.sinkhornIterations, d_.hcEpsilon, d_.normEpsilon};
+    freqs_ = upload(ropeFrequencies(layout_, false));
+    for (size_t layer = 0; layer < weights.layers.size(); ++layer)
+      rings_.push_back(zeroed(uint64_t{layout_.slidingWindow} * latent * 2));
+    // What lives across the calls stays out of their pool.
+    persistent_ = std::exchange(buffers_, {});
+    next_ = 0;
+    ops::LinearScratchSize decode{}, prefill{};
+    const auto include = [&](const ops::Projection &p) {
+      decode.include(operators_.linear().decodeScratchSize(p.shape()));
+      prefill.include(operators_.linear().prefillScratchSize(p.shape()));
+    };
+    for (const model::DeepSeek41LayerWeights &layer : weights.layers) {
+      for (const ops::Projection *p : {&layer.queryA, &layer.queryB, &layer.kv, &layer.outputB}) include(*p);
+      for (const ops::Projection &p : layer.outputA) include(p);
+    }
+    include(weights.mainProjection);
+    include(target.logitsProjection);
+    decodeScratch_ = {zeroed(decode.input), zeroed(decode.sums), zeroed(decode.partials), zeroed(decode.counters),
+                      zeroed(decode.rotated)};
+    prefillScratch_ = {zeroed(prefill.input), zeroed(prefill.sums), zeroed(prefill.partials),
+                       zeroed(prefill.counters), zeroed(prefill.rotated)};
+    moeShape_ = layout_.moeBlockShape();
+    std::map<uint32_t, uint64_t> formats;
+    for (const model::DeepSeek41LayerWeights &layer : weights.layers)
+      for (const ops::BlockExpertProjection *p : {&layer.ffn.gate, &layer.ffn.up, &layer.ffn.down})
+        if (!p->routed.isFloat()) formats[p->routed.formatId] += uint64_t{p->routed.outputSize} * p->routed.inputSize;
+    moeShape_.expertFormat =
+        std::max_element(formats.begin(), formats.end(), [](auto &a, auto &b) { return a.second < b.second; })->first;
+    moeShape_.registerFormats = false;
+    moeShape_.routerFormat = weights.layers.front().ffn.router.formatId;
+    if (!moeShape_.valid()) throw std::runtime_error("invalid DSpark MoE shape");
+    for (MetalBuffer &buffer : buffers_) persistent_.push_back(std::move(buffer));
+    buffers_.clear();
+    next_ = 0;
+  }
+
+  // The latents of the target rows `first` to first + rows - 1 from their
+  // hidden views (bf16 [rows][targets * hidden]) into each layer's ring.
+  void addContext(const MetalBuffer &mainHidden, uint32_t first, uint32_t rows) {
+    next_ = 0;
+    const uint32_t hidden = layout_.hiddenSize, latent = layout_.attentionHeadDimension;
+    std::vector<uint32_t> positions(rows);
+    for (uint32_t r = 0; r < rows; ++r) positions[r] = first + r;
+    const MetalBuffer positionBuffer = upload(positions);
+    MetalBuffer projected = alloc(uint64_t{pad(rows)} * hidden * 2), main = alloc(uint64_t{pad(rows)} * hidden * 2);
+    MetalBuffer raw = alloc(uint64_t{pad(rows)} * latent * 2), latents = alloc(uint64_t{pad(rows)} * latent * 2);
+    metal::CommandGraph graph;
+    operators_.linear().addPrefill(graph, mainHidden, weights_.mainProjection, projected, rows, prefillScratch_);
+    ops::Normalization::addRms(graph, projected, weights_.mainNorm, main, hidden, rows);
+    for (size_t index = 0; index < weights_.layers.size(); ++index) {
+      const model::DeepSeek41LayerWeights &layer = weights_.layers[index];
+      operators_.linear().addPrefill(graph, main, layer.kv, raw, rows, prefillScratch_);
+      ops::LatentRotation::add(graph, raw, false, layer.kvNorm.buffer, freqs_, positionBuffer, latents,
+                               {1, latent, layout_.rotaryPairs, false, ops::LatentRounding::Fp8, true, d_.normEpsilon},
+                               rows);
+      ops::LatentAttention::addRingUpdate(graph, rings_[index], latents, rings_[index], {}, first, rows,
+                                          layout_.slidingWindow);
+    }
+    run(graph);
+    seen_ = std::max(seen_, first + rows);
+  }
+
+  // A block's draft from `anchor`, the token at position `position`, past
+  // every position the rings took.
+  Draft draft(uint32_t anchor, uint32_t position) {
+    next_ = 0;
+    const model::DSparkLayout &dspark = weights_.layout;
+    const uint32_t B = dspark.blockSize, hidden = layout_.hiddenSize, latent = layout_.attentionHeadDimension;
+    const uint32_t heads = layout_.attentionQueryHeads, pairs = layout_.rotaryPairs, ring = layout_.slidingWindow;
+    const uint32_t vocabulary = layout_.vocabularySize, rows = pad(B);
+    if (position != seen_) throw std::runtime_error("a draft past positions its rings did not take");
+    std::vector<uint32_t> tokens(B, dspark.noiseToken), positions(B);
+    tokens[0] = anchor;
+    for (uint32_t r = 0; r < B; ++r) positions[r] = position + r;
+    const MetalBuffer tokenBuffer = upload(tokens), positionBuffer = upload(positions);
+    // Every row's keys: the rings' filled slots, then every row of the block.
+    const uint32_t filled = std::min(ring, position), keyStride = ring + B;
+    std::vector<uint32_t> indices(size_t(B) * keyStride, 0), counts(B, filled + B);
+    for (uint32_t r = 0; r < B; ++r) {
+      for (uint32_t s = 0; s < filled; ++s) indices[size_t(r) * keyStride + s] = s | LATENT_ATTENTION_WINDOW_KEY;
+      for (uint32_t j = 0; j < B; ++j) indices[size_t(r) * keyStride + filled + j] = (ring + j) | LATENT_ATTENTION_WINDOW_KEY;
+    }
+    const MetalBuffer indexBuffer = upload(indices), countBuffer = upload(counts);
+    const MetalBuffer verifyRows = upload(std::vector<uint32_t>{B});
+    MetalBuffer streams = zeroed(uint64_t{rows} * MHC_STREAMS * hidden * 4);
+    MetalBuffer embedding = alloc(uint64_t{rows} * hidden * 2), chunks = alloc(ops::ManifoldHyperConnection::mixScratchBytes(mhc_, B));
+    std::vector<float> first(size_t(B) * MHC_MIXES, 0.0f);
+    for (uint32_t r = 0; r < B; ++r) first[size_t(r) * MHC_MIXES] = 1.0f;
+    MetalBuffer previous = upload(first);
+    metal::CommandGraph graph;
+    ops::Embedding::add(graph, tokenBuffer, target_.tokenEmbedding, embedding, B);
+    ops::ManifoldHyperConnection::addInit(graph, embedding, streams, mhc_, B);
+    const ops::MoePlan plan = operators_.moeDecode(moeShape_, 1);
+    for (const model::DeepSeek41LayerWeights &layer : weights_.layers) {
+      const size_t index = &layer - weights_.layers.data();
+      MetalBuffer mixes = alloc(uint64_t{rows} * MHC_MIXES * 4), x = alloc(uint64_t{rows} * hidden * 2);
+      MetalBuffer qa = alloc(uint64_t{rows} * d_.queryRank * 2), qr = alloc(uint64_t{rows} * d_.queryRank * 2);
+      MetalBuffer q = alloc(uint64_t{rows} * layout_.attentionWidth * 2),
+                  qRotated = alloc(uint64_t{rows} * layout_.attentionWidth * 2);
+      MetalBuffer raw = alloc(uint64_t{rows} * latent * 2), block = alloc(uint64_t{rows} * latent * 2);
+      MetalBuffer scores = alloc(uint64_t{rows} * heads * keyStride * 4),
+                  out = alloc(uint64_t{rows} * heads * latent * 4);
+      const uint64_t partBytes = ops::LatentAttention::partBytes(heads, B);
+      MetalBuffer parts = partBytes ? alloc(partBytes) : MetalBuffer{};
+      MetalBuffer rotatedBack = alloc(uint64_t{rows} * layout_.attentionWidth * 2);
+      const uint32_t groupWidth = d_.groupWidth(layout_.attentionWidth);
+      MetalBuffer groupInput = alloc(uint64_t{rows} * groupWidth * 2), groupOutput = alloc(uint64_t{rows} * d_.outputRank * 2);
+      MetalBuffer joined = alloc(uint64_t{rows} * d_.outputGroups * d_.outputRank * 2), branch = alloc(uint64_t{rows} * hidden * 2);
+      ops::ManifoldHyperConnection::addMix(graph, streams, layer.attentionMix.fn, layer.attentionMix.scale,
+                                           layer.attentionMix.base, chunks, mixes, mhc_, B);
+      ops::ManifoldHyperConnection::addPreNorm(graph, streams, previous, layer.attentionNorm.buffer, x, mhc_, B);
+      project(graph, x, layer.queryA, qa);
+      ops::LatentRotation::add(graph, qa, false, layer.queryNorm.buffer, freqs_, positionBuffer, qr,
+                               {1, d_.queryRank, 0, false, ops::LatentRounding::None, true, d_.normEpsilon}, B);
+      project(graph, qr, layer.queryB, q);
+      ops::LatentRotation::add(graph, q, false, layer.queryNorm.buffer, freqs_, positionBuffer, qRotated,
+                               {heads, latent, pairs, false, ops::LatentRounding::None, false, 0.0f}, B);
+      project(graph, x, layer.kv, raw);
+      ops::LatentRotation::add(graph, raw, false, layer.kvNorm.buffer, freqs_, positionBuffer, block,
+                               {1, latent, pairs, false, ops::LatentRounding::Fp8, true, d_.normEpsilon}, B);
+      ops::LatentAttention::add(graph, qRotated, {block, rings_[index], ring}, {block, {}, {}}, indexBuffer,
+                                countBuffer, layer.sinks, scores, parts, out, heads, keyStride,
+                                1.0f / std::sqrt(float(latent)), B);
+      ops::LatentRotation::add(graph, out, true, layer.queryNorm.buffer, freqs_, positionBuffer, rotatedBack,
+                               {heads, latent, pairs, true, ops::LatentRounding::Fp8, false, 0.0f}, B);
+      for (uint32_t g = 0; g < d_.outputGroups; ++g) {
+        ops::RowCopy::add(graph, rotatedBack, {0, layout_.attentionWidth, g * groupWidth}, groupInput,
+                          {0, groupWidth, 0}, B, groupWidth);
+        project(graph, groupInput, layer.outputA[g], groupOutput);
+        ops::RowCopy::add(graph, groupOutput, {0, d_.outputRank, 0}, joined,
+                          {0, d_.outputGroups * d_.outputRank, g * d_.outputRank}, B, d_.outputRank);
+      }
+      project(graph, joined, layer.outputB, branch);
+      ops::ManifoldHyperConnection::addPost(graph, streams, branch, mixes, mhc_, B);
+      // The FFN.
+      MetalBuffer ffnMixes = alloc(uint64_t{rows} * MHC_MIXES * 4), y = alloc(uint64_t{rows} * hidden * 2);
+      MetalBuffer residual = zeroed(uint64_t{rows} * hidden * 2), ffnOut = alloc(uint64_t{rows} * hidden * 2);
+      ops::MoeScratch scratch;
+      for (const ops::MoeScratchField &field : ops::kMoeScratchFields)
+        scratch.*field.buffer = zeroed(plan.workspace().*field.bytes);
+      ops::ManifoldHyperConnection::addMix(graph, streams, layer.ffnMix.fn, layer.ffnMix.scale, layer.ffnMix.base,
+                                           chunks, ffnMixes, mhc_, B);
+      ops::ManifoldHyperConnection::addPreNorm(graph, streams, mixes, layer.ffnNorm.buffer, y, mhc_, B);
+      ops::MoE::add(graph, {y, residual, ffnOut, scratch, verifyRows}, layer.ffn, plan);
+      ops::ManifoldHyperConnection::addPost(graph, streams, ffnOut, ffnMixes, mhc_, B);
+      previous = ffnMixes;
+    }
+    // The head: the last mix's pre-sum through the output norm, the target's
+    // logits of it.
+    MetalBuffer x = alloc(uint64_t{rows} * hidden * 2), logits = alloc(uint64_t{rows} * vocabulary * 4);
+    ops::ManifoldHyperConnection::addPreNorm(graph, streams, previous, weights_.outputNorm.buffer, x, mhc_, B);
+    project(graph, x, target_.logitsProjection, logits);
+    run(graph);
+    // On the host: each row's pre-sum (the confidence head's input), and the
+    // Markov chain from the anchor, each step's bias from its token's
+    // embedding on the GPU.
+    const auto *s = static_cast<const float *>(streams.contents());
+    const auto *mix = static_cast<const float *>(previous.contents());
+    std::vector<float> pre(size_t(B) * hidden, 0.0f);
+    for (uint32_t r = 0; r < B; ++r)
+      for (uint32_t k = 0; k < MHC_STREAMS; ++k)
+        for (uint32_t c = 0; c < hidden; ++c)
+          pre[size_t(r) * hidden + c] += mix[size_t(r) * MHC_MIXES + k] * s[(size_t(r) * MHC_STREAMS + k) * hidden + c];
+    const auto *weights = static_cast<const float *>(weights_.confidence.contents());
+    const auto *rowLogits = static_cast<const float *>(logits.contents());
+    const uint32_t rank = dspark.markovRank;
+    MetalBuffer token = alloc(16), markov = alloc(uint64_t{32} * rank * 2), bias = alloc(uint64_t{32} * vocabulary * 4);
+    Draft result;
+    uint32_t previousToken = anchor;
+    for (uint32_t r = 0; r < B; ++r) {
+      *static_cast<uint32_t *>(token.contents()) = previousToken;
+      metal::CommandGraph step;
+      ops::Embedding::add(step, token, weights_.markovEmbedding, markov, 1);
+      ops::addGgufFloat(step, markov, weights_.markovHead.blocks().segments.front(), bias, 1, vocabulary, 0,
+                        ops::FloatOutput::Float32, ops::FloatTile::Simdgroup);
+      run(step);
+      const auto *b = static_cast<const float *>(bias.contents());
+      const float *l = rowLogits + size_t(r) * vocabulary;
+      uint32_t best = 0;
+      for (uint32_t v = 1; v < vocabulary; ++v)
+        if (l[v] + b[v] > l[best] + b[best]) best = v;
+      const auto *e = static_cast<const uint16_t *>(markov.contents());
+      double score = 0;
+      for (uint32_t c = 0; c < hidden; ++c) score += double(weights[c]) * f32(bf16(pre[size_t(r) * hidden + c]));
+      for (uint32_t c = 0; c < rank; ++c) score += double(weights[hidden + c]) * f32(e[c]);
+      result.tokens.push_back(best);
+      result.confidence.push_back(float(score));
+      previousToken = best;
+    }
+    return result;
+  }
+
+private:
+  // A projection of a block's rows on the decode plans of one lane.
+  void project(metal::CommandGraph &graph, const MetalBuffer &input, const ops::Projection &projection,
+               const MetalBuffer &output) {
+    const ops::Linear &linear = operators_.linear();
+    static_cast<void>(linear.add(graph, {.input = input, .output = output, .scratch = decodeScratch_}, projection,
+                                 linear.decodePlan(projection, 1)));
+  }
+  template <class T> MetalBuffer upload(const std::vector<T> &values) {
+    MetalBuffer buffer = alloc(values.size() * sizeof(T));
+    std::memcpy(buffer.contents(), values.data(), values.size() * sizeof(T));
+    return buffer;
+  }
+  // The buffers of a draft or a context, the next of those the previous ones
+  // took in the same order (each call's run waits for its commands), larger
+  // ones allocated where a call needs more.
+  MetalBuffer alloc(uint64_t bytes) {
+    bytes = std::max<uint64_t>(bytes, 16);
+    if (next_ < buffers_.size() && buffers_[next_].sizeBytes() >= bytes) return buffers_[next_++];
+    MetalBuffer buffer = backend_.allocateBuffer(bytes, metal::BufferStorage::Shared, "dspark");
+    if (next_ < buffers_.size()) buffers_[next_] = buffer;
+    else buffers_.push_back(buffer);
+    ++next_;
+    return buffer;
+  }
+  MetalBuffer zeroed(uint64_t bytes) {
+    MetalBuffer buffer = alloc(bytes);
+    std::memset(buffer.contents(), 0, std::max<uint64_t>(bytes, 16));
+    return buffer;
+  }
+  void run(metal::CommandGraph &graph) {
+    const metal::CommandTiming timing = backend_.submitCommandAsync(graph.command()).wait();
+    gpuSeconds_ += timing.gpuSeconds;
+  }
+
+  metal::MetalBackend &backend_;
+  const model::DeepSeek41Weights &target_;
+  const model::DSparkWeights &weights_;
+  const model::DeepSeek41Layout &layout_;
+  const model::DeepSeek41Dimensions &d_;
+  ops::ExecutionPlans operators_;
+  ops::ManifoldHyperShape mhc_{};
+  ops::MoeShape moeShape_{};
+  ops::LinearScratch decodeScratch_{}, prefillScratch_{};
+  MetalBuffer freqs_;
+  std::vector<MetalBuffer> rings_;
+  // The positions the rings took, from the start.
+  uint32_t seen_ = 0;
+  double gpuSeconds_ = 0;
+  std::vector<MetalBuffer> buffers_, persistent_;
+  size_t next_ = 0;
 };
 
 // The Engram's tables in their GGUF (deepseek41.engram.file): each Engram
@@ -733,8 +1037,36 @@ int main(int argc, const char *argv[]) {
         return ids;
       };
       if (engram) std::printf("Engram rows from %s\n", argv[7]);
-      // The prompt and the generated tokens, in whole 64-token pieces.
-      Forward forward(backend, weights, (rows + generate + 63) / 64 * 64);
+      // With DEEPSEEK41_DSPARK, DSpark beside the target, its experts loaded
+      // whole.
+      model::WeightImages draftImages(backend, "dspark");
+      std::optional<model::DSparkWeights> dspark;
+      if (const char *path = std::getenv("DEEPSEEK41_DSPARK")) {
+        const model::OpenGguf file(std::vector<std::filesystem::path>{path});
+        dspark.emplace(model::loadDSparkWeights(backend, draftImages, path, model::readDSparkLayout(file.file(), layout)));
+        const model::DSparkLayout &draft = dspark->layout;
+        std::printf("DSpark: %u layers of %u experts (top %u), block %u, noise token %u, Markov rank %u, target layers",
+                    draft.layers.layers, draft.layers.experts, draft.layers.expertsPerToken, draft.blockSize,
+                    draft.noiseToken, draft.markovRank);
+        for (const uint32_t layer : draft.targetLayers()) std::printf(" %u", layer);
+        std::printf(" (%.1f s)\n", seconds());
+      }
+      // The capture slot of a layer DSpark reads, if it is one.
+      const auto captureSlot = [&](uint32_t layer) -> std::optional<uint32_t> {
+        if (!dspark) return std::nullopt;
+        const std::span<const uint32_t> targets = dspark->layout.targetLayers();
+        const auto found = std::find(targets.begin(), targets.end(), layer);
+        if (found == targets.end()) return std::nullopt;
+        return uint32_t(found - targets.begin());
+      };
+      // The prompt and the generated tokens, in whole 64-token pieces, and
+      // a verify step's rows past them.
+      Forward forward(backend, weights, (rows + generate + 63) / 64 * 64 + 64);
+      std::optional<Drafter> drafter;
+      if (dspark) {
+        forward.captures(dspark->layout.targetLayerCount);
+        drafter.emplace(backend, weights, *dspark);
+      }
       forward.begin(prompt);
       forward.embed();
       const size_t width = size_t(rows) * MHC_STREAMS * layout.hiddenSize;
@@ -760,6 +1092,7 @@ int main(int argc, const char *argv[]) {
         } else if (engram && engramLayer) {
           forward.engram(layer, forward.engramRows(engram->store(engramTable(layer)), engramIds(layer, 0, rows)));
         }
+        if (const std::optional<uint32_t> slot = captureSlot(layer)) forward.capture(*slot);
         forward.attention(layer);
         const double attnNorm = meanNorm(forward.streams(), rows, layout.hiddenSize);
         std::pair<double, double> attn{}, ffn{};
@@ -792,6 +1125,7 @@ int main(int argc, const char *argv[]) {
       const uint32_t vocabulary = layout.vocabularySize;
       const std::vector<float> logits = forward.logits();
       forward.end();
+      if (drafter) drafter->addContext(forward.mainHidden(), 0, rows);
       const float *last = logits.data() + size_t(rows - 1) * vocabulary;
       if (compared) {
         const Npy want = readNpy(reference + "/logits.npy");
@@ -833,6 +1167,104 @@ int main(int argc, const char *argv[]) {
       };
       const model::ExpertStoreStats::Use afterPrompt = expertUse();
       printUse("prompt", afterPrompt, {});
+      if (drafter && generate) {
+        // Draft, verify the anchor and the drafts in one step, keep the
+        // drafts up to the first the target's argmax rejects and the token it
+        // predicts there.
+        const uint32_t block = dspark->layout.blockSize;
+        const char *threshold = std::getenv("DEEPSEEK41_DSPARK_THRESHOLD");
+        const std::optional<float> cut = threshold ? std::optional<float>(std::stof(threshold)) : std::nullopt;
+        struct Cycle {
+          std::vector<float> confidence;
+          uint32_t verified = 0, accepted = 0;
+          double verify = 0;
+        };
+        std::vector<Cycle> cycles;
+        uint32_t anchor = order[0], produced = 1;
+        std::printf("generated: %u", anchor);
+        std::vector<uint32_t> kept(block + 1, 0);
+        std::vector<double> drafts, verifies, confidence[2];
+        static_cast<void>(forward.takeTiming());
+        const double began = seconds();
+        while (produced < generate) {
+          const uint32_t position = forward.past();
+          const double started = seconds();
+          const Drafter::Draft draft = drafter->draft(anchor, position);
+          const double drafted = seconds();
+          uint32_t verified = block;
+          if (cut) {
+            verified = 0;
+            while (verified < block && draft.confidence[verified] >= *cut) ++verified;
+          }
+          std::vector<uint32_t> step{anchor};
+          step.insert(step.end(), draft.tokens.begin(), draft.tokens.begin() + verified);
+          sequence.resize(position);
+          sequence.insert(sequence.end(), step.begin(), step.end());
+          forward.begin(step);
+          forward.embed();
+          for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+            if (engram && model::DeepSeek41Dimensions::has(layout.deepseek.engramLayers, layer))
+              forward.engram(layer, forward.engramRows(engram->store(engramTable(layer)),
+                                                       engramIds(layer, position, uint32_t(step.size()))));
+            if (const std::optional<uint32_t> slot = captureSlot(layer)) forward.capture(*slot);
+            forward.attention(layer);
+            forward.ffn(layer);
+          }
+          const std::vector<float> next = forward.logits();
+          const auto argmax = [&](uint32_t row) {
+            const float *l = next.data() + size_t(row) * vocabulary;
+            return uint32_t(std::max_element(l, l + vocabulary) - l);
+          };
+          uint32_t accepted = 0;
+          while (accepted < verified && argmax(accepted) == draft.tokens[accepted]) ++accepted;
+          const uint32_t predicted = argmax(accepted);
+          forward.end(accepted + 1);
+          drafter->addContext(forward.mainHidden(), position, accepted + 1);
+          for (uint32_t i = 0; i < verified; ++i) confidence[i < accepted].push_back(draft.confidence[i]);
+          for (uint32_t i = 0; i < accepted; ++i) std::printf(" %u", draft.tokens[i]);
+          std::printf(" %u", predicted);
+          std::fflush(stdout);
+          ++kept[accepted];
+          produced += accepted + 1;
+          anchor = predicted;
+          sequence.resize(position + accepted + 1);
+          drafts.push_back(drafted - started);
+          verifies.push_back(seconds() - drafted);
+          cycles.push_back({draft.confidence, verified, accepted, verifies.back()});
+        }
+        const double elapsed = seconds() - began;
+        const auto median = [](std::vector<double> values) {
+          std::sort(values.begin(), values.end());
+          return values.empty() ? 0.0 : values[values.size() / 2];
+        };
+        const auto mean = [](const std::vector<double> &values) {
+          double sum = 0;
+          for (const double value : values) sum += value;
+          return values.empty() ? 0.0 : sum / double(values.size());
+        };
+        std::printf("\nspeculative: %u tokens in %zu cycles, %.2f a cycle, %.3f s (%.2f tokens/s)\n", produced - 1,
+                    drafts.size(), double(produced - 1) / double(drafts.size()), elapsed,
+                    double(produced - 1) / elapsed);
+        std::printf("drafts kept per cycle:");
+        for (uint32_t i = 0; i <= block; ++i) std::printf(" %u:%u", i, kept[i]);
+        std::printf("\ncycle medians: draft %.3f s, verify %.3f s; confidence of kept drafts %.3f, of rejected %.3f\n",
+                    median(drafts), median(verifies), mean(confidence[1]), mean(confidence[0]));
+        printUse("speculative", expertUse(), afterPrompt);
+        // Each cycle, and the verify steps' median time by the rows they ran.
+        for (const Cycle &cycle : cycles) {
+          std::printf("cycle: verified %u kept %u verify %.3f s confidence", cycle.verified, cycle.accepted,
+                      cycle.verify);
+          for (const float score : cycle.confidence) std::printf(" %.2f", score);
+          std::printf("\n");
+        }
+        for (uint32_t rows = 1; rows <= block + 1; ++rows) {
+          std::vector<double> times;
+          for (const Cycle &cycle : cycles)
+            if (cycle.verified + 1 == rows) times.push_back(cycle.verify);
+          if (!times.empty()) std::printf("verify of %u rows: %zu steps, median %.3f s\n", rows, times.size(), median(times));
+        }
+        return 0;
+      }
       // Greedy decode steps of one row each.
       uint32_t token = order[0];
       if (generate) std::printf("generated: %u", token);

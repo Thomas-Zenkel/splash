@@ -253,6 +253,16 @@ struct DeepSeek41EngramTables final {
 [[nodiscard]] DeepSeek41EngramTables deepSeek41EngramTables(const GgufFile &engram, uint64_t dataOffset,
                                                             const DeepSeek41Layout &layout);
 
+struct BlockTargetFormat;
+struct MoeExperts;
+class WeightFile;
+
+// A layer of `layout` from its image (GgufImage.cpp DeepSeek41Gguf::layer):
+// the target's, or a DSpark draft's (model/DSpark.hpp), whose layers are the
+// family's of window attention alone.
+[[nodiscard]] DeepSeek41LayerWeights readDeepSeek41Layer(WeightFile &file, const BlockTargetFormat &format,
+                                                         const DeepSeek41Layout &layout, const MoeExperts &experts,
+                                                         uint32_t index);
 // Loads the target from its GGUF's images (GgufImage.cpp DeepSeek41Gguf), its
 // routed experts through a store when they stream, and its Engram's tables
 // through a row store of the loader's table options where they give it memory

@@ -573,6 +573,35 @@ void streamInitTest(MetalBackend &backend) {
   check(same, "manifold hyper-connection streams: four copies of each row's embedding");
 }
 
+// Each row's streams averaged into its slot of a DSpark draft's hidden view
+// (ops::ManifoldHyperConnection::addStreamMean): three target layers' slots
+// of rows three slots wide, the mean bf16's rounding of the fp32 mean, and
+// the other slots untouched.
+void streamMeanTest(MetalBackend &backend) {
+  constexpr uint32_t rows = 5, slots = 3, stride = slots * kHidden;
+  std::mt19937 rng(9);
+  const std::vector<float> streams = randoms(rng, size_t(rows) * kWidth, 3.0f);
+  MetalBuffer streamBuffer = upload(backend, streams);
+  MetalBuffer out = upload(backend, std::vector<uint16_t>(size_t(rows) * stride, 0x7fc0));
+  CommandGraph graph;
+  ops::ManifoldHyperConnection::addStreamMean(graph, streamBuffer, out, stride, kHidden, kShape, rows);
+  run(backend, graph);
+  const std::vector<uint16_t> got = download<uint16_t>(out, size_t(rows) * stride);
+  bool same = true;
+  for (uint32_t r = 0; r < rows; ++r)
+    for (uint32_t c = 0; c < stride; ++c) {
+      const uint16_t value = got[size_t(r) * stride + c];
+      if (c < kHidden || c >= 2 * kHidden) {
+        same = same && value == 0x7fc0;
+        continue;
+      }
+      float sum = 0.0f;
+      for (uint32_t s = 0; s < kStreams; ++s) sum += streams[(size_t(r) * kStreams + s) * kHidden + c - kHidden];
+      same = same && value == bf16(sum / float(kStreams));
+    }
+  check(same, "manifold hyper-connection stream mean: each row's streams averaged into its slot alone");
+}
+
 void latentRotationTest(MetalBackend &backend, const std::string &name, const ops::LatentRotationShape &shape,
                         bool floatInput, bool compressed, const std::vector<uint32_t> &positions) {
   const uint32_t rows = uint32_t(positions.size()), width = shape.width;
@@ -1289,6 +1318,7 @@ int main(int argc, const char *argv[]) {
                                     512, 513, 600, kKeyStride});
       keyListTest(backend);
       streamInitTest(backend);
+      streamMeanTest(backend);
       compressTest(backend, 1, 2, false);
       compressTest(backend, 37, 2, false);
       compressTest(backend, 5, 1, false);
