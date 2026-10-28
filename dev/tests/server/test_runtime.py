@@ -3,6 +3,7 @@ import math
 import os
 import select
 import struct
+import subprocess
 import threading
 import time
 import typing
@@ -55,6 +56,52 @@ def fast_liveness_probe(test):
     return mock.patch.object(
         engine_runtime.MultiplexedRuntime, "_liveness_interval_seconds", 0.05
     )(test)
+
+
+class StuckEngine(FakeProcess):
+    """An engine that ignores SIGTERM and SIGKILL. Its wait() times out until
+    `timeouts` calls have done so (None: until release()), then it exits 0."""
+
+    def __init__(self, timeouts=None, order=None):
+        super().__init__()
+        self.timeouts = timeouts
+        self.order = order
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+    def release(self):
+        self.timeouts = 0
+
+    def wait(self, timeout=None):
+        if self.timeouts is None or self.timeouts > 0:
+            if self.timeouts is not None:
+                self.timeouts -= 1
+            time.sleep(min(timeout or 0.0, 0.02))
+            raise subprocess.TimeoutExpired("stuck-native", timeout)
+        if self.order is not None:
+            self.order.append("old exited")
+        self._exit(0)
+        return super().wait(timeout)
+
+
+def engine_factory(first, order=None):
+    """A process factory: the first call hands out `first`, each later call a
+    fresh ready engine. `made` lists every process handed out."""
+    made = []
+
+    def factory():
+        if made and order is not None:
+            order.append("spawn")  # a relaunch, never the first engine
+        process = FakeProcess() if made else first
+        made.append(process)
+        return process
+
+    factory.made = made
+    return factory
 
 
 class RuntimeTests(unittest.TestCase):
@@ -1602,6 +1649,95 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(process.poll(), -9)
         finally:
             runtime.close()
+
+    def fail_first_engine(self, runtime, process):
+        call = runtime.submit(request(1))
+        process.close_stdout()
+        with self.assertRaises(engine_runtime.EngineUnhealthy):
+            call.result(1.0)
+        self.assertFalse(runtime.ready)
+
+    def test_relaunch_never_spawns_beside_an_engine_that_does_not_exit(self):
+        patcher = mock.patch.object(
+            engine_runtime.MultiplexedRuntime, "_shutdown_grace_seconds", 0.05
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        old = StuckEngine()
+        factory = engine_factory(old)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, startup_timeout=0.3, eager_start=True
+        )
+        self.addCleanup(runtime.close)
+        self.fail_first_engine(runtime, old)
+
+        started = time.monotonic()
+        with self.assertRaisesRegex(engine_runtime.EngineUnhealthy, "has not exited"):
+            runtime.wait_ready(2)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(len(factory.made), 1)
+
+    def test_relaunch_spawns_only_after_the_old_engine_has_exited(self):
+        patcher = mock.patch.object(
+            engine_runtime.MultiplexedRuntime, "_shutdown_grace_seconds", 0.05
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        order = []
+        old = StuckEngine(timeouts=2, order=order)
+        factory = engine_factory(old, order)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, startup_timeout=2.0, eager_start=True
+        )
+        self.addCleanup(runtime.close)
+        self.fail_first_engine(runtime, old)
+
+        self.assertTrue(runtime.wait_ready(3))
+        self.assertEqual(order, ["old exited", "spawn"])
+        self.assertEqual(len(factory.made), 2)
+
+    def test_await_exit_reports_whether_the_process_exits_by_the_deadline(self):
+        exited = FakeProcess(initial_output=b"")
+        exited.terminate()  # its wait() returns at once
+        await_exit = engine_runtime.MultiplexedRuntime._await_exit
+        self.assertTrue(await_exit(exited, time.monotonic() + 1))
+
+        class AlreadyReaped:
+            pid = 1
+
+            def wait(self, timeout=None):
+                raise ChildProcessError("already reaped")
+
+        self.assertTrue(await_exit(AlreadyReaped(), time.monotonic() + 1))
+        self.assertFalse(await_exit(StuckEngine(), time.monotonic() - 1))
+        started = time.monotonic()
+        self.assertFalse(await_exit(StuckEngine(), started + 0.2))
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 0.2)
+        self.assertLess(elapsed, 1.0)
+
+    def test_later_attempt_waits_for_the_same_old_engine_then_spawns(self):
+        patcher = mock.patch.object(
+            engine_runtime.MultiplexedRuntime, "_shutdown_grace_seconds", 0.05
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        old = StuckEngine()
+        factory = engine_factory(old)
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, startup_timeout=0.3, eager_start=True
+        )
+        self.addCleanup(runtime.close)
+        self.fail_first_engine(runtime, old)
+        with self.assertRaisesRegex(engine_runtime.EngineUnhealthy, "has not exited"):
+            runtime.wait_ready(2)
+        self.assertEqual(len(factory.made), 1)
+
+        old.release()
+        self.assertTrue(runtime.wait_ready(2))
+        self.assertEqual(len(factory.made), 2)
+        self.assertIs(factory.made[0], old)
+        self.assertIsNone(factory.made[1].poll())
 
     def test_wire_deadline_is_stamped_once_at_submission(self):
         wall = 1_700_000_000_000_000

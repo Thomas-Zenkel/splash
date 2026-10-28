@@ -857,6 +857,22 @@ class MultiplexedRuntime:
     ) -> None:
         if old_process is not None:
             self._stop_process(old_process, old_reader)
+            # A killed engine can take a long time to exit while it gives its
+            # memory back, and _stop_process stops waiting a second after
+            # SIGKILL. A new engine loaded beside it holds two models at once,
+            # which on a Mac sized for one exhausts memory. Spawn only once
+            # the old process has been reaped; until the attempt's deadline,
+            # else fail the attempt and keep the old process as the one the
+            # next attempt waits for.
+            if not self._await_exit(old_process, attempt.deadline):
+                self._complete_startup_attempt(
+                    attempt,
+                    EngineUnhealthy(
+                        f"previous native engine (pid {old_process.pid}) has not "
+                        "exited; not launching a second engine beside it"
+                    ),
+                )
+                return
         with self._state_lock:
             # close() or a newer attempt may have won while the old engine was
             # being stopped; spawning now would orphan a fresh engine.
@@ -1437,6 +1453,20 @@ class MultiplexedRuntime:
         timer = threading.Timer(self._shutdown_grace_seconds, kill_if_alive)
         timer.daemon = True
         timer.start()
+
+    @staticmethod
+    def _await_exit(process: ProcessLike, deadline: float) -> bool:
+        """Whether `process` exits by `deadline` (time.monotonic())."""
+        while True:
+            try:
+                process.wait(timeout=max(0.0, min(1.0, deadline - time.monotonic())))
+                return True
+            except (subprocess.TimeoutExpired, TimeoutError):
+                if time.monotonic() >= deadline:
+                    return False
+            except OSError:
+                # Already reaped: nothing is left to wait for.
+                return True
 
     def _stop_process(
         self,
