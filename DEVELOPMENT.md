@@ -2466,8 +2466,12 @@ concurrent installation cannot collect the assembly they serve. It is local
 installation metadata, not a file model publishers supply. It records each
 file's path, size, times and digest: a Hub cache file's is the blob's name,
 any other file's its SHA-256, which an assembly that replaces another keeps
-for each file it still links unchanged in path, size and times, so only a
-new or changed file is read for it, before the installation lock is taken.
+for each file it still links unchanged in path, size and times, and a new
+selection takes from any installed assembly that links the file so
+(`assembly.recorded_files`), so only a new or changed file is read for it,
+before the installation lock is taken: another `--draft-model` for an
+installed DeepSeek-V4.1-Flash, whose Engram tables (110.6 GB) a Hub cache
+may keep outside `blobs/<digest>`, no longer reads them for two minutes.
 
 Installation resolves each source's revision to a commit once, downloads by
 that commit and records it in `model.json`, so a repository update cannot mix
@@ -2995,8 +2999,12 @@ chunk of `R` rows (more than 32); the formats `float-bf16` and `float-f32`, and 
 a quantized format's native rows (such as `float-af8g64`), time the float projection
 (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles instead, marking
 `Linear::ggufFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape,
-or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), on the
-device's plans and the other GGUF tile.
+or at Qwen3.8-Flash-Next's, Flint's or DeepSeek-V4.1-Flash's (`GGUF_MOE_ARGS='flash-next'`,
+`'flint'` or `'deepseek 20 iq1s iq1s q80'`), on the device's plans and the other GGUF tile. At
+DeepSeek-V4.1-Flash's shape in IQ1_S on a 48 GB M4 Pro a decode step of one lane takes 2.0 ms
+a layer with its rows sharing their experts and 3.0 ms routed at random, its experts' weights
+read at 60-100 GB/s; running an expert's only tile of up to four rows on the column tile
+instead of two (MOE_GGUF_COLUMN_ROWS) made both slower (2.1 and 3.5 ms).
 
 Target attention runs the geometries of `kCompiledAttention` (`runtime/ops/PagedAttention.cpp`):
 query heads over KV heads of a head dimension (`_d128` in the names of 128-wide heads' kernels;

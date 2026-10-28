@@ -659,7 +659,11 @@ def publish(models_root, link, record, files):
     servers wait for, and its record is taken again under the lock."""
     models_root.mkdir(parents=True, exist_ok=True)
     # One record per linked file, however many assembly paths link it.
-    records = _file_records(assembly.recorded(link), set(files.values()))
+    records = _file_records(
+        assembly.recorded(link),
+        set(files.values()),
+        assembly.recorded_files(models_root),
+    )
     # Everything written under the models root is written under the lock.
     with models.installation_lock(models_root):
         # The record of the assembly the link names, which this one replaces.
@@ -693,11 +697,12 @@ def publish(models_root, link, record, files):
     return published
 
 
-def _file_records(previous, paths):
+def _file_records(previous, paths, known=None):
     """The record of each of paths (assembly.file_record), keeping the
     digest previous, an assembly's record or None, holds of one unchanged
-    since."""
-    recorded = {}
+    since, or else the one another assembly records (`known`, by path:
+    assembly.recorded_files)."""
+    recorded = dict(known or {})
     for entry in previous["files"].values() if previous else ():
         recorded[entry["path"]] = entry
     return {

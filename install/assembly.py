@@ -252,6 +252,21 @@ def recorded(link: Path):
     return record if _well_formed(record) else None
 
 
+def recorded_files(models_root: Path):
+    """Each file entry the assemblies under models_root record, by the path it
+    records (file_record), for reusing a digest a file whose path, size and
+    times are unchanged already has: a new selection of the same sources
+    reads none of them again. Records of another shape are skipped."""
+    entries = {}
+    resolved = models_root / ".resolved"
+    for assembly in sorted(resolved.iterdir()) if resolved.is_dir() else ():
+        record = recorded(assembly)
+        for entry in record["files"].values() if record else ():
+            if isinstance(entry, dict) and isinstance(entry.get("path"), str):
+                entries.setdefault(entry["path"], entry)
+    return entries
+
+
 def family(path: Path):
     """The family the assembly path names was installed as, its record's
     (families.FAMILIES); None without a record of the shape build writes, or

@@ -465,6 +465,26 @@ class LocalModelTest(unittest.TestCase):
         ):
             assembly.hold(prepared)
 
+    def test_a_new_selection_reads_no_digest_another_installation_records(self):
+        # A file another installation records, unchanged since, is not read
+        # again for its digest: another draft for an installed target reads
+        # the draft's files alone.
+        target = self.gguf(self.root / "model" / "model-Q4_K_M.gguf")
+        self.prepare(target, draft_dir(self.root / "draft", MOE))
+        other = draft_dir(self.root / "other-draft", MOE)
+        hashed = []
+        hash_file = models.hash_file
+
+        def counted(path, digest):
+            hashed.append(Path(path).resolve())
+            return hash_file(path, digest)
+
+        with mock.patch.object(models, "hash_file", counted):
+            again = self.prepare(target, other)
+        self.assertNotIn(target.resolve(), hashed)
+        self.assertIn((other / "model.safetensors").resolve(), hashed)
+        assembly.verify(again, full=True)
+
     def test_a_files_digest_is_read_before_the_installation_lock(self):
         # A file's first digest is read before the installation lock, which
         # installations and starting servers wait for; its record is taken
