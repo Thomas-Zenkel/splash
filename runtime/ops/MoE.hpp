@@ -273,6 +273,12 @@ inline constexpr auto kMoeWorkspaceFields = [] {
 // passes on M8 tiles, or on M32 tiles to prefill (moeGgufPrefillTile).
 enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 
+// The tiles each pass of a split load writes at most (MoeSplitTiles): a
+// decode step's of `rows` rows on any expert tile, the most on M8 tiles.
+[[nodiscard]] constexpr uint32_t moeSplitTileCapacity(uint32_t rows, MoeShape shape) noexcept {
+  return moeMaximumTiles(rows, shape, static_cast<uint32_t>(MoeExpertTile::M8));
+}
+
 // The expert tile of GGUF plans, which run grouped passes (gate, up with
 // silu(gate), down; the staged tile runs gate and up in one pass) over the
 // GGUF image: the half-staged tiles of

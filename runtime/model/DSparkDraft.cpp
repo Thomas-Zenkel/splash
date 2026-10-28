@@ -2,6 +2,7 @@
 
 #include "metal/abi/DSpark.h"
 #include "metal/abi/LatentAttention.h"
+#include "ops/DSparkMarkov.hpp"
 #include "ops/DraftAttention.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/LatentAttention.hpp"
@@ -415,10 +416,11 @@ void DSparkDraft::addSelection(metal::CommandGraph &graph, const DSparkSelection
     ops::Embedding::add(graph, s.previous, weights_.markovEmbedding, markov, lanes);
     ops::addGgufFloat(graph, markov, weights_.markovHead.blocks().segments.front(), s.bias, lanes,
                       layout.vocabularySize, 0, ops::FloatOutput::Float32, ops::FloatTile::Simdgroup);
-    graph.add("dspark_markov_step",
-              {buffers.logits, s.bias, s.streams, s.ffnMixes, markov, weights_.confidence, buffers.proposedTokens,
-               buffers.confidence, buffers.candidates, buffers.proposalProbabilities, s.previous},
-              params, {lanes, 1, 1}, {DSPARK_STEP_THREADS, 1, 1});
+    ops::DSparkMarkov::addStep(graph,
+                               {buffers.logits, s.bias, s.streams, s.ffnMixes, markov, weights_.confidence,
+                                buffers.proposedTokens, buffers.confidence, buffers.candidates,
+                                buffers.proposalProbabilities, s.previous},
+                               params);
   }
 }
 

@@ -259,6 +259,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/ManifoldHyperConnection.cpp \
 	runtime/ops/LatentAttention.cpp \
 	runtime/ops/Engram.cpp \
+	runtime/ops/DSparkMarkov.cpp \
 	runtime/ops/LatentIndex.cpp \
 	runtime/ops/LatentRotation.cpp \
 	runtime/ops/NgramEmbedding.cpp \

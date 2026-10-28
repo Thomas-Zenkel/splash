@@ -166,7 +166,7 @@ uint64_t fixedBytesOf(const Geometry &g, uint32_t blocks, ops::MoeShape shape) {
   const uint64_t prediction =
       uint64_t{kCycleRows} * (shape.routerWidth() + 2ULL * shape.routesPerToken()) * sizeof(float);
   // A split decode load's two passes' tiles.
-  const uint64_t split = 2 * uint64_t{ops::moeMaximumTiles(kCycleRows, shape, 8)} * sizeof(MoeTileDescriptor);
+  const uint64_t split = 2 * uint64_t{ops::moeSplitTileCapacity(kCycleRows, shape)} * sizeof(MoeTileDescriptor);
   return stagingOf(g, shape).bytes() + uint64_t{blocks} * shape.experts * sizeof(uint32_t) +
          uint64_t{shape.experts} * (sizeof(uint32_t) + 3 * sizeof(uint64_t)) + 4 * sizeof(uint32_t) + prediction +
          split;
@@ -1166,8 +1166,8 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
   impl.predictionSum.assign(shape.experts, -1);
   impl.everyExpert.resize(shape.experts);
   // A split decode load's passes' tiles, of a decode step of every lane's
-  // verify rows on 8-row tiles.
-  impl.splitCapacity = ops::moeMaximumTiles(kCycleRows, shape, 8);
+  // verify rows.
+  impl.splitCapacity = ops::moeSplitTileCapacity(kCycleRows, shape);
   for (metal::MetalBuffer &tiles : impl.splitTiles)
     tiles = backend.allocateBuffer(uint64_t{impl.splitCapacity} * sizeof(MoeTileDescriptor),
                                    metal::BufferStorage::Shared, "experts/split-tiles");
