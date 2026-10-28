@@ -82,6 +82,20 @@ void LatentAttention::add(metal::CommandGraph &graph, metal::MetalBuffer q, cons
   // Without a ring the step's latents stand in its binding, unread.
   const metal::MetalBuffer ring = window.ringSlots ? window.ring : window.step;
   const metal::MetalBuffer keys = paged ? compressed.pageTable : compressed.pool;
+  // A step of many rows multiplies each row's heads in simdgroup matrices; a
+  // decode's few rows take their keys in parts instead (splits).
+  if (rows > LATENT_ATTENTION_MAX_SPLITS) {
+    graph.add(paged ? "latent_attention_scores_mma_paged" : "latent_attention_scores_mma",
+              {std::move(q), window.step, keys, indices, counts, scores, ring}, params,
+              {rows, (keyStride + LATENT_ATTENTION_MMA_KEYS - 1) / LATENT_ATTENTION_MMA_KEYS, 1},
+              {LATENT_ATTENTION_MMA_THREADS, 1, 1});
+    graph.add("latent_attention_softmax", {scores, counts, std::move(sinks)}, params, {rows, heads, 1}, {32, 1, 1});
+    graph.add(paged ? "latent_attention_values_mma_paged" : "latent_attention_values_mma",
+              {std::move(scores), window.step, keys, std::move(indices), std::move(counts), std::move(out), ring},
+              params, {rows, LATENT_ATTENTION_DIM / LATENT_ATTENTION_MMA_VALUES, 1},
+              {LATENT_ATTENTION_MMA_THREADS, 1, 1});
+    return;
+  }
   graph.add(paged ? "latent_attention_scores_paged" : "latent_attention_scores",
             {std::move(q), window.step, keys, indices, counts, scores, ring}, params,
             {rows, (keyStride + LATENT_ATTENTION_KEY_BLOCK - 1) / LATENT_ATTENTION_KEY_BLOCK, 1},

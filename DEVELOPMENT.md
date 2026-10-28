@@ -2914,11 +2914,12 @@ sqrt(softplus) plus a selection bias, weights times 1.5, one ungated shared slic
 experts' SwiGLU clamp. `deepseek41-kernels` checks DeepSeek-V4.1's own kernels (its
 manifold-constrained hyper-connections, latent attention, rotations and FP8/FP4 grids,
 compressor, indexer, top-k selection and candidate blocks, the Engram hash and gate) against CPU
-references of `dev/tools/deepseek41_reference.py`, and those of a sequence's pages and state
+references of `dev/tools/deepseek41_reference.py`, the attention's matrix passes of a
+prefill's rows among them, and those of a sequence's pages and state
 ([Latent attention](#latent-attention)): the groups a store writes to their places and nowhere
 else, the indexer and the attention through a page table bitwise against pools of the same keys,
-a step's key lists, and the rings and open groups after a prefill's or a verify lane's retained
-rows; with `bench` it times them at the model's shapes. The goldens and how to regenerate them are
+of a verify's rows and of a prefill's, a step's key lists, and the rings and open groups after a
+prefill's or a verify lane's retained rows; with `bench` it times them at the model's shapes. The goldens and how to regenerate them are
 in `dev/tests/fixtures/weight-goldens/`; with `SPLASH_GGML_ORACLE=<libggml-base.dylib>`,
 `gguf-reference` also compares the reference with GGML directly and prints GGML's hashes.
 
@@ -3078,8 +3079,14 @@ follows:
   groups after its retained rows from the step's latents and projections.
 - A prefill runs a layer's queries, attention and output projections in tiles
   of 256 rows, each sequence's rows of a tile through its indexer in pieces
-  whose scores of every group fit 64 MiB. The model has no draft: a decode
-  cycle verifies each lane's anchor alone.
+  whose scores of every group fit 64 MiB. A step of more than 16 rows
+  multiplies each row's 64 heads by its keys, and their weights by the keys'
+  values, in 8x8 simdgroup matrices (`latent_attention_scores_mma`,
+  `latent_attention_values_mma`: bf16 products and fp32 weights summed in
+  fp32), 6.7 times faster at 256 rows than the passes a decode's few rows
+  take, which split their keys into parts instead. The model has no draft: a decode
+  cycle verifies each lane's anchor alone, and attends its anchor's row
+  alone, as the rows after it repeat it.
 - The runtime's arenas hold no paged attention's scratch for it
   (`QwenTargetGeometry::pagedAttention`): the target keeps its own, a
   prefill chunk's and a verify's, beside them (`qwenTargetScratchBytes`).

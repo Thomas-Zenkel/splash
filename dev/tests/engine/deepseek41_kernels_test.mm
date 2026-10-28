@@ -708,12 +708,15 @@ void indexScoresTest(MetalBackend &backend, uint32_t ratio) {
 }
 
 // A KV source's groups in a sequence's pages, as DeepSeek41Target keeps them:
-// a verify step of five rows after 301 tokens of a paired source (ratio 2),
-// its pages spread over extents in a pool of two layers, the second the
-// source's.
-void pagedLatentTest(MetalBackend &backend) {
-  constexpr uint32_t committed = 301, rows = 5, ratio = 2, end = committed + rows, groups = end / ratio;
-  constexpr uint32_t pageTokens = SPLASH_TARGET_KV_BLOCK_TOKENS, pages = (end + pageTokens - 1) / pageTokens;
+// a step of `rows` rows after 301 tokens of a paired source (ratio 2), a
+// verify's few rows or a prefill's many, whose attention multiplies in
+// simdgroup matrices; its pages spread over extents in a pool of two layers,
+// the second the source's.
+void pagedLatentTest(MetalBackend &backend, uint32_t rows) {
+  constexpr uint32_t committed = 301, ratio = 2;
+  const uint32_t end = committed + rows, groups = end / ratio;
+  constexpr uint32_t pageTokens = SPLASH_TARGET_KV_BLOCK_TOKENS;
+  const uint32_t pages = (end + pageTokens - 1) / pageTokens;
   constexpr uint32_t indexHeads = 32, indexDim = LATENT_INDEX_DIM, topK = 100, keyStride = kWindow + topK;
   const kv::Layout layout{.attentionLayers = 2, .kvHeads = 1, .headDimension = kLatent,
                           .format = kv::Format::BFloat16, .valuesTokenMajor = true};
@@ -732,6 +735,7 @@ void pagedLatentTest(MetalBackend &backend) {
   const std::vector<uint16_t> latents = bf16Randoms(size_t(groups) * kLatent, 1.0f),
                               indexKeys = bf16Randoms(size_t(groups) * indexDim, 1.0f);
   MetalBuffer latentBuffer = upload(backend, latents), indexKeyBuffer = upload(backend, indexKeys);
+  const std::string at = "paged, " + std::to_string(rows) + " rows: ";
   // The groups in two stores: those of the tokens before the step, then the
   // step's.
   {
@@ -760,8 +764,8 @@ void pagedLatentTest(MetalBackend &backend) {
     for (uint32_t d = 0; d < kLatent; ++d)
       stored = stored && extents.slab<uint16_t>(0, SPLASH_KV_KEYS, page)[splash_kv_key_element(0, token, d, kLatent)] == 0;
   }
-  check(stored, "paged groups: each group's latent and index key at the place of the position that completes it, "
-                "nothing elsewhere");
+  check(stored, at + "each group's latent and index key at the place of the position that completes it, nothing "
+                     "elsewhere");
 
   // The indexer's scores through the pages, bitwise a pool's of the keys.
   std::vector<uint32_t> positions(rows);
@@ -779,14 +783,14 @@ void pagedLatentTest(MetalBackend &backend) {
                                 groups, groups, ratio, 1.0f / 64, rows);
     run(backend, graph);
     check(std::memcmp(fromPages.contents(), fromPool.contents(), uint64_t{rows} * groups * 4) == 0,
-          "paged indexer scores: bitwise a pool's of the same keys");
+          at + "indexer scores bitwise a pool's of the same keys");
   }
 
   // The step's key lists: its window, of the ring before it and its own
   // latents, then its selected groups as the positions of their places.
   std::vector<uint32_t> selected(size_t(rows) * topK, LATENT_INDEX_NONE);
   for (uint32_t r = 0; r < rows; ++r) {
-    const uint32_t reachable = (committed + r + 1) / ratio, count = std::min(reachable, topK - 7 * r);
+    const uint32_t reachable = (committed + r + 1) / ratio, count = std::min(reachable, topK - (7 * r) % 64);
     std::vector<uint32_t> all(reachable);
     std::iota(all.begin(), all.end(), 0u);
     std::shuffle(all.begin(), all.end(), rng);
@@ -814,8 +818,8 @@ void pagedLatentTest(MetalBackend &backend) {
     lists = lists && gotCounts[r] == want.size() &&
             std::equal(want.begin(), want.end(), gotIndices.begin() + size_t(r) * keyStride);
   }
-  check(lists, "split key lists: the ring's slots before the step, its own latents after them, then the places of "
-               "its groups");
+  check(lists, at + "split key lists, the ring's slots before the step, its own latents after them, then the "
+                    "places of its groups");
 
   // The attention over the ring, the step's latents and the pages, bitwise
   // the pooled attention's over the ring and the step's latents in one
@@ -836,17 +840,18 @@ void pagedLatentTest(MetalBackend &backend) {
   {
     const float scale = 1.0f / std::sqrt(float(kLatent));
     const uint64_t partBytes = ops::LatentAttention::partBytes(kHeads, rows);
+    const auto parts = [&] { return partBytes ? scratch(backend, partBytes) : MetalBuffer{}; };
     CommandGraph graph;
     ops::LatentAttention::add(graph, qBuffer, {stepBuffer, ringBuffer, kWindow}, {{}, table, extents.layer(1)},
                               indices, counts, sinkBuffer, scratch(backend, uint64_t{rows} * kHeads * keyStride * 4),
-                              scratch(backend, partBytes), fromPages, kHeads, keyStride, scale, rows);
+                              parts(), fromPages, kHeads, keyStride, scale, rows);
     ops::LatentAttention::add(graph, qBuffer, windowBuffer, poolBuffer, indices, counts, sinkBuffer,
-                              scratch(backend, uint64_t{rows} * kHeads * keyStride * 4), scratch(backend, partBytes),
-                              fromPools, kHeads, keyStride, scale, rows);
+                              scratch(backend, uint64_t{rows} * kHeads * keyStride * 4), parts(), fromPools, kHeads,
+                              keyStride, scale, rows);
     run(backend, graph);
   }
   check(std::memcmp(fromPages.contents(), fromPools.contents(), outBytes) == 0,
-        "paged latent attention: bitwise the pooled attention over the same keys");
+        at + "latent attention bitwise the pooled attention over the same keys");
 
   // The ring after the step: all its rows (a prefill's), a verify lane's
   // three retained ones, and a prefill's 300 rows from the start.
@@ -875,7 +880,7 @@ void pagedLatentTest(MetalBackend &backend) {
   check(download<uint16_t>(whole, size_t(kWindow) * kLatent) == ringAfter(ring, step, committed, rows) &&
             download<uint16_t>(lane, size_t(kWindow) * kLatent) == ringAfter(ring, step, committed, 3) &&
             download<uint16_t>(fresh, size_t(kWindow) * kLatent) == ringAfter(ring, longStep, 0, 300),
-        "ring after a step: each slot's last latent of the retained rows, the ring's before them");
+        at + "ring after a step, each slot's last latent of the retained rows, the ring's before them");
 
   // The open group after a verify: lane 1's two retained rows leave position
   // 302 open, the row of its projections after the open one before the
@@ -896,7 +901,8 @@ void pagedLatentTest(MetalBackend &backend) {
   std::vector<float> wantOpen(kv.begin() + 2 * kLatent, kv.begin() + 3 * kLatent);
   wantOpen.insert(wantOpen.end(), gate.begin() + 2 * kLatent, gate.begin() + 3 * kLatent);
   check(download<float>(open, size_t(2) * kLatent) == wantOpen && download<float>(closed, size_t(2) * kLatent) == stale,
-        "open group after a verify: the last retained row's projections where they leave a group open, else as it was");
+        at + "open group after a verify, the last retained row's projections where they leave a group open, else "
+                 "as it was");
 }
 
 // Each row's top k of `scores` (rows of `stride`, the first `count` read) as
@@ -1277,6 +1283,10 @@ int main(int argc, const char *argv[]) {
       latentAttentionTest(backend, {kKeyStride});
       latentAttentionTest(backend, {1});
       latentAttentionTest(backend, {129, 300, kKeyStride, 37});
+      // A prefill's rows, in simdgroup matrices, of key counts about the
+      // blocks of their passes (64 keys scored, 32 summed, at a time).
+      latentAttentionTest(backend, {1, 2, 7, 8, 9, 31, 32, 33, 63, 64, 65, 127, 128, 129, 200, 255, 256, 257, 300, 511,
+                                    512, 513, 600, kKeyStride});
       keyListTest(backend);
       streamInitTest(backend);
       compressTest(backend, 1, 2, false);
@@ -1285,7 +1295,10 @@ int main(int argc, const char *argv[]) {
       compressTest(backend, 37, 2, true);
       indexScoresTest(backend, 2);
       indexScoresTest(backend, 1);
-      pagedLatentTest(backend);
+      // A verify step's rows, and a prefill's, whose attention multiplies in
+      // simdgroup matrices.
+      pagedLatentTest(backend, 5);
+      pagedLatentTest(backend, 24);
       selectTest(backend);
       candidateTest(backend);
       engramHashTest();

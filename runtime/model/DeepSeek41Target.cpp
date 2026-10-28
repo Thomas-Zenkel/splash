@@ -216,6 +216,13 @@ DeepSeek41Target::DeepSeek41Target(const DeepSeek41Weights &weights, const QwenT
       prefillChunks_(std::max<uint32_t>(prefillChunks, 1)) {
   const DeepSeek41Layout &layout = weights.layout;
   if (weights.layers.size() != layout.layers) throw std::invalid_argument("DeepSeek-V4.1 layers mismatch");
+  // Its Engram tables only stream (their store's rows staged by each step),
+  // which the memory plan always gives memory (StreamedPart::streamsOnly).
+  if (!weights.streamedTable || weights.engramFirstRows.size() != static_cast<size_t>(std::popcount(d_.engramLayers)))
+    throw std::invalid_argument("DeepSeek-V4.1 runs with its Engram tables streaming, which these weights do not");
+  // It decodes without a draft (ModelDescriptor): a verify retains each
+  // lane's anchor alone, whose rows after it repeat it (addAttention).
+  if (geometry.captureLayerCount) throw std::invalid_argument("DeepSeek-V4.1 decodes without a draft");
   mhc_ = {layout.hiddenSize, d_.sinkhornIterations, d_.hcEpsilon, d_.normEpsilon};
   moeShape_ = geometry_.moeShape();
   for (uint32_t layer = 0; layer < layout.layers; ++layer)
@@ -255,7 +262,7 @@ DeepSeek41Target::DeepSeek41Target(const DeepSeek41Weights &weights, const QwenT
       for (uint64_t i = 0; i < values; ++i) gate[i] = query[i] * key[i];
       engramGates_.push_back(upload(gate, "deepseek41/engram-gate"));
     }
-  const uint64_t rowBytes = weights_.streamedTable ? weights_.streamedTable->table().rowBytes : 0;
+  const uint64_t rowBytes = weights_.streamedTable->table().rowBytes;
   for (uint32_t chunk = 0; chunk < prefillChunks_; ++chunk) {
     Scratch &s = prefill_.emplace_back();
     if (chunk) s = prefill_.front();
@@ -318,7 +325,6 @@ void DeepSeek41Target::addEngram(metal::CommandGraph &graph, const Scratch &s, c
   const DeepSeek41LayerWeights &layer = weights_.layers[index];
   const uint32_t table = static_cast<uint32_t>(std::popcount(d_.engramLayers & ((uint64_t{1} << index) - 1)));
   const uint32_t hidden = weights_.layout.hiddenSize, perToken = (d_.engramNgram - 1) * d_.engramHeads;
-  if (!weights_.streamedTable) throw std::logic_error("DeepSeek-V4.1 runs with its Engram's tables streaming");
   const ops::EmbeddingWeights stagedRows{staged, d_.engramHeadDimension,
                                          ops::NativeRows(s.engramStaging, weights_.engramFormat)};
   const uint32_t tile = decode ? rows : kLayerTile;
@@ -496,8 +502,11 @@ void DeepSeek41Target::addAttention(metal::CommandGraph &graph, const Scratch &s
     ops::LatentRotation::add(graph, s.q, false, layer.queryNorm.buffer, freqs, positions, s.qRotated,
                              {heads, kLatent, pairs, false, ops::LatentRounding::None, false, 0.0F}, n);
     for (const Rows &sequence : sequences) {
+      // A verify attends a lane's anchor alone, the one row it retains: the
+      // rows after it repeat it, and no row it reads is theirs (positions
+      // past its own).
       const uint32_t first = std::max(sequence.rowBegin, begin);
-      const uint32_t end = std::min(sequence.rowBegin + sequence.rows, begin + n);
+      const uint32_t end = decode ? first + 1 : std::min(sequence.rowBegin + sequence.rows, begin + n);
       if (first >= end) continue;
       const uint32_t count = end - first, at = first - begin;
       // A row reads the groups of its KV source its last indexer selected,
@@ -615,7 +624,6 @@ std::vector<metal::MetalBuffer> DeepSeek41Target::addPrefill(metal::CommandGraph
     for (uint32_t table = 0; table < engramLayers; ++table)
       for (uint64_t at = uint64_t{table} * chunk.rows * perToken; at < (table + 1ull) * chunk.rows * perToken; ++at)
         ids[at] += weights_.engramFirstRows[table];
-    if (!weights_.streamedTable) throw std::logic_error("DeepSeek-V4.1 runs with its Engram's tables streaming");
     const uint64_t rowBytes = weights_.streamedTable->table().rowBytes;
     weights_.streamedTable->stage({ids, staged}, {contents<uint8_t>(s.engramStaging), staged * rowBytes},
                                   {contents<uint32_t>(s.engramSlots), staged}, SparseRowUse::Prefill, true);
@@ -698,7 +706,6 @@ void DeepSeek41Target::addVerifyInput(metal::CommandGraph &graph, metal::MetalBu
                                       metal::MetalBuffer proposals, metal::MetalBuffer verifyInput,
                                       uint32_t lanes) const {
   QwenTarget::addVerifyInput(graph, std::move(draftInput), std::move(proposals), verifyInput, lanes);
-  if (!weights_.streamedTable) throw std::logic_error("DeepSeek-V4.1 runs with its Engram's tables streaming");
   const Scratch &s = *verify_;
   const uint32_t engramLayers = static_cast<uint32_t>(std::popcount(d_.engramLayers));
   EngramHashParams params{.rows = lanes * kVerifyRows,

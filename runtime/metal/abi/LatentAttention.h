@@ -27,6 +27,15 @@
 #define LATENT_ATTENTION_KEY_BLOCK 32u
 #define LATENT_ATTENTION_HEAD_BLOCK 8u
 #define LATENT_ATTENTION_VALUE_THREADS (LATENT_ATTENTION_DIM / 4u)
+// The matrix passes of a step of more rows than LATENT_ATTENTION_MAX_SPLITS,
+// whose values pass splits no keys: a scores threadgroup takes
+// LATENT_ATTENTION_MMA_KEYS keys of a row for every head, a values
+// threadgroup LATENT_ATTENTION_MMA_VALUES of a row's latent values for every
+// head, each in LATENT_ATTENTION_MMA_THREADS threads by 8x8 simdgroup
+// matrices.
+#define LATENT_ATTENTION_MMA_THREADS 128u
+#define LATENT_ATTENTION_MMA_KEYS 64u
+#define LATENT_ATTENTION_MMA_VALUES 64u
 // The most parts a values pass splits a row's keys into, so that a decode's
 // few rows fill the GPU: each part's sums apart, then added in part order
 // (latent_attention_sum).
