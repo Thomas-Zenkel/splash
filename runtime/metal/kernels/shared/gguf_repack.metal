@@ -197,8 +197,10 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
 }
 
 // Streamed experts into their slots (model/ExpertStore.cpp): threadgroup (x, y, z) repacks MOE_EXPERT_LOAD_THREADS
-// (row, 32-wide K group) pairs of projection z of job y, as gguf_repack does, from the native rows the host staged
-// for it from staging + sources[3y + z] on into the planes of slot slots[y]. The grid's jobs are the host's (an
+// (row, native block) pairs of projection z of job y, each block's groups as gguf_repack does, from the native rows
+// the host staged for it from staging + sources[3y + z] on into the planes of slot slots[y]. A thread's neighbours
+// take the rows after its own in a tile of QUANT_TILE_ROWS rows (moe_expert_load_rows), so that the threads of a
+// simdgroup write each group's places of the planes one after another. The grid's jobs are the host's (an
 // indirect grid it writes in the step before).
 kernel void moe_expert_load(device const uchar *staging [[buffer(0)]], device uchar *arena [[buffer(1)]],
                             device const uint *slots [[buffer(2)]], device const ulong *sources [[buffer(3)]],
@@ -206,11 +208,15 @@ kernel void moe_expert_load(device const uchar *staging [[buffer(0)]], device uc
                             uint3 group [[threadgroup_position_in_grid]],
                             uint index [[thread_index_in_threadgroup]]) {
   constant MoeExpertLoadProjection &q = p.projections[group.z];
-  const uint G = q.columns / 32, t = group.x * MOE_EXPERT_LOAD_THREADS + index;
-  if (t >= q.rows * G) return;
-  const uint n = t / G, g = t % G;
+  const uint G = q.columns / 32, units = G / kQuantFormats[q.format].meta_groups;
+  const uint t = group.x * MOE_EXPERT_LOAD_THREADS + index, tile = t / (QUANT_TILE_ROWS * units);
+  const uint unit = t / QUANT_TILE_ROWS % units, n = tile * QUANT_TILE_ROWS + t % QUANT_TILE_ROWS;
+  if (n >= q.rows) return;
   const ulong slot = slots[group.y];
-  gguf_repack_group(staging + sources[group.y * 3 + group.z] + ulong(n) * q.row_bytes, q.format, G, n, g,
-                    arena + q.planes[0] + slot * q.slot_bytes[0], arena + q.planes[1] + slot * q.slot_bytes[1],
-                    arena + q.planes[2] + slot * q.slot_bytes[2]);
+  device const uchar *row = staging + sources[group.y * 3 + group.z] + ulong(n) * q.row_bytes;
+  device uchar *plane0 = arena + q.planes[0] + slot * q.slot_bytes[0];
+  device uchar *plane1 = arena + q.planes[1] + slot * q.slot_bytes[1];
+  device uchar *meta = arena + q.planes[2] + slot * q.slot_bytes[2];
+  const uint groups = kQuantFormats[q.format].meta_groups;
+  for (uint j = 0; j < groups; ++j) gguf_repack_group(row, q.format, G, n, unit * groups + j, plane0, plane1, meta);
 }

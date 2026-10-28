@@ -165,10 +165,31 @@ struct MoeLoadPart final {
 // passes, what makes the experts their tiles name resident and the block's
 // table name their slots; it may read a step's input (MoeBuffers::input).
 // Several steps' parts load the union of their experts at once.
+// The tile descriptors of a decode step's two expert passes around a split
+// load (MoeExpertStream::addSplitLoadStart): every live tile in each, those
+// of the experts that were resident and the shared expert's in `resident`,
+// those of the experts the load reads in `loaded`, the other pass's tiles of
+// no rows (which the passes skip).
+struct MoeSplitTiles final {
+  metal::MetalBuffer resident;
+  metal::MetalBuffer loaded;
+};
+
 class MoeExpertStream {
 public:
   virtual ~MoeExpertStream() = default;
   virtual void addLoad(metal::CommandGraph &graph, std::span<const MoeLoadPart> parts, uint32_t block) const = 0;
+  // A decode step's load of block `block`, split around the expert passes of
+  // the experts that were resident, which the GPU runs while the stream
+  // reads the others: the start routes the step, starts the reads and writes
+  // `tiles`; the finish, after the resident passes, waits for the reads and
+  // makes the experts resident, before the loaded passes. False, and nothing
+  // added, for a step whose load does not split (it adds addLoad instead).
+  [[nodiscard]] virtual bool addSplitLoadStart(metal::CommandGraph &, const MoeLoadPart &, uint32_t,
+                                               MoeSplitTiles &) const {
+    return false;
+  }
+  virtual void addSplitLoadFinish(metal::CommandGraph &, const MoeLoadPart &, uint32_t) const {}
 };
 
 // Grouped-row scratch. Routes are sorted by expert into tiles of tileRows

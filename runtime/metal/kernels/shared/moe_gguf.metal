@@ -27,6 +27,8 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
                                  threadgroup half2 *tl) {
   if (group.y >= *tile_count) return;
   const MoeTileDescriptor tile = tiles[group.y];
+  // A tile of no rows is the other pass's of a split load (ops::MoeSplitTiles).
+  if (!tile.rows) return;
   const MoeGgufSegment s = moe_gguf_segment<Shared>(tile.expert, p, slots, w0, w1, meta, sw0, sw1, smeta);
   device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
   const ulong out = ulong(group.y) * Rows * p.output_size;
@@ -138,6 +140,7 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
   threadgroup half stage[kStagedStages]; threadgroup half2 tl[Tables * kQuantPairTableEntries];
   if (group.y >= *tile_count) return;
   const MoeTileDescriptor tile = tiles[group.y];
+  if (!tile.rows) return;
   const bool up = simd_group == 1;
   const MoeGgufSegment gs = moe_gguf_segment<Shared>(tile.expert, p.experts, p.input_size, p.output_size, p.gate_routed_format,
                                              p.gate_shared_format, p.routed_slot_bytes, slots, gw0, gw1, gmeta, gsw0,

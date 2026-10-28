@@ -179,7 +179,9 @@ ExpertStoreOptions storeOptions(uint64_t arena, const StreamedBlocks &blocks, co
 // The host steps of a load of `plan`'s rows, a round each: the staging
 // places the experts of a block a decode cycle's rows may route, and at least
 // two; a decode step's load that they hold stages them all in one round, any
-// other load half of them a round. A long chunk's load whose next block
+// other load half of them a round. A decode step's round on staged tiles
+// splits around its resident experts' passes into two host steps
+// (ExpertStore::addSplitLoadStart). A long chunk's load whose next block
 // streams (`nextStreams`) reads it ahead in one step more.
 uint32_t loadSteps(const MoeShape &shape, const MoePlan &plan, bool nextStreams) {
   using splash::model::ExecutionLimits;
@@ -188,6 +190,9 @@ uint32_t loadSteps(const MoeShape &shape, const MoePlan &plan, bool nextStreams)
                                                ExecutionLimits::targetVerifyRows * shape.expertsPerToken));
   const uint64_t routable = std::min<uint64_t>(shape.experts, uint64_t{plan.rows()} * shape.expertsPerToken);
   const uint64_t perRound = plan.phase() == MoePhase::Decode && routable <= places ? places : places / 2;
+  if (plan.phase() == MoePhase::Decode && routable <= places &&
+      plan.configuration().ggufTile == splash::ops::MoeGgufTile::Staged)
+    return 2;
   const bool longChunk = plan.phase() == MoePhase::Prefill &&
                          uint64_t{plan.rows()} * shape.expertsPerToken >= 3ULL * shape.experts;
   return static_cast<uint32_t>((routable + perRound - 1) / perRound) + (longChunk && nextStreams);

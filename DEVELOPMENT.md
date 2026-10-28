@@ -371,11 +371,26 @@ formats a layer mixes; the engine refuses a SIZE below that, and
   experts go first), and reads them from their
   files into a staging of a decode cycle's experts on the engine's SSD
   readers, and a repack kernel writes them into their slots before the expert
-  passes run. A decode step's load is one such round; a prefill command's
+  passes run; its threads take the consecutive rows of a tile of the planes,
+  each a native block of its row, so a simdgroup writes each group's places
+  in one piece (a DeepSeek-V4.1-Flash decode cycle's repacks of its IQ1_S
+  experts on a 48 GB M4 Pro: 15 instead of 19.5 ms). A decode step's load is one such round; a prefill command's
   loads take as many rounds as its rows may route experts, each staging half
   of the staging while the other half is read ahead. The kernels read every
   routed expert through the layer's slot table, so resident and streamed
   experts run the same kernels.
+- A decode step's load on staged tiles splits around its expert passes
+  (`ExpertStore::addSplitLoadStart`, `ops::MoeSplitTiles`): its first host
+  step routes it and starts the reads of the experts that are not resident,
+  which the readers read while the GPU runs the passes of the experts that
+  were (and of the shared expert); its second host step waits for the reads,
+  which the repack and the passes of the loaded experts follow. Each pass
+  runs every live tile, the other pass's of no rows, which it skips, so the
+  outputs are those of one pass bitwise. Serving DeepSeek-V4.1-Flash with its
+  DSpark drafter on a 48 GB M4 Pro, whose cycles read about 2 experts a layer,
+  the host steps' waits fell from about 70 to 52 ms of a 170 ms cycle and
+  greedy prose decoded 8% faster (12.6 instead of 11.7 tokens per second);
+  without a draft, at a 90% hit rate, it decoded as fast as before.
 - An expert's rows a GGUF stores as they are are read straight into the
   staging (`F_NOCACHE`, widened to whole 16 KiB pages, which the kernel reads
   without the buffer cache: an M5 Pro reads 460 KiB pieces from four threads

@@ -77,7 +77,7 @@ tables, a file of their own (110.6 GB) that installs with it, always stream; a
 48 GB Mac serves it at 7–9 tokens per second. With `--draft-model
 unsloth/DeepSeek-V4.1-Flash-1017-GGUF` (or a local `dspark-*.gguf`) it decodes
 with its own block drafter DSpark (8 GB, which its experts then lack): on a
-48 GB Mac about 8% faster on prose, more with memory to spare
+48 GB Mac about 20% faster on prose, more with memory to spare
 ([drafts](DEVELOPMENT.md#drafts)).
 
 Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats

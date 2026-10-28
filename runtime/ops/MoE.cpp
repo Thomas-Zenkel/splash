@@ -3,6 +3,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
 #include "metal/abi/MoE.h"
+#include "metal/abi/QuantFormat.h"
 #include "ops/BufferExtent.hpp"
 
 #include <stdexcept>
@@ -207,11 +208,61 @@ MoeGroupParams groupParams(const MoePlan &plan) {
 
 } // namespace
 
+namespace {
+
+// The grouped rows of a step's tiles (Table16 tiles on register plans), and
+// its routes' outputs combined into its rows.
+void addGather(metal::CommandGraph &graph, const MoeBuffers &buffers, const MoePlan &plan) {
+  const MoeShape shape = plan.shape();
+  const uint32_t tiles = plan.maximumTiles();
+  const MoeScratch &scratch = buffers.scratch;
+  const MoeGatherParams gather{plan.tileRows(), shape.hiddenSize, shape.routesPerToken()};
+  if (plan.configuration().ggufTile == MoeGgufTile::Register)
+    graph.add("moe_gather_table16",
+              {buffers.input, scratch.groupedRoutes, scratch.tileCount,
+               scratch.groupedInput, scratch.groupedSums},
+              gather, {tiles, shape.hiddenSize / 256, 1});
+  else
+    graph.add("moe_gather_rows",
+              {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
+               scratch.tileCount, scratch.groupedInput},
+              gather, {tiles, shape.hiddenSize / 256, 1});
+}
+
+void addCombine(metal::CommandGraph &graph, const MoeBuffers &buffers, const MoePlan &plan) {
+  const MoeShape shape = plan.shape();
+  const MoeScratch &scratch = buffers.scratch;
+  graph.add("moe_combine",
+            {scratch.expertOutput, scratch.routeRows, scratch.routingWeights,
+             buffers.residual, buffers.output},
+            MoeCombineParams{plan.rows(), shape.hiddenSize, shape.routesPerToken()},
+            {plan.rows(), shape.hiddenSize / 256, 1});
+}
+
+} // namespace
+
 void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
               const BlockMoeWeights &weights, const MoePlan &plan) {
   addRouting(graph, buffers, weights, plan);
   if (weights.stream) {
     const MoeLoadPart part{&buffers, &plan};
+    // A decode step on staged tiles runs the experts that were resident
+    // while the stream reads the others, and those once they are loaded;
+    // each tile runs in one of the two passes, as in one.
+    MoeSplitTiles split;
+    if (plan.configuration().ggufTile == MoeGgufTile::Staged &&
+        weights.stream->addSplitLoadStart(graph, part, weights.streamBlock, split)) {
+      addGather(graph, buffers, plan);
+      MoeScratch resident = buffers.scratch;
+      resident.tileDescriptors = split.resident;
+      addExperts(graph, resident, weights, plan, groupParams(plan));
+      weights.stream->addSplitLoadFinish(graph, part, weights.streamBlock);
+      MoeScratch loaded = buffers.scratch;
+      loaded.tileDescriptors = split.loaded;
+      addExperts(graph, loaded, weights, plan, groupParams(plan));
+      addCombine(graph, buffers, plan);
+      return;
+    }
     weights.stream->addLoad(graph, {&part, 1}, weights.streamBlock);
   }
   addRouted(graph, buffers, weights, plan);
@@ -255,28 +306,9 @@ void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
 
 void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
                     const BlockMoeWeights &weights, const MoePlan &plan) {
-  const MoeShape shape = plan.shape();
-  const uint32_t rows = plan.rows();
-  const uint32_t tileRows = plan.tileRows();
-  const uint32_t tiles = plan.maximumTiles();
-  const MoeScratch &scratch = buffers.scratch;
-  const MoeGatherParams gather{tileRows, shape.hiddenSize, shape.routesPerToken()};
-  if (plan.configuration().ggufTile == MoeGgufTile::Register)
-    graph.add("moe_gather_table16",
-              {buffers.input, scratch.groupedRoutes, scratch.tileCount,
-               scratch.groupedInput, scratch.groupedSums},
-              gather, {tiles, shape.hiddenSize / 256, 1});
-  else
-    graph.add("moe_gather_rows",
-              {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
-               scratch.tileCount, scratch.groupedInput},
-              gather, {tiles, shape.hiddenSize / 256, 1});
-  addExperts(graph, scratch, weights, plan, groupParams(plan));
-  graph.add("moe_combine",
-            {scratch.expertOutput, scratch.routeRows, scratch.routingWeights,
-             buffers.residual, buffers.output},
-            MoeCombineParams{rows, shape.hiddenSize, shape.routesPerToken()},
-            {rows, shape.hiddenSize / 256, 1});
+  addGather(graph, buffers, plan);
+  addExperts(graph, buffers.scratch, weights, plan, groupParams(plan));
+  addCombine(graph, buffers, plan);
 }
 
 void MoE::addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input, const QuantizedSegment &router,
@@ -303,9 +335,13 @@ void MoE::addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input,
 
 uint32_t MoE::expertLoadGroups(const MoeExpertLoadParams &params) noexcept {
   uint64_t groups = 0;
-  for (const MoeExpertLoadProjection &projection : params.projections)
-    groups = std::max(groups, (uint64_t{projection.rows} * (projection.columns / 32) + MOE_EXPERT_LOAD_THREADS - 1) /
-                                  MOE_EXPERT_LOAD_THREADS);
+  // A thread a row and native block (moe_expert_load), the rows in whole
+  // tiles.
+  for (const MoeExpertLoadProjection &projection : params.projections) {
+    const uint64_t units = projection.columns / 32 / kQuantFormats[projection.format].meta_groups;
+    const uint64_t rows = (uint64_t{projection.rows} + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS * QUANT_TILE_ROWS;
+    groups = std::max(groups, (rows * units + MOE_EXPERT_LOAD_THREADS - 1) / MOE_EXPERT_LOAD_THREADS);
+  }
   return static_cast<uint32_t>(groups);
 }
 

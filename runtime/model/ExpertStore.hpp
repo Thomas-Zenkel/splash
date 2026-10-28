@@ -128,6 +128,14 @@ public:
   // routes.
   void bind(uint32_t block, ops::BlockMoeWeights &weights);
   void addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLoadPart> parts, uint32_t block) const override;
+  // A decode step's load in one round (every expert it may route fits the
+  // staging) splits: its first host step routes the step, writes the passes'
+  // tiles and starts reading the experts that are not resident, which the
+  // readers read while the GPU runs the others; its second waits for them
+  // and plans the next block's read-ahead, before their repack.
+  [[nodiscard]] bool addSplitLoadStart(metal::CommandGraph &graph, const ops::MoeLoadPart &part, uint32_t block,
+                                       ops::MoeSplitTiles &tiles) const override;
+  void addSplitLoadFinish(metal::CommandGraph &graph, const ops::MoeLoadPart &part, uint32_t block) const override;
   [[nodiscard]] ExpertStoreStats stats() const;
   // The arena and the staging, while no command is in flight; restore()
   // takes both back in one part and reads the experts of an arena of one
