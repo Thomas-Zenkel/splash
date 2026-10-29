@@ -198,41 +198,45 @@ struct TranscriptTests {
         let paragraph = String(repeating: "A sentence that goes on for a while. ", count: 12)
         var messages = (0..<12).flatMap { _ in [ChatMessage(role: .user, text: "Tell me more."), ChatMessage(role: .assistant, text: paragraph)] }
         let id = UUID()
-        func show(_ messages: [ChatMessage]) async throws {
+        func show(_ messages: [ChatMessage]) {
             transcript.show(TranscriptPage(Conversation(id: id, messages: messages), live: nil, asleep: false,
                                            askAgain: .init(enabled: false, help: ""), name: { $0 }))
-            try await Task.sleep(for: .milliseconds(150))
         }
+        // Where the page is two frames on, however long WebKit takes to draw them: by then the
+        // scroll and resize observers have seen what came before, as the follow of a reply that grew.
+        // A page that draws no frame is read after 5 s, so that the expectation fails where it is.
         func scrolled() async throws -> (top: Double, bottom: Double, latest: Bool) {
             let values = try await webView.callAsyncJavaScript(
-                "return [scrollY, document.scrollingElement.scrollHeight - innerHeight, document.getElementById('latest').classList.contains('shown') ? 1 : 0]",
-                contentWorld: .page) as? [Double] ?? []
+                """
+                await Promise.race([new Promise(drawn => requestAnimationFrame(() => requestAnimationFrame(drawn))),
+                                    new Promise(late => setTimeout(late, 5000))])
+                return [scrollY, document.scrollingElement.scrollHeight - innerHeight, document.getElementById('latest').classList.contains('shown') ? 1 : 0]
+                """, contentWorld: .page) as? [Double] ?? []
             return (values[0], values[1], values[2] == 1)
         }
         // A conversation opens at its latest message, and follows a reply that grows.
-        try await show(messages)
+        show(messages)
         var position = try await scrolled()
         #expect(position.top == position.bottom && position.bottom > 0 && !position.latest)
         messages[messages.count - 1].text += "\n\n" + paragraph
-        try await show(messages)
+        show(messages)
         position = try await scrolled()
         #expect(position.top == position.bottom && !position.latest)
         // Scrolled up, it stays where the reader left it, and offers the way back.
         _ = try await webView.callAsyncJavaScript("scrollTo(0, 100)", contentWorld: .page)
-        try await Task.sleep(for: .milliseconds(150))
+        _ = try await scrolled()
         messages[messages.count - 1].text += "\n\n" + paragraph
-        try await show(messages)
+        show(messages)
         position = try await scrolled()
         #expect(position.top == 100 && position.bottom > 100 && position.latest)
-        // Which glides there, and the conversation follows again.
+        // Which glides there over 0.4 s, and the conversation follows again.
         _ = try await webView.callAsyncJavaScript("document.getElementById('latest').click()", contentWorld: .page)
-        try await Task.sleep(for: .milliseconds(600))
-        position = try await scrolled()
+        position = try await settled(scrolled, seconds: 2) { $0.top == $0.bottom }
         #expect(position.top == position.bottom && !position.latest)
         // A message sent scrolls to it, wherever the reader was.
         _ = try await webView.callAsyncJavaScript("scrollTo(0, 0)", contentWorld: .page)
         messages += [ChatMessage(role: .user, text: "And then?"), ChatMessage(role: .assistant, text: "")]
-        try await show(messages)
+        show(messages)
         position = try await scrolled()
         #expect(position.top == position.bottom && !position.latest)
     }
@@ -278,8 +282,10 @@ struct TranscriptTests {
         #expect(try await run("return window.mark + ' ' + document.querySelector('.reply').dataset.mark") == "kept kept")
         // Another conversation is sent to the page, which stays.
         state.chats.selection = other.id
-        try await Task.sleep(for: .milliseconds(200))
-        #expect(try await run("return window.mark + ' ' + document.querySelector('.reply .markdown').textContent") == "kept Goodbye.")
+        let shown = try await settled({ try await run("return window.mark + ' ' + document.querySelector('.reply .markdown').textContent") }) {
+            $0 == "kept Goodbye."
+        }
+        #expect(shown == "kept Goodbye.")
     }
 
     private static func textViews(in view: NSView) -> [NSTextView] {
@@ -292,6 +298,19 @@ struct TranscriptTests {
             try #require(ContinuousClock.now < deadline, "timed out")
             try await Task.sleep(for: .milliseconds(20))
         }
+    }
+
+    /// `value` read until `done` holds of it, or until `seconds` pass: what the page shows once it
+    /// has caught up, however long that takes on a busy Mac.
+    private func settled<Value>(_ value: () async throws -> Value, seconds: Double = 10,
+                                until done: (Value) -> Bool) async throws -> Value {
+        let deadline = ContinuousClock.now + .seconds(seconds)
+        var read = try await value()
+        while !done(read), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+            read = try await value()
+        }
+        return read
     }
 }
 
