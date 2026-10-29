@@ -835,8 +835,27 @@ def _name_rule(syntax):
 
 def _writes_name(syntax, name):
     """Whether a strict tool's parameter `name` reads back as written from
-    `syntax`'s tags."""
-    return is_tag_name(name) and syntax.key_close[0] not in name
+    `syntax`'s tags and, as a function's name does (_name_markup), holds no
+    marker of them."""
+    return (
+        is_tag_name(name)
+        and syntax.key_close[0] not in name
+        and syntax.marker not in name
+    )
+
+
+def _name_markup(syntax, name):
+    """The markup of `syntax` that a function's `name` holds, which a call of
+    it would write inside its own tag: the marker the tags of `syntax` hold
+    and text outside calls cannot spell (DSML's, which opens each of its
+    tags), or the character a function's name ends at (DSML's quote), after
+    which the call would read as a call of another function. None where it
+    holds neither, as no tag name holds Qwen's or Flint's, each of which is
+    or holds < or >."""
+    return next(
+        (markup for markup in (syntax.marker, syntax.name_end) if markup in name),
+        None,
+    )
 
 
 def _tags(syntax, *tags):
@@ -1105,8 +1124,10 @@ def _check_tool_schema(name, schema):
         ) from error
 
 
-def normalize_tools(tools, tool_choice, parallel, namespaces=None):
-    """The tools of a request and its ToolPolicy."""
+def normalize_tools(tools, tool_choice, parallel, namespaces=None, *, syntax=None):
+    """The tools of a request and its ToolPolicy. With `syntax`, the layout
+    the served model writes its calls in (ToolCallSyntax), a function's name
+    holds none of its markup (_name_markup)."""
     if parallel is None:
         parallel = True
     if not isinstance(parallel, bool):
@@ -1136,6 +1157,12 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
         name = function.get("name")
         if not is_tag_name(name):
             raise APIError(400, f"tool name must be {TAG_NAME_RULE}")
+        if syntax is not None and (markup := _name_markup(syntax, name)):
+            raise APIError(
+                400,
+                f"tool name {name} must not contain {markup!r}, "
+                "the markup of this model's tool calls",
+            )
         if name in schemas:
             raise APIError(400, f"duplicate tool name: {name}")
         schema = function.get("parameters")

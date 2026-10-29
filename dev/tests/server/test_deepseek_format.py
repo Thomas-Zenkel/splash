@@ -1,14 +1,16 @@
 """DeepSeek-V4.1-Flash's chat format: its calls in DSML, one block of them
 after the text, read, constrained and rendered as Qwen's and Flint's calls
-are; its embedded template, which renders DeepSeek's own encoding cases;
-and a generation prompt that opens or closes the think block by the
-request's reasoning."""
+are; tool names that hold none of DSML's markup; its embedded template,
+which renders DeepSeek's own encoding cases, and text that quotes its image
+placeholder; and a generation prompt that opens or closes the think block
+by the request's reasoning."""
 
 import json
 import unittest
 from dataclasses import replace
 from pathlib import Path
 
+from jinja2 import TemplateError
 from llguidance import LLMatcher
 from tokenizers import (
     AddedToken,
@@ -26,13 +28,23 @@ from dev.tests import server_fixtures as fixtures
 from dev.tests.tool_output import project, put, streamed_text, tool_policy
 from server import constraints, tool_schema
 from server import output as model_output
-from server.chat_format import DEEPSEEK, DEEPSEEK_DSML, DSML
+from server.chat_format import (
+    DEEPSEEK,
+    DEEPSEEK_DSML,
+    DEEPSEEK_IMAGE,
+    DSML,
+    GLM_ARGS,
+    QWEN,
+    QWEN_XML,
+)
 from server.chat_templates import (
     NATIVE,
     ChatTemplates,
     render_chat_template,
     template_options,
 )
+from server.errors import APIError
+from server.frontend import PLACEHOLDER_RENDER_MARKER
 from server.serve_options import REASONING_EFFORTS
 from server.tokenization import PromptTokenizer
 
@@ -390,6 +402,78 @@ class DsmlGrammarTests(unittest.TestCase):
         )
 
 
+class DsmlToolNameTests(unittest.TestCase):
+    """A tool's name is written inside its calls' DSML tags, and a strict
+    tool's parameter names inside theirs: a name that holds DSML's markup,
+    the marker its tags open with or the quote a function's name ends at, is
+    refused, naming the tool. Qwen's and Flint's tools keep every name they
+    took."""
+
+    def policy(self, name, syntax=DEEPSEEK_DSML, **function):
+        tools = [{"type": "function", "function": {"name": name, **function}}]
+        return tool_schema.normalize_tools(tools, "auto", True, syntax=syntax)[1]
+
+    def test_a_name_holding_dsml_markup_is_refused(self):
+        for name, markup in (
+            (f"read{DSML}file", DSML),
+            (DSML, DSML),
+            ('bash"x', '"'),
+            ('say "hi"', '"'),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(APIError) as caught:
+                    self.policy(name)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(
+                    caught.exception.message,
+                    f"tool name {name} must not contain {markup!r}, "
+                    "the markup of this model's tool calls",
+                )
+        for name in (
+            "weather",
+            "ns::lookup",
+            "mcp__github__list_issues",
+            "web search",
+            "files:read/v2",
+            "天气",
+            "｜DSML",
+            "a'b",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(list(self.policy(name).schemas), [name])
+
+    def test_reading_ends_a_call_s_function_name_at_the_quote(self):
+        # Why the quote is refused: reading ends a function's name there.
+        text = dsml_calls(("bash", {})).replace('"bash"', '"bash"x"')
+        _, calls, _ = project(text, tool_policy(SCHEMAS), syntax=DEEPSEEK_DSML)
+        self.assertEqual([call["function"]["name"] for call in calls], ["bash"])
+
+    def test_other_families_take_the_names_they_took(self):
+        # Their markup is or holds < or >, which no tool name holds.
+        for syntax in (QWEN_XML, GLM_ARGS):
+            for markup in (syntax.marker, syntax.name_end):
+                self.assertTrue({"<", ">"} & set(markup), markup)
+            for name in (f"read{DSML}file", 'bash"x', "weather"):
+                with self.subTest(syntax=syntax.key_open, name=name):
+                    self.assertEqual(list(self.policy(name, syntax).schemas), [name])
+
+    def test_a_strict_parameter_name_holding_the_marker_is_refused(self):
+        schema = {"type": "object", "properties": {f"a{DSML}b": {"type": "string"}}}
+        for chat_format, refused in ((DEEPSEEK, True), (QWEN, False)):
+            policy = self.policy(
+                "tool",
+                chat_format.call_syntax,
+                parameters=schema,
+                strict=True,
+            )
+            with self.subTest(syntax=chat_format.call_syntax.key_open):
+                if not refused:
+                    tool_schema.tool_grammar(policy, False, chat_format=chat_format)
+                    continue
+                with self.assertRaisesRegex(APIError, "invalid tool parameter name"):
+                    tool_schema.tool_grammar(policy, False, chat_format=chat_format)
+
+
 class DeepSeekTokenizerContractTests(unittest.TestCase):
     def test_deepseek_s_tokens_are_checked_against_its_format(self):
         tokenizer = deepseek_tokenizer()
@@ -423,14 +507,19 @@ class DeepSeekTokenizerContractTests(unittest.TestCase):
         self.assertIs(DEEPSEEK.call_syntax, DEEPSEEK_DSML)
         self.assertTrue(DEEPSEEK.reasoning_switch)
         self.assertFalse(DEEPSEEK.calls_end_reasoning)
+        # The image placeholder its template writes and refuses in text.
+        self.assertEqual(DEEPSEEK.refused_placeholder, "<｜deepseek_image｜>")
+        self.assertIn(f'set IMG = "{DEEPSEEK_IMAGE}"', TEMPLATE)
 
 
 class DeepSeekPromptTests(unittest.TestCase):
     """DeepSeek's embedded template renders as its reference encoder does,
-    through the options a request passes it, and its generation prompt opens
-    the think block where the request thinks."""
+    through the options a request passes it, also where a message's text
+    quotes the image placeholder the template refuses there, and its
+    generation prompt opens the think block where the request thinks."""
 
-    def frontend(self):
+    def frontend(self, **changes):
+        """A frontend serving DeepSeek's format, with `changes` to it."""
         tokenizer = deepseek_tokenizer()
         return fixtures.make_frontend(
             tokenizer,
@@ -440,11 +529,12 @@ class DeepSeekPromptTests(unittest.TestCase):
             10,
             2,
             vision=False,
-            chat_format=deepseek_format(tokenizer),
+            chat_format=replace(deepseek_format(tokenizer), **changes),
         )
 
     def test_the_template_renders_deepseek_s_own_encoding_cases(self):
         tokenizer = deepseek_tokenizer()
+        frontend = self.frontend()
         cases = sorted((FIXTURES / "deepseek41-encoding").glob("test_input_*.json"))
         self.assertEqual(len(cases), 5)
         for case in cases:
@@ -474,6 +564,15 @@ class DeepSeekPromptTests(unittest.TestCase):
                 self.assertEqual(
                     render_chat_template(
                         tokenizer, data["messages"], options | {"tokenize": False}
+                    ),
+                    expected,
+                )
+                # As requests render it, with a marker for its image
+                # placeholder, which the image blocks of case 5 write.
+                self.assertEqual(
+                    frontend._apply_chat_template(
+                        data["messages"],
+                        options | {"chat_template": TEMPLATE, "tokenize": False},
                     ),
                     expected,
                 )
@@ -556,6 +655,135 @@ class DeepSeekPromptTests(unittest.TestCase):
             ),
             prompt,
         )
+
+    def test_text_quoting_the_image_placeholder_renders_as_it_is(self):
+        # The template refuses a message whose text holds its image
+        # placeholder. A page, file or tool result an agent read may quote
+        # it, and the model may quote it back in its answer or its reasoning;
+        # every later request of the conversation renders that text again.
+        quote = f"The page reads {DEEPSEEK_IMAGE} here."
+        ask = {"role": "user", "content": "Read the page."}
+        then = {"role": "user", "content": "Go on."}
+        call = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": {"city": "Paris"}},
+                }
+            ],
+        }
+        result = {"role": "tool", "tool_call_id": "call_1", "content": quote}
+        done = {"role": "assistant", "content": "Done."}
+        conversations = {
+            "system": [{"role": "system", "content": quote}, ask],
+            "user": [{"role": "user", "content": quote}],
+            "tool": [ask, call, result],
+            "later turn": [ask, call, result, done, then],
+            "assistant": [ask, {**done, "content": quote}, then],
+            "reasoning": [ask, {**done, "reasoning_content": quote}, then],
+        }
+        # Tools keep the history's reasoning.
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": SCHEMAS["weather"]},
+            }
+        ]
+        tokenizer, frontend = deepseek_tokenizer(), self.frontend()
+        for name, messages in conversations.items():
+            body = fixtures.chat_body(messages=messages, tools=tools)
+            with self.subTest(conversation=name):
+                # The template's own refusal.
+                with self.assertRaisesRegex(TemplateError, "image special token"):
+                    render_chat_template(
+                        tokenizer,
+                        messages,
+                        {
+                            "tools": tools,
+                            "add_generation_prompt": True,
+                            "tokenize": False,
+                        },
+                    )
+                prompt = frontend.apply_template(body, deadline=fixtures.FOREVER)
+                self.assertEqual(prompt.count(quote), 1, prompt)
+                self.assertNotIn(PLACEHOLDER_RENDER_MARKER, prompt)
+                frontend.prepare(body, deadline=fixtures.FOREVER)
+
+    def test_ordinary_requests_render_and_encode_as_without_the_marker(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": SCHEMAS["weather"]},
+            }
+        ]
+        bodies = (
+            fixtures.chat_body(),
+            fixtures.chat_body(
+                messages=[
+                    {"role": "system", "content": "Be brief."},
+                    {"role": "user", "content": "Weather in Paris?"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "Look it up.",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "weather",
+                                    "arguments": '{"city": "Paris"}',
+                                },
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "content": "Sunny"},
+                    {
+                        "role": "assistant",
+                        "content": "Sunny.",
+                        "reasoning_content": "Hm",
+                    },
+                    {"role": "system", "content": "Answer in French."},
+                    {"role": "user", "content": "And Rome?"},
+                ],
+                tools=tools,
+            ),
+        )
+
+        def prompt(app, request):
+            """The request's prompt text and tokens."""
+            return (
+                app.apply_template(request, deadline=fixtures.FOREVER),
+                app.prepare(request, deadline=fixtures.FOREVER).prompt_tokens,
+            )
+
+        frontend, unmarked = self.frontend(), self.frontend(refused_placeholder=None)
+        for index, body in enumerate(bodies):
+            for effort in (None, *REASONING_EFFORTS):
+                request = body | {"reasoning_effort": effort}
+                with self.subTest(body=index, effort=effort):
+                    self.assertEqual(
+                        prompt(frontend, request), prompt(unmarked, request)
+                    )
+
+    def test_a_judgment_of_text_quoting_the_image_placeholder_is_scored(self):
+        frontend, unmarked = self.frontend(), self.frontend(refused_placeholder=None)
+
+        def prompt(app, state):
+            job, _ = app.prepare_judgment(
+                fixtures.judgment_body(state=state),
+                deadline=fixtures.FOREVER,
+                disconnected=fixtures.stays_connected,
+            )
+            return job.prompt_tokens, job.prompt_sha256
+
+        ordinary = {"evidence": "the sky is blue"}
+        self.assertEqual(prompt(frontend, ordinary), prompt(unmarked, ordinary))
+        tokens, _ = prompt(frontend, {"evidence": f"a page reads {DEEPSEEK_IMAGE}"})
+        self.assertTrue(tokens)
 
     def test_prompt_tokens_are_reused_after_the_last_assistant_turn(self):
         # Splits before the byte-level BPE, as DeepSeek's tokenizer has, and
@@ -690,6 +918,51 @@ class DeepSeekServingTests(fixtures.HarnessTestCase):
             f'start: think WS {calls_open} ((call_0) "\\n")+ {calls_close} WS\n', main
         )
         self.assertIn("think: TEXT <[42]>\n", main)
+
+    def test_a_tool_result_quoting_the_image_placeholder_is_served(self):
+        harness = self.harness(fixtures.Plan([[41], [42], [43]]))
+        messages = [
+            {"role": "user", "content": "Read the page."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "weather", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": f"The page reads {DEEPSEEK_IMAGE} here.",
+            },
+        ]
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body(messages=messages)
+        )
+        self.assertEqual(status, 200, payload)
+        message = json.loads(payload)["choices"][0]["message"]
+        self.assertEqual(message["content"], "Let me look.")
+
+    def test_a_tool_whose_name_holds_dsml_markup_is_refused(self):
+        harness = self.harness()
+        name = f"read{DSML}file"
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/chat/completions",
+            fixtures.chat_body(
+                tools=[{"type": "function", "function": {"name": name}}]
+            ),
+        )
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(
+            json.loads(payload)["error"]["message"],
+            f"tool name {name} must not contain '{DSML}', "
+            "the markup of this model's tool calls",
+        )
 
 
 if __name__ == "__main__":

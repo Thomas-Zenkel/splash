@@ -21,6 +21,8 @@ TOOL_CALL_OPEN = "<tool_call>"
 TOOL_CALL_CLOSE = "</tool_call>"
 # The token DeepSeek's DSML opens each of its tags with, after their < or </.
 DSML = "｜DSML｜"
+# The placeholder DeepSeek's template writes for an image.
+DEEPSEEK_IMAGE = "<｜deepseek_image｜>"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -211,6 +213,12 @@ class ChatFormat:
     # The template's special token after which prompt tokenization reuses a
     # cached prompt's tokens (tokenization.PromptTokenizer).
     message_boundary: str
+    # The placeholder the template writes for an image where it refuses any
+    # message whose text holds it, as DeepSeek's does: a page or file an agent
+    # read that quotes it would fail every later request of the conversation.
+    # Requests render the template with a marker of their own in its place
+    # (frontend.py). None where the template refuses no such text.
+    refused_placeholder: str | None = None
 
     @property
     def stop_ids(self):
@@ -261,7 +269,8 @@ FLINT = ChatFormat(
 # DeepSeek-V4.1-Flash's: a vocabulary its tokenizer fills, the EOS
 # <｜end▁of▁sentence｜> as the stop token, a generation prompt that opens the
 # think block when the request thinks and closes it when it does not, calls
-# in DSML, and the assistant's role token before each of its turns.
+# in DSML, the assistant's role token before each of its turns, and a
+# template that refuses its image placeholder in a message's text.
 DEEPSEEK = ChatFormat(
     vocabulary=129280,
     stop_tokens=(("<｜end▁of▁sentence｜>", 1),),
@@ -271,4 +280,5 @@ DEEPSEEK = ChatFormat(
     call_syntax=DEEPSEEK_DSML,
     calls_end_reasoning=False,
     message_boundary="<｜Assistant｜>",
+    refused_placeholder=DEEPSEEK_IMAGE,
 )

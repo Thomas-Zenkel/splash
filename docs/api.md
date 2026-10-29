@@ -483,6 +483,9 @@ A tool's name is written in its calls' tags and read back from them, so it
 holds 1 to 256 characters in Unicode NFC, which a tokenizer such as Qwen's
 keeps text in, other than `<`, `>`, line breaks and lone surrogates, and does
 not start or end with whitespace; a `tool_reference` names a tool the same way.
+Where DeepSeek's DSML lays the calls out, a tool's name also holds neither
+`｜DSML｜`, which opens each of its tags, nor the quote a function's name ends
+at, and the 400 names the tool.
 A Chat tool or named `tool_choice` that gives no `type` is a function. A
 Responses `namespace` function goes by `namespace__name`. Hosted search is
 unsupported; configure client-owned tools such as MCP.

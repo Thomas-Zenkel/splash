@@ -578,7 +578,11 @@ opens its reasoning itself, and of the marker each call's opening holds,
 `<tool_call>` or DSML's `｜DSML｜`; the call syntax; and the special token
 after which prompt tokenization reuses a cached prompt's tokens,
 `<|im_end|>`, `<|assistant|>` or `<｜Assistant｜>`. Startup checks that the
-tokenizer encodes each as the format has it. Grammars write reasoning and
+tokenizer encodes each as the format has it. DeepSeek's also names the image
+placeholder its template refuses in any message's text, `<｜deepseek_image｜>`:
+requests render the template with a marker of the server's own in its place,
+so a page, file or tool result that quotes the placeholder does not fail every
+later request of its conversation. Grammars write reasoning and
 calls as the format lays them out: Flint's optional think block may come
 before any constrained output, and its tags, which the grammar compiler takes
 as tokens rather than text, are written as their tokens. DSML's tags are
