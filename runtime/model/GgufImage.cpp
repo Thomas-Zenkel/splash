@@ -337,15 +337,6 @@ public:
     }
   }
 
-  // An integer tensor of `elements` values of `type` (I32 or I64) as stored,
-  // which the host reads: DeepSeek-V4.1's Engram hash.
-  void integers(const std::string &name, uint32_t type, uint64_t elements) {
-    const GgufTensor *tensor = file_.find(name);
-    if (!tensor || tensor->type != type) return reject(name, tensor);
-    if (tensor->elements() != elements) throw GgufError("unexpected shape for " + name);
-    image_.copy(tensorRows(*tensor, 1, tensor->bytes), Conversion::None);
-  }
-
   // A tensor the target's blocks would not apply, which changes what the
   // model computes where a GGUF holds it: `what` names it in the error.
   void absent(const std::string &name, std::string_view what) {
@@ -667,17 +658,19 @@ void mixImage(Builder &b, const std::string &stem, uint64_t streams) {
   b.floatNorm(stem + "_base.weight", MHC_MIXES);
 }
 
-// DeepSeek-V4.1's GGUFs (deepseek41, model/DeepSeek41.hpp), each layer in
-// its weights' order (DeepSeek41LayerWeights): an Engram layer's projection
-// and gate weights; the attention's mix (hc_attn), norm, query latent and its
-// norm, queries, latent and its norm and sinks; a compressor layer's
-// compressor and indexer key, an indexer layer's queries and head weights;
-// the output's groups, each a projection of its own, and their projection;
-// the FFN's mix (hc_ffn) and norm, its MoE, and its router's selection bias.
-// The head holds the output norm and the Engram hash's tables, which the
-// host reads, before the logits; the Engram's own tables lie in a GGUF of
-// their own (deepseek41.engram.file). Its norms take its own epsilon and its
-// RoPE YaRN's scaling, which requireMetadata leaves to it.
+// DeepSeek-V4.1's GGUFs (deepseek41, model/DeepSeek41.hpp) in llama.cpp's
+// layout, each layer in its weights' order (DeepSeek41LayerWeights): an
+// Engram layer's projection and gate weights; the attention's mix (hc_attn),
+// norm, query latent and its norm, queries, latent and its norm and sinks; a
+// compressor layer's compressor and indexer key, an indexer layer's queries
+// and head weights; the output's groups, each a projection of its own, and
+// their projection; the FFN's mix (hc_ffn) and norm, its MoE, and its
+// router's selection bias (the image router's, exp_probs_b_vl, is not read).
+// The head holds the output norm before the logits. The Engram hash lies in
+// the metadata (engram.token_map and the ple.* arrays) and the Engram's
+// tables in the split's last part (per_layer_token_embd), which stream
+// (DeepSeek41.cpp). Its norms take its own epsilon and its RoPE YaRN's
+// scaling, which requireMetadata leaves to it.
 struct DeepSeek41Gguf final {
   static constexpr std::string_view architecture = "deepseek41";
   // The expert_gating_func of its sqrt(softplus) router, as its GGUFs state it.
@@ -693,9 +686,9 @@ struct DeepSeek41Gguf final {
     expect("attention.indexer.head_count", d.indexerHeads);
     expect("attention.indexer.key_length", d.indexerHeadDimension);
     expect("attention.indexer.top_k", d.indexerTopGroups);
-    expect("attention.candidate_source_layer_id", d.candidateLayer);
-    expect("attention.candidate_block_size", d.candidateBlockGroups);
-    expect("attention.candidate_topk_blocks", d.candidateTopBlocks);
+    expect("attention.indexer.candidate_source_layer", d.candidateLayer);
+    expect("attention.indexer.candidate_block_size", d.candidateBlockGroups);
+    expect("attention.indexer.candidate_top_k_blocks", d.candidateTopBlocks);
     expect("hyper_connection.count", MHC_STREAMS);
     expect("hyper_connection.sinkhorn_iterations", d.sinkhornIterations);
     expect("expert_shared_count", g.sharedExpertSlices);
@@ -703,11 +696,10 @@ struct DeepSeek41Gguf final {
     expect("expert_weights_norm", 1);
     // No layer routes by token hashes, which its MoE would not apply.
     expect("hash_layer_count", 0);
-    expect("engram.present", 1);
-    expect("engram_n_heads", d.engramHeads);
-    expect("engram_head_dim", d.engramHeadDimension);
-    expect("engram_max_ngram_size", d.engramNgram);
-    expect("engram_pad_token_id", d.engramPadToken);
+    expect("ple.heads_per_ngram", d.engramHeads);
+    expect("embedding_length_per_layer_input", d.engramHeadDimension);
+    expect("ple.ngram_size", d.engramNgram);
+    expect("engram.pad_token_id", d.engramPadToken);
     expect("rope.scaling.original_context_length", d.yarnOriginalContextTokens);
     expectFloat("attention.layer_norm_rms_epsilon", d.normEpsilon);
     expectFloat("hyper_connection.epsilon", d.hcEpsilon);
@@ -721,7 +713,7 @@ struct DeepSeek41Gguf final {
   // The arrays and strings the installer's copy of the scalar metadata leaves
   // out: each layer's compress ratio (the array also holds its draft
   // layers'), the layers of each role, one SwiGLU clamp for every expert, and
-  // the router's scoring and RoPE's scaling. One error names every mismatch.
+  // RoPE's scaling. One error names every mismatch.
   static void arrays(const GgufFile &file, const QwenTargetDimensions &g) {
     const DeepSeek41Dimensions &d = g.deepseek;
     const std::string arch(architecture);
@@ -747,9 +739,9 @@ struct DeepSeek41Gguf final {
       }
       if (!valid || found != bits) mismatch(key);
     };
-    layers("kv_source_layer_ids", d.compressorLayers);
-    layers("index_source_layer_ids", d.indexerLayers);
-    layers("engram.layer_ids", d.engramLayers);
+    layers("attention.kv_source_layers", d.compressorLayers);
+    layers("attention.indexer.source_layers", d.indexerLayers);
+    layers("ple.layers", d.engramLayers);
     for (const char *key : {"swiglu_clamp_exp", "swiglu_clamp_shexp"}) {
       const auto clamps = file.numericArray(arch + "." + key);
       bool same = clamps && clamps->size() >= g.layers;
@@ -760,7 +752,6 @@ struct DeepSeek41Gguf final {
       const std::optional<std::string> found = file.metadata().stringValue(arch + "." + key);
       if (!found || *found != value) mismatch(key);
     };
-    text("expert_scoring_func", "sqrtsoftplus");
     text("rope.scaling.type", "yarn");
     if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
   }
@@ -770,9 +761,8 @@ struct DeepSeek41Gguf final {
     const std::string p = prefix(index);
     const uint64_t latent = g.attentionHeadDimension, streams = uint64_t{MHC_STREAMS} * g.hiddenSize;
     if (d.has(d.engramLayers, index)) {
-      b.quantized(p + "engram_wkv.weight", uint64_t{MHC_STREAMS + 1} * g.hiddenSize, d.engramWidth());
-      b.floatRows(p + "engram_q.weight", MHC_STREAMS, g.hiddenSize, false);
-      b.floatRows(p + "engram_k.weight", MHC_STREAMS, g.hiddenSize, false);
+      b.quantized(p + "engram_kv.weight", uint64_t{MHC_STREAMS + 1} * g.hiddenSize, d.engramWidth());
+      b.floatRows(p + "engram_gate.weight", MHC_STREAMS, g.hiddenSize, false);
     }
     mixImage(b, p + "hc_attn", streams);
     b.floatNorm(p + "attn_norm.weight", g.hiddenSize);
@@ -801,15 +791,7 @@ struct DeepSeek41Gguf final {
     ffnImage(b, g, p, index);
   }
 
-  static void head(Builder &b, const QwenTargetDimensions &g) {
-    const DeepSeek41Dimensions &d = g.deepseek;
-    b.floatNorm("output_norm.weight", g.hiddenSize);
-    const uint64_t engrams = std::popcount(d.engramLayers), hashes = uint64_t{d.engramNgram - 1} * d.engramHeads;
-    b.integers("engram_token_map.weight", ggml::kI32, g.vocabularySize);
-    b.integers("engram_multipliers.weight", ggml::kI64, engrams * d.engramNgram);
-    b.integers("engram_primes.weight", ggml::kI64, engrams * hashes);
-    b.integers("engram_offsets.weight", ggml::kI64, engrams * hashes);
-  }
+  static void head(Builder &b, const QwenTargetDimensions &g) { b.floatNorm("output_norm.weight", g.hiddenSize); }
 
   static void tables(const GgufFile &, const QwenTargetDimensions &, PlanOptions, std::vector<std::string> &,
                      std::vector<Image> &) {}

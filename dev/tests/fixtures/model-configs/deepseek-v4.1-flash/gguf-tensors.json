@@ -22,8 +22,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.0.attn_output_b.weight": [
@@ -60,6 +59,12 @@
     ]
   ],
   "blk.0.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.0.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -184,8 +189,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.1.attn_output_b.weight": [
@@ -221,21 +225,14 @@
       64
     ]
   ],
-  "blk.1.engram_k.weight": [
-    "BF16",
+  "blk.1.engram_gate.weight": [
+    "F32",
     [
       5120,
       4
     ]
   ],
-  "blk.1.engram_q.weight": [
-    "BF16",
-    [
-      5120,
-      4
-    ]
-  ],
-  "blk.1.engram_wkv.weight": [
+  "blk.1.engram_kv.weight": [
     "Q5_K",
     [
       6144,
@@ -243,6 +240,12 @@
     ]
   ],
   "blk.1.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.1.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -367,8 +370,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.10.attn_output_b.weight": [
@@ -405,6 +407,12 @@
     ]
   ],
   "blk.10.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.10.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -529,8 +537,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.11.attn_output_b.weight": [
@@ -567,6 +574,12 @@
     ]
   ],
   "blk.11.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.11.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -691,8 +704,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.12.attn_output_b.weight": [
@@ -729,6 +741,12 @@
     ]
   ],
   "blk.12.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.12.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -853,8 +871,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.13.attn_output_b.weight": [
@@ -891,6 +908,12 @@
     ]
   ],
   "blk.13.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.13.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -1035,8 +1058,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.14.attn_output_b.weight": [
@@ -1072,21 +1094,14 @@
       64
     ]
   ],
-  "blk.14.engram_k.weight": [
-    "BF16",
+  "blk.14.engram_gate.weight": [
+    "F32",
     [
       5120,
       4
     ]
   ],
-  "blk.14.engram_q.weight": [
-    "BF16",
-    [
-      5120,
-      4
-    ]
-  ],
-  "blk.14.engram_wkv.weight": [
+  "blk.14.engram_kv.weight": [
     "Q5_K",
     [
       6144,
@@ -1094,6 +1109,12 @@
     ]
   ],
   "blk.14.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.14.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -1245,8 +1266,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.15.attn_output_b.weight": [
@@ -1283,6 +1303,12 @@
     ]
   ],
   "blk.15.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.15.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -1407,8 +1433,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.16.attn_output_b.weight": [
@@ -1445,6 +1470,12 @@
     ]
   ],
   "blk.16.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.16.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -1569,8 +1600,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.17.attn_output_b.weight": [
@@ -1607,6 +1637,12 @@
     ]
   ],
   "blk.17.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.17.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -1731,8 +1767,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.18.attn_output_b.weight": [
@@ -1769,6 +1804,12 @@
     ]
   ],
   "blk.18.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.18.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -1893,8 +1934,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.19.attn_output_b.weight": [
@@ -1931,6 +1971,12 @@
     ]
   ],
   "blk.19.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.19.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -2075,8 +2121,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.2.attn_output_b.weight": [
@@ -2113,6 +2158,12 @@
     ]
   ],
   "blk.2.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.2.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -2277,8 +2328,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.20.attn_output_b.weight": [
@@ -2315,6 +2365,12 @@
     ]
   ],
   "blk.20.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.20.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -2466,8 +2522,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.21.attn_output_b.weight": [
@@ -2504,6 +2559,12 @@
     ]
   ],
   "blk.21.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.21.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -2628,8 +2689,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.22.attn_output_b.weight": [
@@ -2666,6 +2726,12 @@
     ]
   ],
   "blk.22.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.22.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -2790,8 +2856,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.23.attn_output_b.weight": [
@@ -2828,6 +2893,12 @@
     ]
   ],
   "blk.23.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.23.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -2952,8 +3023,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.24.attn_output_b.weight": [
@@ -2990,6 +3060,12 @@
     ]
   ],
   "blk.24.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.24.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -3128,8 +3204,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.25.attn_output_b.weight": [
@@ -3166,6 +3241,12 @@
     ]
   ],
   "blk.25.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.25.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -3290,8 +3371,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.26.attn_output_b.weight": [
@@ -3328,6 +3408,12 @@
     ]
   ],
   "blk.26.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.26.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -3452,8 +3538,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.27.attn_output_b.weight": [
@@ -3490,6 +3575,12 @@
     ]
   ],
   "blk.27.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.27.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -3614,8 +3705,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.28.attn_output_b.weight": [
@@ -3652,6 +3742,12 @@
     ]
   ],
   "blk.28.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.28.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -3790,8 +3886,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.29.attn_output_b.weight": [
@@ -3828,6 +3923,12 @@
     ]
   ],
   "blk.29.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.29.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -3952,8 +4053,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.3.attn_output_b.weight": [
@@ -3990,6 +4090,12 @@
     ]
   ],
   "blk.3.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.3.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -4114,8 +4220,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.30.attn_output_b.weight": [
@@ -4152,6 +4257,12 @@
     ]
   ],
   "blk.30.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.30.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -4276,8 +4387,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.31.attn_output_b.weight": [
@@ -4314,6 +4424,12 @@
     ]
   ],
   "blk.31.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.31.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -4438,8 +4554,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.32.attn_output_b.weight": [
@@ -4476,6 +4591,12 @@
     ]
   ],
   "blk.32.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.32.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -4614,8 +4735,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.33.attn_output_b.weight": [
@@ -4652,6 +4772,12 @@
     ]
   ],
   "blk.33.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.33.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -4776,8 +4902,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.34.attn_output_b.weight": [
@@ -4814,6 +4939,12 @@
     ]
   ],
   "blk.34.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.34.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -4938,8 +5069,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.35.attn_output_b.weight": [
@@ -4976,6 +5106,12 @@
     ]
   ],
   "blk.35.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.35.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -5100,8 +5236,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.36.attn_output_b.weight": [
@@ -5138,6 +5273,12 @@
     ]
   ],
   "blk.36.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.36.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -5276,8 +5417,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.37.attn_output_b.weight": [
@@ -5314,6 +5454,12 @@
     ]
   ],
   "blk.37.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.37.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -5438,8 +5584,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.38.attn_output_b.weight": [
@@ -5476,6 +5621,12 @@
     ]
   ],
   "blk.38.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.38.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -5600,8 +5751,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.39.attn_output_b.weight": [
@@ -5638,6 +5788,12 @@
     ]
   ],
   "blk.39.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.39.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -5762,8 +5918,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.4.attn_output_b.weight": [
@@ -5800,6 +5955,12 @@
     ]
   ],
   "blk.4.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.4.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -5924,8 +6085,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.5.attn_output_b.weight": [
@@ -5962,6 +6122,12 @@
     ]
   ],
   "blk.5.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.5.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -6086,8 +6252,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.6.attn_output_b.weight": [
@@ -6124,6 +6289,12 @@
     ]
   ],
   "blk.6.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.6.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -6248,8 +6419,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.7.attn_output_b.weight": [
@@ -6286,6 +6456,12 @@
     ]
   ],
   "blk.7.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.7.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -6430,8 +6606,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.8.attn_output_b.weight": [
@@ -6468,6 +6643,12 @@
     ]
   ],
   "blk.8.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.8.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -6619,8 +6800,7 @@
     "Q5_K",
     [
       4096,
-      1024,
-      8
+      8192
     ]
   ],
   "blk.9.attn_output_b.weight": [
@@ -6657,6 +6837,12 @@
     ]
   ],
   "blk.9.exp_probs_b.bias": [
+    "F32",
+    [
+      384
+    ]
+  ],
+  "blk.9.exp_probs_b_vl.bias": [
     "F32",
     [
       384
@@ -6758,33 +6944,6 @@
       3
     ]
   ],
-  "engram_multipliers.weight": [
-    "I64",
-    [
-      4,
-      2
-    ]
-  ],
-  "engram_offsets.weight": [
-    "I64",
-    [
-      24,
-      2
-    ]
-  ],
-  "engram_primes.weight": [
-    "I64",
-    [
-      24,
-      2
-    ]
-  ],
-  "engram_token_map.weight": [
-    "I32",
-    [
-      129280
-    ]
-  ],
   "output.weight": [
     "Q5_K",
     [
@@ -6796,6 +6955,13 @@
     "F32",
     [
       5120
+    ]
+  ],
+  "per_layer_token_embd.weight": [
+    "IQ4_NL",
+    [
+      256,
+      768022850
     ]
   ],
   "token_embd.weight": [

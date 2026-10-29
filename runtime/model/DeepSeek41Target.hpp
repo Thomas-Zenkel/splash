@@ -128,8 +128,8 @@ private:
   uint32_t prefillChunks_ = 0;
   // The RoPE inverse frequencies of the uncompressed layers and, YaRN's, of
   // the compressed ones; the first mix's weights of a step's rows (stream 0
-  // alone); each Engram layer's gate weights (engram_q * engram_k); zeros a
-  // MoE adds its routes to.
+  // alone); each Engram layer's gate weights (engram_gate, its weights'
+  // buffer); zeros a MoE adds its routes to.
   std::array<metal::MetalBuffer, 2> frequencies_;
   metal::MetalBuffer firstMixes_, zeros_;
   std::vector<metal::MetalBuffer> engramGates_;

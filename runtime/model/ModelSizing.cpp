@@ -65,16 +65,15 @@ StreamableWeights targetWeights(const Layout &layout, const Plan &plan, gguf::Pl
   return result;
 }
 
-// DeepSeek-V4.1's Engram tables, in a file of their own beside its GGUF
-// (deepSeek41EngramPath), which `target` names: a table that only streams,
-// through a row cache, or, where `streams` leaves it to load, more than a Mac
-// holds.
+// DeepSeek-V4.1's Engram tables, the last part of its split `target`
+// (deepSeek41EngramTables): a table that only streams, through a row cache,
+// or, where `streams` leaves it to load, more than a Mac holds. The hash's
+// buffers, from the metadata, load with the weights.
 void addEngramTables(StreamableWeights &weights, const GgufFile &target, const DeepSeek41Layout &layout,
                      bool streams) {
   weights.tableStreamsOnly = true;
-  WeightSource source(deepSeek41EngramPath(target, target.source().path()));
-  const GgufFile engram(source);
-  const DeepSeek41EngramTables tables = deepSeek41EngramTables(engram, source.dataOffset(), layout);
+  weights.loadedBytes += deepSeek41EngramHashBytes(layout);
+  const DeepSeek41EngramTables tables = deepSeek41EngramTables(target, layout);
   const uint64_t bytes = tables.table.rows * tables.table.rowBytes;
   if (!streams) {
     weights.loadedBytes += bytes;

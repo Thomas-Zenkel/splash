@@ -2,10 +2,10 @@
 """fp32 reference forward of DeepSeek-V4.1-Flash, read from its GGUFs.
 
 This is the executable specification Splash's DeepSeek-V4.1 target is graded
-against. It reads a split GGUF of the ``deepseek41`` architecture and the
-Engram tables its first shard names (``deepseek41.engram.file``, a GGUF of
-the ``deepseek41-engram`` architecture beside it) with gguf-py, which also
-dequantizes their tensors, and runs the forward pass of DeepSeek's reference
+against. It reads a split GGUF of the ``deepseek41`` architecture in
+llama.cpp's layout, the Engram tables its last part (``per_layer_token_embd``,
+a file of its own name beside the others where the variants share it), with
+gguf-py, which also dequantizes their tensors, and runs the forward pass of DeepSeek's reference
 implementation (deepseek-ai/DeepSeek-V4.1-Flash-1017, ``inference/model.py``
 and ``inference/engram.py``, MIT) entirely in numpy fp32, one layer and one
 routed expert at a time:
@@ -14,18 +14,18 @@ routed expert at a time:
   streams. Each sublayer reads one weighted sum of the streams and writes its
   output back to every stream beside a Sinkhorn-balanced mix of them; the
   weights of a sublayer's input come from the sublayer before it (``hc_*``);
-- Engram before the layers ``engram.layer_ids`` names: the 2- to 4-gram
-  hashes of each token's compressed id (``engram_token_map``) and the ids
-  before it select 24 rows of the layer's table, whose projection gates a
-  value into every stream;
+- Engram before the layers ``ple.layers`` names: the 2- to 4-gram hashes of
+  each token's compressed id (``engram.token_map``) and the ids before it
+  select 24 rows of the layer's heads in the tables (``ple.head_offsets``),
+  whose projection gates a value into every stream;
 - attention of 64 query heads over one latent KV head of 512, whose last 64
   values rotate as interleaved pairs, with a learned sink per head: over a
   sliding window of the 128 latest raw latents and, on the layers
   ``compress_ratios`` gives a ratio, over the compressed latents an indexer
   selects (its top 512 by ReLU-weighted scores, the later index layers among
   the 2048 blocks of 8 the candidate layer keeps). Compressed latents and the
-  indexer's keys come from the ``kv_source_layer_ids`` layers, a selection from
-  the ``index_source_layer_ids`` layers, each read by the layers up to the
+  indexer's keys come from the ``attention.kv_source_layers`` layers, a
+  selection from the ``attention.indexer.source_layers`` layers, each read by the layers up to the
   next. The output is rotated back and projected per group of 8 heads to 1024,
   then to the hidden size. Layers without a ratio rotate by
   ``rope.freq_base``; the others by ``compress_rope_freq_base`` with YaRN;
@@ -66,8 +66,8 @@ the model's tokenizer and chat template give them. OUT_DIR receives:
 ``--layers N`` computes the prompt's first N layers alone, for a comparison of
 their streams (with ``--dump-streams``): no logits, no generated tokens.
 
-Without the Engram file beside the shards, ``--engram-url URL`` reads the rows
-a run needs from that file's URL with HTTP range requests. The run needs
+Without the Engram tables' file beside the shards, ``--engram-url URL`` reads
+the rows a run needs from that file's URL with HTTP range requests. The run needs
 gguf-py (pip install gguf) and memory for one layer's weights in fp32, about
 3 GB.
 """
@@ -89,7 +89,10 @@ import gguf
 import numpy as np
 
 ARCHITECTURE = "deepseek41"
-ENGRAM_ARCHITECTURE = "deepseek41-engram"
+# The Engram tables, every Engram layer's heads back to back.
+ENGRAM_TABLE = "per_layer_token_embd.weight"
+# DeepSeek's router, sqrt(softplus), as llama.cpp numbers its gating.
+SQRT_SOFTPLUS_GATING = 4
 # Engram rows read at once over HTTP.
 REMOTE_READERS = 16
 # Output head rows dequantized at once.
@@ -156,10 +159,13 @@ class Layout:
             raise SystemExit(
                 f"not a {ARCHITECTURE} GGUF: {meta['general.architecture']}"
             )
-        if need(a + "expert_scoring_func") != "sqrtsoftplus":
+        if a + "engram.file" in meta:
             raise SystemExit(
-                f"unknown expert scoring {meta[a + 'expert_scoring_func']}"
+                "the GGUF is in the layout before llama.cpp's (an Engram file the "
+                "backbone names); convert it with ISTA-DASLab's convert_ds41_upstream.py"
             )
+        if int(need(a + "expert_gating_func")) != SQRT_SOFTPLUS_GATING:
+            raise SystemExit(f"unknown expert gating {meta[a + 'expert_gating_func']}")
         if need(a + "rope.scaling.type") != "yarn":
             raise SystemExit(f"unknown RoPE scaling {meta[a + 'rope.scaling.type']}")
         layers = int(need(a + "block_count"))
@@ -176,14 +182,18 @@ class Layout:
             compress_ratios=tuple(
                 int(r) for r in need(a + "attention.compress_ratios")
             )[:layers],
-            kv_sources=tuple(int(x) for x in need(a + "kv_source_layer_ids")),
-            index_sources=tuple(int(x) for x in need(a + "index_source_layer_ids")),
+            kv_sources=tuple(int(x) for x in need(a + "attention.kv_source_layers")),
+            index_sources=tuple(
+                int(x) for x in need(a + "attention.indexer.source_layers")
+            ),
             index_heads=int(need(a + "attention.indexer.head_count")),
             index_dim=int(need(a + "attention.indexer.key_length")),
             index_topk=int(need(a + "attention.indexer.top_k")),
-            candidate_source=int(need(a + "attention.candidate_source_layer_id")),
-            candidate_blocks=int(need(a + "attention.candidate_topk_blocks")),
-            candidate_block_size=int(need(a + "attention.candidate_block_size")),
+            candidate_source=int(need(a + "attention.indexer.candidate_source_layer")),
+            candidate_blocks=int(need(a + "attention.indexer.candidate_top_k_blocks")),
+            candidate_block_size=int(
+                need(a + "attention.indexer.candidate_block_size")
+            ),
             streams=int(need(a + "hyper_connection.count")),
             sinkhorn_iterations=int(need(a + "hyper_connection.sinkhorn_iterations")),
             hc_eps=float(need(a + "hyper_connection.epsilon")),
@@ -201,11 +211,11 @@ class Layout:
             rope_original=int(need(a + "rope.scaling.original_context_length")),
             beta_fast=float(need(a + "rope.scaling.yarn_beta_fast")),
             beta_slow=float(need(a + "rope.scaling.yarn_beta_slow")),
-            engram_layers=tuple(int(x) for x in need(a + "engram.layer_ids")),
-            engram_ngram=int(need(a + "engram_max_ngram_size")),
-            engram_heads=int(need(a + "engram_n_heads")),
-            engram_dim=int(need(a + "engram_head_dim")),
-            engram_pad=int(need(a + "engram_pad_token_id")),
+            engram_layers=tuple(int(x) for x in need(a + "ple.layers")),
+            engram_ngram=int(need(a + "ple.ngram_size")),
+            engram_heads=int(need(a + "ple.heads_per_ngram")),
+            engram_dim=int(need(a + "embedding_length_per_layer_input")),
+            engram_pad=int(need(a + "engram.pad_token_id")),
         )
 
     def kv_source(self, layer: int) -> int:
@@ -375,56 +385,60 @@ class Model:
                 first.with_name(f"{stem}-{k:05d}-of-{count:05d}.gguf")
                 for k in range(1, count + 1)
             ]
+            # The last part the variants share under a name of its own.
+            if not self.paths[-1].exists():
+                self.paths[-1] = self.shared_part(first, count)
         self.tensors = {}
+        self.engram_source = None
         for path in self.paths:
+            if path is None:
+                continue
             part = reader if path == first else gguf.GGUFReader(path)
             for tensor in part.tensors:
                 self.tensors[tensor.name] = tensor
+            if ENGRAM_TABLE in self.tensors and self.engram_source is None:
+                self.engram_source = str(path)
+        if self.layout.engram_layers and ENGRAM_TABLE not in self.tensors:
+            if not engram_url:
+                raise SystemExit(
+                    f"the Engram tables, part {count} of {count}, are missing; "
+                    "download them beside the shards or pass --engram-url"
+                )
+            _, tensors = remote_tensors(engram_url)
+            if ENGRAM_TABLE not in tensors:
+                raise SystemExit(f"--engram-url holds no {ENGRAM_TABLE}")
+            kind, shape, offset = tensors[ENGRAM_TABLE]
+            block, block_bytes = gguf.GGML_QUANT_SIZES[kind]
+            self.tensors[ENGRAM_TABLE] = RemoteRows(
+                engram_url, offset, shape[-1] // block * block_bytes, kind
+            )
+            self.engram_source = engram_url
         expected = int(self.meta.get("split.tensors.count", len(self.tensors)))
         if len(self.tensors) != expected:
             raise SystemExit(
                 f"the parts hold {len(self.tensors)} tensors, the header states {expected}"
             )
-        self.engram = {}
-        self.engram_source = None
-        if self.layout.engram_layers:
-            self.open_engram(first, engram_url)
 
-    def open_engram(self, first: Path, url: str | None):
-        name = str(self.meta.get(ARCHITECTURE + ".engram.file", ""))
-        # The name comes from the file: a bare file name beside the first part, nothing else.
-        if (
-            not name.endswith(".gguf")
-            or Path(name).name != name
-            or name.startswith(".")
-        ):
-            raise SystemExit(f"refusing the Engram file name {name!r}")
-        source = self.meta.get(ARCHITECTURE + ".engram.source")
-        path = first.with_name(name)
-        if path.is_file():
-            reader = gguf.GGUFReader(path)
-            meta = {k: field_value(f) for k, f in reader.fields.items()}
-            for tensor in reader.tensors:
-                self.engram[tensor.name] = tensor
-            self.engram_source = str(path)
-        elif url:
-            if not url.split("?")[0].endswith("/" + name):
-                raise SystemExit(f"--engram-url does not name {name}")
-            meta, tensors = remote_tensors(url)
-            for tensor_name, (kind, shape, offset) in tensors.items():
-                block, block_bytes = gguf.GGML_QUANT_SIZES[kind]
-                self.engram[tensor_name] = RemoteRows(
-                    url, offset, shape[-1] // block * block_bytes, kind
-                )
-            self.engram_source = url
-        else:
-            raise SystemExit(
-                f"{path} is missing; download it beside the shards or pass --engram-url"
-            )
-        if meta.get("general.architecture") != ENGRAM_ARCHITECTURE:
-            raise SystemExit(f"{name} is not a {ENGRAM_ARCHITECTURE} GGUF")
-        if meta.get(ARCHITECTURE + ".engram.source") != source:
-            raise SystemExit(f"{name} was made for another backbone than {first.name}")
+    def shared_part(self, first: Path, count: int) -> Path | None:
+        """The GGUF beside the first part, named as no split's part, whose
+        header makes it the last part, as DeepSeek-V4.1's Engram tables."""
+        expected = self.meta.get("split.tensors.count")
+        for path in sorted(first.parent.glob("*.gguf")):
+            if "-of-" in path.name:
+                continue
+            fields = gguf.GGUFReader(path).fields
+            values = {
+                name: field_value(fields[name])
+                for name in fields
+                if name.startswith("split.")
+            }
+            if (
+                values.get("split.no") == count - 1
+                and values.get("split.count") == count
+                and values.get("split.tensors.count") == expected
+            ):
+                return path
+        return None
 
     def has(self, name: str) -> bool:
         return name in self.tensors
@@ -456,8 +470,9 @@ class Model:
             gguf.dequantize(tensor.data[expert], tensor.tensor_type), dtype=np.float32
         )
 
-    def engram_rows(self, layer: int, rows: np.ndarray) -> np.ndarray:
-        table = self.engram[f"blk.{layer}.engram_embd.weight"]
+    def engram_rows(self, rows: np.ndarray) -> np.ndarray:
+        """Rows of the Engram tables, which every Engram layer's heads share."""
+        table = self.tensors[ENGRAM_TABLE]
         if isinstance(table, RemoteRows):
             return table.read(rows)
         flat = rows.ravel()
@@ -610,16 +625,20 @@ def hc_post(
 
 def engram_hashes(model: Model, tokens: np.ndarray) -> np.ndarray:
     """The table rows of each token, [tokens, engram layers, (ngram - 1) * heads]:
-    engram.py's NgramHashState over compressed ids, without image spans."""
+    engram.py's NgramHashState over compressed ids, without image spans, each
+    head's rows from its offset in the one table (ple.head_offsets)."""
     layout = model.layout
-    token_map = model.tensor("engram_token_map.weight").astype(np.int64)
-    multipliers = model.tensor("engram_multipliers.weight").astype(
-        np.int64
+    a, layers = ARCHITECTURE + ".", len(layout.engram_layers)
+    token_map = np.asarray(model.meta[a + "engram.token_map"], np.int64)
+    multipliers = np.asarray(model.meta[a + "ple.layer_multipliers"], np.int64).reshape(
+        layers, -1
     )  # [layers, ngram]
-    primes = model.tensor("engram_primes.weight").astype(
-        np.int64
+    primes = np.asarray(model.meta[a + "ple.head_vocab_sizes"], np.int64).reshape(
+        layers, -1
     )  # [layers, (ngram - 1) * heads]
-    offsets = model.tensor("engram_offsets.weight").astype(np.int64)
+    offsets = np.asarray(model.meta[a + "ple.head_offsets"], np.int64).reshape(
+        layers, -1
+    )
     pad = token_map[layout.engram_pad]
     compressed = token_map[tokens]
     count, heads = len(tokens), layout.engram_heads
@@ -789,15 +808,16 @@ class Forward:
     ) -> np.ndarray:
         """engram.py's Engram: the rows' projection gates a value into each stream."""
         layout = self.layout
-        values = self.model.engram_rows(layer, rows).reshape(len(rows), -1)
+        values = self.model.engram_rows(rows).reshape(len(rows), -1)
         if self.streams is not None:
             self.engram_values.setdefault(layer, values)
-        kv = values @ w["engram_wkv.weight"].T
+        kv = values @ w["engram_kv.weight"].T
         key = kv[:, : layout.streams * layout.hidden].reshape(
             len(rows), layout.streams, layout.hidden
         )
         value = kv[:, layout.streams * layout.hidden :]
-        weight = w["engram_q.weight"] * w["engram_k.weight"]
+        # engram_gate: the product of DeepSeek's gate query and key.
+        weight = w["engram_gate.weight"]
         eps = layout.norm_eps
         rstd = (
             1.0
@@ -888,9 +908,10 @@ class Forward:
         out = out.reshape(len(rows), layout.o_groups, -1)
         if self.kv_rounding:
             out = fp8_round(out)
-        projected = np.einsum("rgd,god->rgo", out, w["attn_output_a.weight"]).reshape(
-            len(rows), -1
-        )
+        # attn_output_a: [groups * output rank, group width], each group's rows
+        # in turn.
+        groups = w["attn_output_a.weight"].reshape(layout.o_groups, layout.o_rank, -1)
+        projected = np.einsum("rgd,god->rgo", out, groups).reshape(len(rows), -1)
         return projected @ w["attn_output_b.weight"].T
 
     def select(self, w, layer, rows, qr, x, angles, shared: Shared) -> list:

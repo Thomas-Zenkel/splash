@@ -77,8 +77,9 @@ automatically:
 Splash also serves DeepSeek-V4.1-Flash
 (`ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF:IQ1_M`), which has no
 DFlash2 draft and decodes one token a cycle. Its IQ1_M build (120.7 GB)
-streams its routed experts from the SSD, and its Engram tables, a file of
-their own (110.6 GB) that installs with it, always stream; a 48 GB Mac serves
+streams its routed experts from the SSD, and its Engram tables, the last
+part of its split GGUF that its variants share (110.6 GB), always stream;
+it reads llama.cpp's layout of these files (b11870 and newer). A 48 GB Mac serves
 it at 8–11 tokens per second. With `--draft-model
 unsloth/DeepSeek-V4.1-Flash-1017-GGUF` (or a local `dspark-*.gguf`) it decodes
 with its own block drafter DSpark (8 GB, which its experts then lack): on a

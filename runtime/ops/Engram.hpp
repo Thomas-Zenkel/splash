@@ -17,8 +17,8 @@ struct Engram final {
   // The streams (fp32 [rows][MHC_STREAMS][hidden]) in place, each plus the
   // value of `kv` (bf16 [rows][MHC_STREAMS + 1][hidden]: a key per stream,
   // then the value) gated by the stream's product with its key weighted by
-  // `weights` (fp32 [MHC_STREAMS][hidden], the product of engram_q and
-  // engram_k), over both RMS norms and sqrt(hidden).
+  // `weights` (fp32 [MHC_STREAMS][hidden], engram_gate, the product of
+  // DeepSeek's gate query and key), over both RMS norms and sqrt(hidden).
   static void addGate(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer kv,
                       metal::MetalBuffer weights, uint32_t hidden, float normEpsilon, uint32_t rows);
   // The table rows of a verify step's rows (EngramHashParams), into `rows`

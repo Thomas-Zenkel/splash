@@ -181,12 +181,11 @@ struct DeepSeek41IndexerWeights final {
 
 // An Engram layer's projection [(MHC_STREAMS + 1) * hidden, gathered width] of
 // its gathered rows into a key per stream and a value, and its gate's
-// weights, engram_q and engram_k as F32 [MHC_STREAMS][hidden], whose product
-// ops::Engram::addGate reads.
+// weights, engram_gate F32 [MHC_STREAMS][hidden] (the product of DeepSeek's
+// gate query and key), which ops::Engram::addGate reads.
 struct DeepSeek41EngramWeights final {
   ops::Projection kv;
-  metal::MetalBuffer query;
-  metal::MetalBuffer key;
+  metal::MetalBuffer gate;
 };
 
 // A layer, in its image's order (GgufImage.cpp DeepSeek41Gguf::layer).
@@ -216,10 +215,11 @@ struct DeepSeek41Weights final : QwenTargetWeightsBase {
   std::vector<DeepSeek41LayerWeights> layers;
   // The norm the head reads the streams through (ops::ManifoldHyperConnection::addPreNorm).
   ops::NormWeights finalNorm;
-  // The Engram hash's tables as the GGUF stores them, which the host reads
-  // (engramHash): each token's compressed id (I32 [vocabulary]); and per
-  // Engram layer its multipliers (I64 [ngram]), primes and offsets (I64
-  // [(ngram - 1) * heads] each).
+  // The Engram hash's tables, which the host (engramHash) and a verify
+  // step's hash read, from the GGUF's metadata (readDeepSeek41EngramHash):
+  // each token's compressed id (I32 [vocabulary]); and per Engram layer its
+  // multipliers (I64 [ngram]), primes and offsets (I64 [(ngram - 1) * heads]
+  // each), its offsets from its first row in the tables.
   metal::MetalBuffer engramTokenMap;
   metal::MetalBuffer engramMultipliers;
   metal::MetalBuffer engramPrimes;
@@ -233,25 +233,27 @@ struct DeepSeek41Weights final : QwenTargetWeightsBase {
   [[nodiscard]] EngramHashTables engramHash() const noexcept;
 };
 
-// The Engram's tables in their GGUF: every Engram layer's table of IQ4_NL
-// rows of a head's values, back to back in the file as one table, which one
-// row store streams (DeepSeek41Weights::streamedTable), Engram layer l's
-// rows from firstRows[l] on.
+// The Engram's tables in the target's GGUF: per_layer_token_embd, the IQ4_NL
+// rows of a head's values of every Engram layer's heads, back to back as one
+// table in the split GGUF's last part (the file `file` of the target's),
+// which one row store streams (DeepSeek41Weights::streamedTable).
 struct DeepSeek41EngramTables final {
   SparseRowTable table;
-  std::vector<uint32_t> firstRows;
+  uint32_t file = 0;
   uint32_t format = 0;
 };
-// The file of the Engram's tables the target's metadata names
-// (deepseek41.engram.file), in the engram/ directory of the assembly whose
-// target/ holds `targetPart`, a part of the target's GGUF.
-[[nodiscard]] std::filesystem::path deepSeek41EngramPath(const GgufFile &target,
-                                                         const std::filesystem::path &targetPart);
-// The tables of the Engram GGUF `engram` holds, of its data from `dataOffset`
-// on. Throws unless each Engram layer of the layout has its table, all of one
-// row format and head width, back to back.
-[[nodiscard]] DeepSeek41EngramTables deepSeek41EngramTables(const GgufFile &engram, uint64_t dataOffset,
-                                                            const DeepSeek41Layout &layout);
+// The Engram's tables the target GGUF `target` holds. Throws unless they are
+// rows of IQ4_NL of the Engram's head width.
+[[nodiscard]] DeepSeek41EngramTables deepSeek41EngramTables(const GgufFile &target, const DeepSeek41Layout &layout);
+// The Engram hash the target GGUF's metadata states for the `tableRows` rows
+// of its tables (deepseek41.engram.token_map and the ple.* arrays), in
+// buffers of `backend`, each Engram layer's offsets from its first row
+// (engramFirstRows), where its first head's lie. Throws unless every value
+// is a whole number of its range and each head's rows lie inside the tables.
+void readDeepSeek41EngramHash(metal::MetalBackend &backend, const GgufFile &target, uint64_t tableRows,
+                              DeepSeek41Weights &weights);
+// The bytes of the Engram hash's buffers (readDeepSeek41EngramHash).
+[[nodiscard]] uint64_t deepSeek41EngramHashBytes(const DeepSeek41Layout &layout);
 
 struct BlockTargetFormat;
 struct MoeExperts;

@@ -957,8 +957,8 @@ void checkDeepSeek(const std::filesystem::path &directory) {
     const model::gguf::Image &image = deepseek.images[layer];
     const std::string p = "blk." + std::to_string(layer) + ".", at = "layer " + std::to_string(layer) + "'s ";
     const auto has = [&](uint64_t bits) { return model::DeepSeek41Dimensions::has(bits, layer); };
-    check(bool(repackOf(image, p + "engram_wkv.weight")) == has(d.engramLayers) &&
-              bool(copyOf(image, p + "engram_k.weight")) == has(d.engramLayers),
+    check(bool(repackOf(image, p + "engram_kv.weight")) == has(d.engramLayers) &&
+              bool(copyOf(image, p + "engram_gate.weight")) == has(d.engramLayers),
           "planner plans " + at + "Engram where it has one");
     check(bool(copyOf(image, p + "attn_compressor_kv.weight")) == has(d.compressorLayers) &&
               bool(copyOf(image, p + "indexer.attn_k.weight")) == has(d.compressorLayers) &&
@@ -982,12 +982,13 @@ void checkDeepSeek(const std::filesystem::path &directory) {
     for (const std::string name : {"hc_attn_fn.weight", "hc_ffn_base.weight", "attn_sinks.weight", "exp_probs_b.bias"})
       check(asStored(copyOf(image, p + name), tensorNamed(tensors, p + name).data),
             "planner copies the F32 tensor as stored: " + p + name);
+    check(!copyOf(image, p + "exp_probs_b_vl.bias"), "planner leaves " + at + "image router's bias out");
   }
-  const model::gguf::Image &head = deepseek.images[g.layers];
-  for (const std::string name :
-       {"engram_token_map.weight", "engram_multipliers.weight", "engram_primes.weight", "engram_offsets.weight"})
-    check(asStored(copyOf(head, name), tensorNamed(tensors, name).data),
-          "planner copies the Engram hash's table as stored: " + name);
+  // The Engram's tables stream from the GGUF (DeepSeek41.cpp), past every
+  // image.
+  for (const model::gguf::Image &image : deepseek.images)
+    check(!copyOf(image, "per_layer_token_embd.weight") && !repackOf(image, "per_layer_token_embd.weight"),
+          "planner leaves the Engram's tables out of " + image.name);
   const Plan streamed = planned(deepseekMetadata(g), tensors, {.streamExperts = true});
   check(!streamed.error && streamsExperts(deepseek, streamed) &&
             model::gguf::streamedExperts(std::span(streamed.images).first(g.layers)).size() == g.layers,
@@ -1005,8 +1006,8 @@ void checkDeepSeek(const std::filesystem::path &directory) {
   check(names(planned(withKey(test_gguf::stringKey("deepseek41.rope.scaling.type", "none")), tensors),
               {"does not match the target: rope.scaling.type"}),
         "planner names a RoPE without YaRN");
-  check(names(planned(withKey(test_gguf::int32ArrayKey("deepseek41.kv_source_layer_ids", {1})), tensors),
-              {"does not match the target: kv_source_layer_ids"}),
+  check(names(planned(withKey(test_gguf::int32ArrayKey("deepseek41.attention.kv_source_layers", {1})), tensors),
+              {"does not match the target: attention.kv_source_layers"}),
         "planner names other compressor layers");
   check(names(planned(withKey(test_gguf::int32ArrayKey("deepseek41.attention.compress_ratios", {0, 2, 2, 1})),
                       tensors),

@@ -153,29 +153,31 @@ def _inspect(target, mmproj, language_only, scratch):
                 raise models.VisionError(
                     f"{error}; pass language_only=True to serve text only"
                 ) from None
-        # A DeepSeek-V4.1 target's Engram file beside it is no target.
-        directory, names = (
-            target,
-            _gguf_in({n for n in repo.files if not _holds_engram(target, n)}),
-        )
+        directory = target
     elif target.is_file():
         if not target.name.endswith(".gguf"):
             raise ModelError(
                 "it is not a GGUF file; a target is a GGUF file or a model directory"
             )
-        directory, names = target.parent, _split_parts(target)
+        directory = target.parent
     else:
         raise ModelError("it does not exist")
-    files = {name: directory / name for name in names}
-    # A DeepSeek-V4.1 target's Engram file lies beside it (gguf.engram_file),
-    # which upstream.gguf_target screens; a header it cannot read here, it
-    # refuses there.
-    try:
-        engram = gguf.engram_file(gguf.Metadata(directory / names[0]))
-    except (ModelError, OSError):
-        engram = None
-    if engram and (directory / engram).is_file():
-        files[engram] = directory / engram
+    # The last part a split GGUF's variants share under a name of its own, as
+    # DeepSeek-V4.1's Engram tables, is no target; where one lies at the
+    # root, the split GGUF beside it may lack its last part, which
+    # upstream.gguf_target finds by its header among them.
+    shared = {
+        path.name: path
+        for path in sorted(directory.iterdir())
+        if _shared_part(directory, path.name)
+    }
+    if target.is_dir():
+        names = _gguf_in(
+            {n for n in repo.files if n not in shared}, shared_last=bool(shared)
+        )
+    else:
+        names = _split_parts(target, shared_last=bool(shared))
+    files = {name: directory / name for name in names} | shared
     projector = None
     if mmproj:
         if mmproj.name in files:
@@ -195,17 +197,24 @@ def _inspect(target, mmproj, language_only, scratch):
     return repo, inspected
 
 
-def _holds_engram(directory, name):
-    """Whether the file name of directory is a GGUF at its root that holds a
-    DeepSeek-V4.1 target's Engram tables (gguf.ENGRAM_ARCHITECTURE)."""
+def _shared_part(directory, name):
+    """Whether the file name of directory is a GGUF at its root, not named as
+    a split GGUF's part, whose header makes it a later part of one: the last
+    part the variants of a split GGUF share under a name of its own
+    (gguf.last_part), as DeepSeek-V4.1's Engram tables."""
     path = directory / name
-    if "/" in name or not name.endswith(".gguf") or not path.is_file():
+    if (
+        "/" in name
+        or not name.endswith(".gguf")
+        or upstream.SPLIT_NAME.search(name)
+        or not path.is_file()
+    ):
         return False
     try:
-        architecture = gguf.Metadata(path).values.get("general.architecture")
+        part = gguf.Metadata(path).values.get("split.no")
     except (ModelError, OSError):
         return False
-    return architecture == gguf.ENGRAM_ARCHITECTURE
+    return type(part) is int and part > 0
 
 
 def _model_of(name):
@@ -215,10 +224,10 @@ def _model_of(name):
     return name[: match.start()] if match else name
 
 
-def _gguf_in(files):
+def _gguf_in(files, *, shared_last=False):
     """The files of the one GGUF target at the root of a directory of files,
-    in split order, whatever vision projectors (named mmproj) lie beside
-    it."""
+    in split order, whatever vision projectors (named mmproj) lie beside it;
+    with shared_last, a split GGUF's but its last (upstream.split_order)."""
     candidates = [
         name
         for name in upstream.root_ggufs(files)
@@ -236,12 +245,13 @@ def _gguf_in(files):
         )
     if _model_of(candidates[0]) == candidates[0]:
         return candidates
-    return upstream.split_order(candidates, "its split GGUF")
+    return upstream.split_order(candidates, "its split GGUF", shared_last=shared_last)
 
 
-def _split_parts(target):
+def _split_parts(target, *, shared_last=False):
     """The files of the GGUF target, in split order: target alone, or every
-    part of the split GGUF it is one part of, beside it."""
+    part of the split GGUF it is one part of, beside it (with shared_last,
+    every part but the last, upstream.split_order)."""
     model = _model_of(target.name)
     if model == target.name:
         return [target.name]
@@ -252,7 +262,9 @@ def _split_parts(target):
         and path.name.endswith(".gguf")
         and _model_of(path.name) == model
     ]
-    return upstream.split_order(parts, f"the split GGUF {model} in {target.parent}")
+    return upstream.split_order(
+        parts, f"the split GGUF {model} in {target.parent}", shared_last=shared_last
+    )
 
 
 def _projector(mmproj, repo):

@@ -13,8 +13,6 @@
 namespace splash::model {
 namespace {
 
-constexpr uint64_t kInt32Bytes = 4, kInt64Bytes = 8;
-
 // A sublayer's mix, in the image's order (GgufImage.cpp mixImage): its
 // projection's F32 rows, its scale and its base.
 DeepSeek41MixWeights readMix(WeightFile &file, const DeepSeek41Layout &layout, const std::string &label) {
@@ -45,8 +43,7 @@ DeepSeek41LayerWeights readDeepSeek41Layer(WeightFile &file, const BlockTargetFo
   if (has(d.engramLayers)) {
     DeepSeek41EngramWeights engram;
     engram.kv = format.projection(file, (MHC_STREAMS + 1) * hidden, d.engramWidth(), "engram-kv");
-    engram.query = file.section(uint64_t{MHC_STREAMS} * hidden * kFloat32Bytes, "engram-query");
-    engram.key = file.section(uint64_t{MHC_STREAMS} * hidden * kFloat32Bytes, "engram-key");
+    engram.gate = file.section(uint64_t{MHC_STREAMS} * hidden * kFloat32Bytes, "engram-gate");
     layer.engram = std::move(engram);
   }
   layer.attentionMix = readMix(file, layout, "attention-mix");
@@ -131,46 +128,89 @@ void requireDeepSeek41Layout(const DeepSeek41Layout &layout) {
     throw WeightStoreError("DeepSeek-V4.1 layout is inconsistent");
 }
 
-std::filesystem::path deepSeek41EngramPath(const GgufFile &target, const std::filesystem::path &targetPart) {
-  const std::optional<std::string> name = target.metadata().stringValue("deepseek41.engram.file");
-  if (!name || name->empty() || std::filesystem::path(*name).has_parent_path())
-    throw WeightStoreError("the DeepSeek-V4.1 GGUF names no Engram file");
-  return targetPart.parent_path().parent_path() / "engram" / *name;
-}
-
-DeepSeek41EngramTables deepSeek41EngramTables(const GgufFile &engram, uint64_t dataOffset,
-                                              const DeepSeek41Layout &layout) {
-  constexpr uint32_t kIq4Nl = 20; // GGML_TYPE_IQ4_NL
+DeepSeek41EngramTables deepSeek41EngramTables(const GgufFile &target, const DeepSeek41Layout &layout) {
   const DeepSeek41Dimensions &d = layout.deepseek;
   DeepSeek41EngramTables result{.table = {.name = "engram", .rowBytes = d.engramHeadDimension / 32 * 18},
                                 .format = GGUF_FMT_IQ4NL};
-  uint64_t next = 0;
-  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    if (!DeepSeek41Dimensions::has(d.engramLayers, layer)) continue;
-    const GgufTensor &table = engram.require("blk." + std::to_string(layer) + ".engram_embd.weight");
-    if (table.type != kIq4Nl || table.columns() != d.engramHeadDimension || table.file != 0 ||
-        table.bytes != table.rows() * result.table.rowBytes)
-      throw WeightStoreError("an Engram table is no IQ4_NL rows of the Engram's head width");
-    if (result.firstRows.empty()) result.table.offset = dataOffset + table.offset;
-    else if (table.offset != next) throw WeightStoreError("the Engram's tables do not lie back to back");
-    next = table.offset + table.bytes;
-    result.firstRows.push_back(static_cast<uint32_t>(result.table.rows));
-    result.table.rows += table.rows();
-  }
+  const GgufTensor &table = target.require("per_layer_token_embd.weight");
+  if (table.type != ggml::kIQ4_NL || table.columns() != d.engramHeadDimension ||
+      table.bytes != table.rows() * result.table.rowBytes)
+    throw WeightStoreError("the Engram's tables are no IQ4_NL rows of the Engram's head width");
+  result.file = table.file;
+  result.table.offset = target.source(table.file).dataOffset() + table.offset;
+  result.table.rows = table.rows();
   result.table.validate();
   return result;
 }
 
-EngramHashTables DeepSeek41Weights::engramHash() const noexcept {
-  const auto values = [](const metal::MetalBuffer &buffer, auto *type) {
-    using T = std::remove_pointer_t<decltype(type)>;
-    return std::span(static_cast<const T *>(buffer.contents()), buffer.sizeBytes() / sizeof(T));
-  };
+uint64_t deepSeek41EngramHashBytes(const DeepSeek41Layout &layout) {
   const DeepSeek41Dimensions &d = layout.deepseek;
-  return {.tokenMap = values(engramTokenMap, static_cast<int32_t *>(nullptr)),
-          .multipliers = values(engramMultipliers, static_cast<int64_t *>(nullptr)),
-          .primes = values(engramPrimes, static_cast<int64_t *>(nullptr)),
-          .offsets = values(engramOffsets, static_cast<int64_t *>(nullptr)),
+  const uint64_t engrams = std::popcount(d.engramLayers), hashes = uint64_t{d.engramNgram - 1} * d.engramHeads;
+  return uint64_t{layout.vocabularySize} * sizeof(int32_t) + engrams * (d.engramNgram + 2 * hashes) * sizeof(int64_t);
+}
+
+void readDeepSeek41EngramHash(metal::MetalBackend &backend, const GgufFile &target, uint64_t tableRows,
+                              DeepSeek41Weights &weights) {
+  // Whole numbers below 2^53, which the metadata's doubles hold exactly.
+  constexpr double kWholeLimit = 9007199254740992.0;
+  const DeepSeek41Dimensions &d = weights.layout.deepseek;
+  const uint32_t engrams = static_cast<uint32_t>(std::popcount(d.engramLayers));
+  const uint64_t hashes = uint64_t{d.engramNgram - 1} * d.engramHeads;
+  const auto array = [&](const char *key, uint64_t count, double limit) {
+    const std::optional<std::span<const double>> values = target.numericArray("deepseek41." + std::string(key));
+    if (!values || values->size() != count) throw GgufError("GGUF Engram metadata is missing: " + std::string(key));
+    std::vector<uint64_t> whole;
+    whole.reserve(count);
+    for (const double value : *values) {
+      if (!(value >= 0 && value < limit) || value != std::floor(value))
+        throw GgufError("GGUF Engram metadata holds an invalid value: " + std::string(key));
+      whole.push_back(static_cast<uint64_t>(value));
+    }
+    return whole;
+  };
+  const std::vector<uint64_t> tokens = array("engram.token_map", weights.layout.vocabularySize, INT32_MAX);
+  const std::vector<uint64_t> multipliers = array("ple.layer_multipliers", engrams * d.engramNgram, kWholeLimit);
+  const std::vector<uint64_t> primes = array("ple.head_vocab_sizes", engrams * hashes, double(tableRows) + 1);
+  const std::vector<uint64_t> offsets = array("ple.head_offsets", engrams * hashes, double(tableRows));
+  std::vector<uint64_t> relative;
+  weights.engramFirstRows.clear();
+  for (uint32_t table = 0; table < engrams; ++table) {
+    // The offsets count from the tables' first row; the hash counts each
+    // Engram layer's from its own, where its first head's rows start.
+    const uint64_t first = offsets[table * hashes];
+    weights.engramFirstRows.push_back(static_cast<uint32_t>(first));
+    for (uint64_t head = table * hashes; head < (table + 1) * hashes; ++head) {
+      if (offsets[head] < first || !primes[head] || offsets[head] + primes[head] > tableRows)
+        throw WeightStoreError("an Engram head's rows lie outside the Engram's tables");
+      relative.push_back(offsets[head] - first);
+    }
+  }
+  // Each in a buffer of the type the GGUF's tensors stored it in before.
+  const auto upload = [&](const std::vector<uint64_t> &values, auto type, const char *label) {
+    using T = decltype(type);
+    metal::MetalBuffer buffer =
+        backend.allocateBuffer(std::max<uint64_t>(values.size() * sizeof(T), 16), metal::BufferStorage::Shared, label);
+    T *out = static_cast<T *>(buffer.contents());
+    for (size_t i = 0; i < values.size(); ++i) out[i] = static_cast<T>(values[i]);
+    return buffer;
+  };
+  weights.engramTokenMap = upload(tokens, int32_t{}, "deepseek41/engram-token-map");
+  weights.engramMultipliers = upload(multipliers, int64_t{}, "deepseek41/engram-multipliers");
+  weights.engramPrimes = upload(primes, int64_t{}, "deepseek41/engram-primes");
+  weights.engramOffsets = upload(relative, int64_t{}, "deepseek41/engram-offsets");
+}
+
+EngramHashTables DeepSeek41Weights::engramHash() const noexcept {
+  const DeepSeek41Dimensions &d = layout.deepseek;
+  const uint64_t engrams = std::popcount(d.engramLayers), hashes = uint64_t{d.engramNgram - 1} * d.engramHeads;
+  const auto values = [](const metal::MetalBuffer &buffer, uint64_t count, auto *type) {
+    using T = std::remove_pointer_t<decltype(type)>;
+    return std::span(static_cast<const T *>(buffer.contents()), count);
+  };
+  return {.tokenMap = values(engramTokenMap, layout.vocabularySize, static_cast<int32_t *>(nullptr)),
+          .multipliers = values(engramMultipliers, engrams * d.engramNgram, static_cast<int64_t *>(nullptr)),
+          .primes = values(engramPrimes, engrams * hashes, static_cast<int64_t *>(nullptr)),
+          .offsets = values(engramOffsets, engrams * hashes, static_cast<int64_t *>(nullptr)),
           .layers = static_cast<uint32_t>(std::popcount(d.engramLayers)),
           .ngram = d.engramNgram,
           .heads = d.engramHeads,
@@ -196,14 +236,8 @@ DeepSeek41Weights loadDeepSeek41Weights(metal::MetalBackend &backend, DeepSeek41
     result.files.push_back(file.record());
   }
   {
-    const DeepSeek41Dimensions &d = layout.deepseek;
-    const uint64_t engrams = std::popcount(d.engramLayers), hashes = uint64_t{d.engramNgram - 1} * d.engramHeads;
     WeightFile file = loader.head();
     result.finalNorm = format.norm(file, layout.hiddenSize, "final-norm");
-    result.engramTokenMap = file.section(uint64_t{layout.vocabularySize} * kInt32Bytes, "engram-token-map");
-    result.engramMultipliers = file.section(engrams * d.engramNgram * kInt64Bytes, "engram-multipliers");
-    result.engramPrimes = file.section(engrams * hashes * kInt64Bytes, "engram-primes");
-    result.engramOffsets = file.section(engrams * hashes * kInt64Bytes, "engram-offsets");
     // fp32 logits, as every target's (readQwenTargetHead).
     result.logitsProjection = floatProjection(file, format, layout.vocabularySize, layout.hiddenSize, "logits");
     file.finish();
@@ -216,15 +250,14 @@ DeepSeek41Weights loadDeepSeek41Weights(metal::MetalBackend &backend, DeepSeek41
     result.files.push_back(file.record());
   }
   result.experts = experts.store;
-  // The Engram's tables stream from their own file through the table's row
-  // store, where the loader's options give it memory.
+  // The Engram's hash comes from the metadata; its tables stream from the
+  // target's part that holds them through the table's row store, where the
+  // loader's options give it memory.
+  const DeepSeek41EngramTables tables = deepSeek41EngramTables(loader.file(), layout);
+  readDeepSeek41EngramHash(backend, loader.file(), tables.table.rows, result);
   if (const SparseRowStoreOptions &rows = loader.tableOptions(); rows.cacheBytes) {
-    const auto source =
-        std::make_shared<WeightSource>(deepSeek41EngramPath(loader.file(), loader.file().source().path()));
-    const GgufFile engram(*source);
-    const DeepSeek41EngramTables tables = deepSeek41EngramTables(engram, source->dataOffset(), layout);
+    const auto source = std::make_shared<WeightSource>(loader.file().source(tables.file).path());
     result.streamedTable = std::make_shared<SparseRowStore>(tables.table, openRowReader(source), rows);
-    result.engramFirstRows = tables.firstRows;
     result.engramFormat = tables.format;
   }
   result.manifestFingerprintSha256 = weightManifestFingerprint(result.files);

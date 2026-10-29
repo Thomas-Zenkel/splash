@@ -11,24 +11,24 @@
 // decode step's dispatches one by one (metal::BackendInstrumentation) and
 // prints their GPU time by kernel.
 //
-//   deepseek41-forward METALLIB GGUF_DIRECTORY REFERENCE_DIRECTORY EXPERT_GIB [LAYERS [GENERATE [ENGRAM_GGUF]]]
+//   deepseek41-forward METALLIB GGUF_DIRECTORY REFERENCE_DIRECTORY EXPERT_GIB [LAYERS [GENERATE [ENGRAM]]]
 //
-// GGUF_DIRECTORY holds the target's parts alone; its routed experts stream
-// through a store of EXPERT_GIB GiB (at least 4.9 for IQ1_M: a layer's
-// experts in slots of the widest expert's size, and the staging). With the streams of dev/tools/deepseek41_reference.py
-// --dump-streams in REFERENCE_DIRECTORY it compares the streams after each
-// sublayer and the prompt's logits with the reference's, an Engram layer
-// reading the reference's gathered rows (engram_values_<layer>.npy), which
-// the rows staged from ENGRAM_GGUF, when it is given, are checked against.
-// Without them it takes the prompt's token ids from
-// REFERENCE_DIRECTORY/../prompt.txt, skips the Engram unless ENGRAM_GGUF names
-// its tables' file, and prints each sublayer's mean stream norm (which the
+// GGUF_DIRECTORY holds the target's parts alone, the Engram's tables its last
+// (llama.cpp's layout); its routed experts stream through a store of
+// EXPERT_GIB GiB (at least 4.9 for IQ1_M: a layer's experts in slots of the
+// widest expert's size, and the staging). With the streams of
+// dev/tools/deepseek41_reference.py --dump-streams in REFERENCE_DIRECTORY it
+// compares the streams after each sublayer and the prompt's logits with the
+// reference's, an Engram layer reading the reference's gathered rows
+// (engram_values_<layer>.npy), which the rows staged from the target's
+// tables, with ENGRAM 1, are checked against. Without them it takes the
+// prompt's token ids from REFERENCE_DIRECTORY/../prompt.txt, skips the Engram
+// unless ENGRAM is 1, and prints each sublayer's mean stream norm (which the
 // reference logs after each layer). Then it prints the next token's top 5
 // and, with GENERATE, adds that many tokens greedily, a decode step of one
-// row each, with their Engram rows from ENGRAM_GGUF where it is given. Engram
-// rows from ENGRAM_GGUF are staged by a model::SparseRowStore per table and
-// gathered on the GPU (ops::Embedding over the staging), as the target will
-// read them.
+// row each, with their Engram rows from the tables with ENGRAM 1. Those are
+// staged by a model::SparseRowStore per Engram layer and gathered on the GPU
+// (ops::Embedding over the staging), as the target reads them.
 //
 // With DEEPSEEK41_DSPARK=<dspark GGUF> (model/DSpark.hpp, its experts loaded
 // whole beside the target's store) it generates speculatively instead: after
@@ -343,15 +343,10 @@ public:
   void engram(uint32_t index, const MetalBuffer &input) {
     const model::DeepSeek41LayerWeights &layer = weights_.layers[index];
     const uint32_t hidden = layout_.hiddenSize;
-    const auto *q = static_cast<const float *>(layer.engram->query.contents());
-    const auto *k = static_cast<const float *>(layer.engram->key.contents());
-    std::vector<float> gate(size_t(MHC_STREAMS) * hidden);
-    for (size_t i = 0; i < gate.size(); ++i) gate[i] = q[i] * k[i];
     MetalBuffer kv = alloc(uint64_t{pad(rows_)} * (MHC_STREAMS + 1) * hidden * 2);
-    MetalBuffer gateBuffer = upload(gate);
     metal::CommandGraph &graph = *pending_;
     project(graph, input, layer.engram->kv, kv, rows_);
-    ops::Engram::addGate(graph, streams_, kv, gateBuffer, hidden, d_.normEpsilon, rows_);
+    ops::Engram::addGate(graph, streams_, kv, layer.engram->gate, hidden, d_.normEpsilon, rows_);
 
   }
 
@@ -919,22 +914,22 @@ private:
   size_t next_ = 0;
 };
 
-// The Engram's tables in their GGUF (deepseek41.engram.file): each Engram
-// layer's rows of IQ4_NL blocks, which a model::SparseRowStore per table
-// reads from the file on the SSD readers and stages for a step.
+// The Engram's tables in the target's split GGUF (per_layer_token_embd, its
+// last part): each Engram layer's rows of IQ4_NL blocks from its first row
+// (DeepSeek41Weights::engramFirstRows), which a model::SparseRowStore per
+// table reads from the file on the SSD readers and stages for a step.
 class EngramTables {
 public:
-  EngramTables(const std::filesystem::path &path, const model::DeepSeek41Layout &layout,
-               std::shared_ptr<model::SsdReaders> readers)
-      : source_(std::make_shared<model::WeightSource>(path)), file_(*source_) {
-    const uint32_t width = layout.deepseek.engramHeadDimension, rowBytes = width / 32 * 18;
-    for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-      if (!model::DeepSeek41Dimensions::has(layout.deepseek.engramLayers, layer)) continue;
-      const std::string name = "blk." + std::to_string(layer) + ".engram_embd.weight";
-      const model::GgufTensor &table = file_.require(name);
-      if (table.type != 20 || table.columns() != width) throw std::runtime_error("an Engram table not IQ4_NL rows");
+  EngramTables(const model::GgufFile &target, const model::DeepSeek41Weights &weights,
+               std::shared_ptr<model::SsdReaders> readers) {
+    const model::DeepSeek41EngramTables tables = model::deepSeek41EngramTables(target, weights.layout);
+    source_ = std::make_shared<model::WeightSource>(target.source(tables.file).path());
+    const std::vector<uint32_t> &first = weights.engramFirstRows;
+    for (size_t table = 0; table < first.size(); ++table) {
+      const uint64_t end = table + 1 < first.size() ? first[table + 1] : tables.table.rows;
       stores_.push_back(std::make_unique<model::SparseRowStore>(
-          model::SparseRowTable{name, table.rows(), rowBytes, source_->dataOffset() + table.offset},
+          model::SparseRowTable{tables.table.name, end - first[table], tables.table.rowBytes,
+                                tables.table.offset + uint64_t{first[table]} * tables.table.rowBytes},
           model::openRowReader(source_),
           model::SparseRowStoreOptions{.cacheBytes = 64ull << 20, .readers = readers, .stageRows = 1u << 15}));
     }
@@ -944,7 +939,6 @@ public:
 
 private:
   std::shared_ptr<model::WeightSource> source_;
-  model::GgufFile file_;
   std::vector<std::unique_ptr<model::SparseRowStore>> stores_;
 };
 
@@ -981,7 +975,7 @@ int main(int argc, const char *argv[]) {
       if (argc < 5)
         throw std::runtime_error(
             "usage: deepseek41-forward METALLIB GGUF_DIRECTORY REFERENCE_DIRECTORY EXPERT_GIB [LAYERS [GENERATE "
-            "[ENGRAM_GGUF]]]");
+            "[ENGRAM]]]");
       metal::MetalBackend backend(argv[1]);
       const std::string reference = argv[3];
       const model::DeepSeek41Layout layout;
@@ -1012,11 +1006,11 @@ int main(int argc, const char *argv[]) {
       const uint32_t rows = uint32_t(prompt.size());
       const uint32_t layers = argc > 5 ? uint32_t(std::stoul(argv[5])) : layout.layers;
       const uint32_t generate = argc > 6 ? uint32_t(std::stoul(argv[6])) : 0;
-      // With ENGRAM_GGUF, each row's Engram rows from that file (the reference's
-      // gathered rows for a compared prompt, which those from the file are
-      // checked against).
+      // With ENGRAM 1, each row's Engram rows from the target's tables (the
+      // reference's gathered rows for a compared prompt, which those from the
+      // file are checked against).
       std::optional<EngramTables> engram;
-      if (argc > 7) engram.emplace(argv[7], layout, readers);
+      if (argc > 7 && std::string_view(argv[7]) == "1") engram.emplace(files.file(), weights, readers);
       const model::EngramHashTables hash = weights.engramHash();
       std::vector<uint32_t> sequence = prompt;
       // Engram layer `layer`'s table, and the row ids of the sequence's rows

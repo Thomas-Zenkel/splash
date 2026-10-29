@@ -526,27 +526,15 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
 // (model/DeepSeek41.cpp) in the order the planner lays its images out
 // (GgufImage.cpp DeepSeek41Gguf): each layer's parts of its roles alone, its
 // output groups block projections of their own, its compressor's and
-// indexer's BF16 projections into fp32, the head's logits into fp32 and the
-// Engram hash's tables as the GGUF stores them. The loader reads every
-// section of every image, or throws.
+// indexer's BF16 projections into fp32, its Engram gate's F32 weights, the
+// head's logits into fp32 and the Engram hash the metadata states, each
+// Engram layer's offsets from its first row in the tables. The loader reads
+// every section of every image, or throws.
 void checkDeepSeekTarget(MetalBackend &backend, const std::filesystem::path &directory) {
   const model::QwenTargetDimensions g = deepseekGeometry();
   const model::DeepSeek41Layout layout{model::QwenHybridLayout{g, "DeepSeek-V4.1-Flash"}};
   const model::DeepSeek41Dimensions &d = layout.deepseek;
-  std::vector<Tensor> tensors = deepseekTensors(g);
-  // Distinct values in the Engram hash's tables.
-  const auto fill = [&](const std::string &name, auto first) {
-    auto &data = tensorNamed(tensors, name).data;
-    using T = decltype(first);
-    for (size_t i = 0; i < data.size() / sizeof(T); ++i) {
-      const T value = T(first + T(i) * 3);
-      std::memcpy(data.data() + i * sizeof(T), &value, sizeof(T));
-    }
-  };
-  fill("engram_token_map.weight", int32_t{11});
-  fill("engram_multipliers.weight", int64_t{1} << 40);
-  fill("engram_primes.weight", int64_t{1009});
-  fill("engram_offsets.weight", int64_t{-5});
+  const std::vector<Tensor> tensors = deepseekTensors(g);
   const auto target = directory / "deepseek41";
   std::filesystem::create_directory(target);
   splash::test::writeFile(target / "target.gguf", test_gguf::file(deepseekMetadata(g), tensors));
@@ -583,8 +571,9 @@ void checkDeepSeekTarget(MetalBackend &backend, const std::filesystem::path &dir
                 layer.indexer->weights.outputSize == d.indexerHeads,
             at + "indexer queries and head weights into fp32");
     if (layer.engram)
-      check(blockProjection(layer.engram->kv, (MHC_STREAMS + 1) * hidden, d.engramWidth(), {(MHC_STREAMS + 1) * hidden}),
-            at + "Engram projection of its gathered rows into a key per stream and a value");
+      check(blockProjection(layer.engram->kv, (MHC_STREAMS + 1) * hidden, d.engramWidth(), {(MHC_STREAMS + 1) * hidden}) &&
+                layer.engram->gate.sizeBytes() == uint64_t{MHC_STREAMS} * hidden * 4,
+            at + "Engram projection of its gathered rows into a key per stream and a value, and F32 gate weights");
     check(layer.attentionMix.fn.sizeBytes() == uint64_t{MHC_MIXES} * MHC_STREAMS * hidden * 4 &&
               layer.ffnMix.base.sizeBytes() == MHC_MIXES * 4 &&
               layer.ffn.selectionBias.sizeBytes() == uint64_t{layout.experts} * 4 &&
@@ -594,11 +583,15 @@ void checkDeepSeekTarget(MetalBackend &backend, const std::filesystem::path &dir
   check(weights.finalNorm.float32 && weights.logitsProjection.destination == ops::FloatOutput::Float32 &&
             blockProjection(weights.logitsProjection, layout.vocabularySize, hidden, {layout.vocabularySize}),
         "DeepSeek-V4.1 target: F32 final norm and fp32 logits");
+  // Heads 0 to 3 are the first Engram layer's, from row 0; heads 4 to 7 the
+  // second's, from the first's 1009 + 1012 + 1015 + 1018 rows on.
   const model::EngramHashTables hash = weights.engramHash();
   check(hash.tokenMap.size() == layout.vocabularySize && hash.tokenMap[5] == 26 && hash.multipliers.size() == 6 &&
             hash.multipliers[1] == (int64_t{1} << 40) + 3 && hash.primes.size() == 8 && hash.primes[7] == 1030 &&
-            hash.offsets[2] == 1 && hash.layers == 2 && hash.ngram == d.engramNgram && hash.heads == d.engramHeads,
-        "DeepSeek-V4.1 target: the Engram hash's tables as the GGUF stores them");
+            hash.offsets.size() == 8 && hash.offsets[2] == 1009 + 1012 && hash.offsets[4] == 0 &&
+            hash.offsets[5] == 1021 && weights.engramFirstRows == std::vector<uint32_t>{0, 4054} && hash.layers == 2 &&
+            hash.ngram == d.engramNgram && hash.heads == d.engramHeads,
+        "DeepSeek-V4.1 target: the Engram hash the metadata states, each layer's offsets from its first row");
 }
 
 // The tensor data section's offset in the executor's source file: not zero,

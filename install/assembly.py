@@ -18,7 +18,10 @@ The paths an assembly links, and what reads each:
   target/<shard>         the MLX safetensors shards except those holding only
                          vision_tower.* (SafetensorsCheckpoint.mm)
   target/<name>.gguf     the GGUF target, or the parts of a split one
-                         (GgufTarget.cpp findTargetGgufs)
+                         (GgufTarget.cpp findTargetGgufs), the last of them
+                         under the name the others imply where the variants
+                         share it, as DeepSeek-V4.1's Engram tables
+                         (upstream.shared_last_part)
   tokenizer/config.json  the same configuration again, from which the
                          server's AutoTokenizer.from_pretrained chooses the
                          tokenizer class
@@ -35,9 +38,6 @@ The paths an assembly links, and what reads each:
   vision/<shard>         the MLX shards holding vision_tower.*
                          (VisionLoader.cpp, through SafetensorsCheckpoint.mm)
   vision/mmproj.gguf     the GGUF vision projector (VisionLoader.cpp)
-  engram/<name>.gguf     a DeepSeek-V4.1 target's Engram tables, the file its
-                         metadata names (gguf.engram_file), apart from the
-                         target's parts
 """
 
 from __future__ import annotations

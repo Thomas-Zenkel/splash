@@ -87,7 +87,7 @@ def projector_named(name):
     return "mmproj" in Path(name).stem.lower()
 
 
-def select_gguf(files, variant):
+def select_gguf(files, variant, *, shared_last=False):
     """The target GGUF among a repository's root files, as the list of its
     files (one, or a split GGUF's parts, split_gguf), and whether it was
     taken by its -VARIANT ending from several, which the caller reports.
@@ -96,7 +96,8 @@ def select_gguf(files, variant):
     only file whose name ends in -VARIANT. A repository of one GGUF names no
     variant apart from its model, so its one match needs no report. Without
     :VARIANT, the only target GGUF. Anything else is an error listing the
-    candidates."""
+    candidates. With shared_last, a split GGUF at the root may lack its last
+    part, which a caller that reads headers finds (shared_last_part)."""
     candidates = [n for n in root_ggufs(files) if not projector_named(n)]
     if variant is None:
         if len(candidates) == 1:
@@ -117,7 +118,9 @@ def select_gguf(files, variant):
         if len(ending) == 1:
             return [ending[0]], len(candidates) > 1
         choice = "no single GGUF matches :" + variant
-        if split := split_gguf(files, variant) or root_split_gguf(files, variant):
+        if split := split_gguf(files, variant) or root_split_gguf(
+            files, variant, shared_last=shared_last
+        ):
             return split, False
     listed = ", ".join(candidates) or "none"
     raise models.ModelError(f"{choice} (files in the repository root: {listed})")
@@ -145,11 +148,13 @@ def split_gguf(files, variant):
     return split_order(names, f"the split GGUF in {variant}/")
 
 
-def root_split_gguf(files, variant):
+def root_split_gguf(files, variant, *, shared_last=False):
     """The split files of a target GGUF that a repository keeps at its root
     beside its other variants' (MODEL-VARIANT-00001-of-0000N.gguf ...), as
     ISTA-DASLab's DeepSeek-V4.1 GGUFs, in split order; None when no part is
-    named so. Every part from 1 to N must be present."""
+    named so. Every part from 1 to N must be present, but, with shared_last,
+    the last, which the variants may share as a file of another name
+    (shared_last_part)."""
     suffix = "-" + variant.lower()
     names = [
         n
@@ -160,13 +165,16 @@ def root_split_gguf(files, variant):
     ]
     if not names:
         return None
-    return split_order(names, f"the split GGUF of {variant} at the root")
+    return split_order(
+        names, f"the split GGUF of {variant} at the root", shared_last=shared_last
+    )
 
 
-def split_order(names, split):
+def split_order(names, split, *, shared_last=False):
     """names, the files of one split GGUF, in split order: each named
-    NAME-0000K-of-0000N.gguf, and every part from 1 to N present once. split
-    names the split GGUF in a refusal."""
+    NAME-0000K-of-0000N.gguf, and every part from 1 to N present once, or,
+    with shared_last, every part but the last (last_part_name). split names
+    the split GGUF in a refusal."""
     parts = {}
     for name in names:
         match = SPLIT_NAME.search(name)
@@ -181,9 +189,50 @@ def split_order(names, split):
             )
         parts[number] = (int(match.group(2)), name)
     counts = {count for count, _ in parts.values()}
-    if len(counts) != 1 or sorted(parts) != list(range(1, counts.pop() + 1)):
+    count = counts.pop() if len(counts) == 1 else None
+    if count is None or sorted(parts) not in (
+        list(range(1, count + 1)),
+        *([list(range(1, count))] if shared_last and count > 1 else []),
+    ):
         raise models.ModelError(f"{split} is incomplete: " + ", ".join(sorted(names)))
     return [parts[number][1] for number in sorted(parts)]
+
+
+def last_part_name(first):
+    """The name under which the last part of the split GGUF whose first
+    part's name is `first` lies beside its other parts in target/, where the
+    native loader finds each by its -0000K-of-0000N name."""
+    match = SPLIT_NAME.search(first)
+    count = match.group(2)
+    return f"{first[: match.start()]}-{count}-of-{count}.gguf"
+
+
+def shared_last_part(repo, names, first):
+    """The root file of repo that is the last part of the split GGUF whose
+    other parts are names (first, the first one's header), as DeepSeek-V4.1's
+    variants share their Engram tables (gguf.last_part): the one root GGUF,
+    neither another split's part nor a projector, whose header says so. Each
+    candidate's header costs a few range requests."""
+    found = []
+    for name in root_ggufs(repo.files):
+        if projector_named(name) or SPLIT_NAME.search(name):
+            continue
+        with repo.open(name) as stream:
+            header = gguf.Metadata(stream, tensors=True)
+        if gguf.last_part(first, header):
+            found.append((name, header))
+    if len(found) != 1:
+        count = first.values.get("split.count")
+        raise models.ModelError(
+            f"{names[0]} is part 1 of {count}; "
+            + (
+                f"no root GGUF of {repo.name} is part {count}"
+                if not found
+                else "several root GGUFs are its last part: "
+                + ", ".join(name for name, _ in found)
+            )
+        )
+    return found[0]
 
 
 def select_vision(repo):
@@ -277,7 +326,7 @@ def inspect_target(repo, variant, language_only, scratch):
 
 
 def _gguf_target(repo, variant, language_only, scratch):
-    names, by_ending = select_gguf(repo.files, variant)
+    names, by_ending = select_gguf(repo.files, variant, shared_last=True)
     name = names[0] if len(names) == 1 else f"{len(names)} split files {names[0]} ..."
     if by_ending:
         print(
@@ -303,25 +352,21 @@ def gguf_target(repo, names, scratch, *, projector=None):
     for part in names:
         with repo.open(part) as stream:
             headers.append(gguf.Metadata(stream, tensors=True))
-    header = gguf.merged_split(headers)
     # A split GGUF's parts lie side by side in target/, where the native
-    # loader finds them by their -0000K-of-0000N names.
+    # loader finds them by their -0000K-of-0000N names; a last part the
+    # variants share goes there under the name the others imply.
     files = {"target/" + Path(part).name: part for part in names}
+    if headers[0].values.get("split.count") == len(names) + 1:
+        shared, header = shared_last_part(repo, names, headers[0])
+        headers.append(header)
+        files["target/" + last_part_name(Path(names[0]).name)] = shared
+    header = gguf.merged_split(headers)
     config, metadata = scratch / "config.json", scratch / "gguf-metadata.json"
     config.write_bytes(models.json_bytes(gguf.model_config(header)))
     metadata.write_bytes(models.json_bytes(gguf.scalar_metadata(header)))
     # The family bounds the layers whose tensors the screening lists.
     family = check_model("gguf", "none", config, gguf_metadata=metadata)
     gguf.require_loadable(header)
-    # A DeepSeek-V4.1 target's Engram tables lie in a file of their own
-    # beside its parts, which engram/ keeps apart from them.
-    if engram := gguf.engram_file(header):
-        path = str(Path(names[0]).with_name(engram))
-        if path not in repo.files:
-            raise models.ModelError(f"{repo.name} has no {path} beside the target")
-        with repo.open(path) as stream:
-            gguf.require_engram(header, gguf.Metadata(stream, tensors=True))
-        files["engram/" + engram] = path
     vision_format = "none"
     if projector is not None and family.vision:
         name, vision_header = projector(repo)

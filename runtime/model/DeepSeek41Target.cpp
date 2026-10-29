@@ -157,12 +157,10 @@ void layoutScratch(const DeepSeek41Layout &layout, const ops::ManifoldHyperShape
 }
 
 // The fixed buffers beside the scratch: the RoPE frequencies, the first
-// mix's weights and the MoE's zeros of a chunk's rows, each Engram layer's
-// gate weights.
+// mix's weights and the MoE's zeros of a chunk's rows.
 uint64_t fixedBytes(const DeepSeek41Layout &layout) {
-  const uint64_t engrams = static_cast<uint64_t>(std::popcount(layout.deepseek.engramLayers));
   return 2 * uint64_t{layout.rotaryPairs} * 4 + uint64_t{kPrefillRows} * MHC_MIXES * 4 +
-         uint64_t{kPrefillRows} * layout.hiddenSize * 2 + engrams * MHC_STREAMS * layout.hiddenSize * 4;
+         uint64_t{kPrefillRows} * layout.hiddenSize * 2;
 }
 
 } // namespace
@@ -230,14 +228,7 @@ DeepSeek41Target::DeepSeek41Target(const DeepSeek41Weights &weights, const QwenT
   firstMixes_ = upload(first, "deepseek41/first-mixes");
   zeros_ = upload(std::vector<uint16_t>(uint64_t{kPrefillRows} * layout.hiddenSize, 0), "deepseek41/zeros");
   for (const DeepSeek41LayerWeights &layer : weights.layers)
-    if (layer.engram) {
-      const uint64_t values = uint64_t{MHC_STREAMS} * layout.hiddenSize;
-      std::vector<float> gate(values);
-      const auto *query = static_cast<const float *>(layer.engram->query.contents());
-      const auto *key = static_cast<const float *>(layer.engram->key.contents());
-      for (uint64_t i = 0; i < values; ++i) gate[i] = query[i] * key[i];
-      engramGates_.push_back(upload(gate, "deepseek41/engram-gate"));
-    }
+    if (layer.engram) engramGates_.push_back(layer.engram->gate);
   const uint64_t rowBytes = weights_.streamedTable->table().rowBytes;
   for (uint32_t chunk = 0; chunk < prefillChunks_; ++chunk) {
     Scratch &s = prefill_.emplace_back();

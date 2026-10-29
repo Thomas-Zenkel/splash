@@ -195,14 +195,23 @@ keep a split GGUF's parts at its root instead, `MODEL-VARIANT-0000K-of-0000N.ggu
 beside other variants' (`upstream.root_split_gguf`), as ISTA-DASLab's
 DeepSeek-V4.1 GGUFs do.
 
-A DeepSeek-V4.1 target (`deepseek41`) keeps its Engram tables in a file of
-their own beside its parts, which its metadata names
-(`deepseek41.engram.file`, `gguf.engram_file`). The installer takes only a
-plain `*.gguf` name in the same folder, never a path, and holds the file to
-the backbone: its architecture `deepseek41-engram`, the backbone's
-`deepseek41.engram.source` and one table of a format for each Engram layer
-(`gguf.require_engram`). It installs in `engram/`, apart from the target's
-parts, which `target/` alone holds.
+A DeepSeek-V4.1 target (`deepseek41`) in llama.cpp's layout (b11870 and
+newer) keeps its Engram tables, `per_layer_token_embd` with every Engram
+layer's heads, as the last part of its split GGUF, which every variant of a
+repository shares as one file of its own name
+(`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`, ISTA-DASLab's), beside parts 1 to
+N - 1 of each. Where a split GGUF at the root, or in a local folder, lacks
+its last part, the installer reads the headers of the other root GGUFs, none
+a split's part or a projector, and takes the one whose `split.no`,
+`split.count` and `split.tensors.count` make it that part
+(`upstream.shared_last_part`, `gguf.last_part`); it installs in `target/`
+under the name the other parts imply (`-0000N-of-0000N.gguf`), and a link of
+that name beside them, as llama.cpp's instructions make, serves as well. The
+Engram hash lies in the first part's metadata (`deepseek41.engram.token_map`
+and the `ple.*` arrays). The installer refuses the layout ISTA-DASLab
+published until October 27, 2026, its Engram tables in a file the backbone
+names (`deepseek41.engram.file`): install the repository's current revision,
+or convert local files with its `convert_ds41_upstream.py`.
 
 BF16 and F16 are formats of the image like the quantized ones, for the tensors
 a quantized file keeps unquantized: UD-Q8_K_XL keeps the 27B's attention

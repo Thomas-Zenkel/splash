@@ -807,7 +807,10 @@ follows:
 - The runtime's arenas hold no paged attention's scratch for it
   (`QwenTargetGeometry::pagedAttention`): the target keeps its own, a
   prefill chunk's and a verify's, beside them (`qwenTargetScratchBytes`).
-- The Engram layers' table rows stream from their file
+- The Engram layers' table rows stream from the split GGUF's last part, one
+  table of every Engram layer's heads whose hash the metadata states; each
+  layer's offsets count from its own first row, where the metadata's
+  absolute offsets put its first head
   ([PLE table streaming](server.md#ple-table-streaming), the same `SparseRowStore`): a
   prefill hashes its rows' n-grams on the host and stages their rows before
   its command, and reads the next command's rows ahead while it runs; a
