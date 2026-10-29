@@ -1,9 +1,10 @@
 """DeepSeek-V4.1-Flash's chat format: its calls in DSML, one block of them
 after the text, read, constrained and rendered as Qwen's and Flint's calls
-are; tool names that hold none of DSML's markup; its embedded template,
-which renders DeepSeek's own encoding cases, and text that quotes its image
-placeholder; and a generation prompt that opens or closes the think block
-by the request's reasoning."""
+are; tool names that hold none of DSML's markup and that its template takes;
+its embedded template, which renders DeepSeek's own encoding cases, text
+that quotes its image placeholder and a history call of a name it refuses;
+and a generation prompt that opens or closes the think block by the
+request's reasoning."""
 
 import json
 import unittest
@@ -28,6 +29,7 @@ from dev.tests import server_fixtures as fixtures
 from dev.tests.tool_output import project, put, streamed_text, tool_policy
 from server import constraints, tool_schema
 from server import output as model_output
+from server.api_shapes import template_messages
 from server.chat_format import (
     DEEPSEEK,
     DEEPSEEK_DSML,
@@ -406,7 +408,9 @@ class DsmlToolNameTests(unittest.TestCase):
     """A tool's name is written inside its calls' DSML tags, and a strict
     tool's parameter names inside theirs: a name that holds DSML's markup,
     the marker its tags open with or the quote a function's name ends at, is
-    refused, naming the tool. Qwen's and Flint's tools keep every name they
+    refused, naming the tool, and so is one that holds the separator of a
+    namespace more than once, which the template refuses. A history call of
+    such a name stays text. Qwen's and Flint's tools keep every name they
     took."""
 
     def policy(self, name, syntax=DEEPSEEK_DSML, **function):
@@ -448,12 +452,67 @@ class DsmlToolNameTests(unittest.TestCase):
         _, calls, _ = project(text, tool_policy(SCHEMAS), syntax=DEEPSEEK_DSML)
         self.assertEqual([call["function"]["name"] for call in calls], ["bash"])
 
+    def test_a_name_holding_the_namespace_separator_twice_is_refused(self):
+        # The template reads a name's text before its first :: as the tool's
+        # namespace and refuses the name if the rest holds another, naming
+        # only the rest: every request that offered the tool failed.
+        for name in ("a::b::c", "a::::b", "::::", "ns::lookup::"):
+            with self.subTest(name=name):
+                with self.assertRaises(APIError) as caught:
+                    self.policy(name)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(
+                    caught.exception.message,
+                    f"tool name {name} must not contain '::' more than once, "
+                    "the separator of this model's tool namespaces",
+                )
+        for name in ("ns::lookup", "a:::b", "::", "lookup::", "::lookup"):
+            with self.subTest(name=name):
+                self.assertEqual(list(self.policy(name).schemas), [name])
+
+    def test_a_history_call_of_a_refused_name_stays_text_in_its_place(self):
+        # As a call whose arguments are text: the call of the name the
+        # template refuses becomes the text of a turn of its own, between the
+        # calls before and after it.
+        def call(name, arguments):
+            return {
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }
+
+        before, after = call("weather", {"city": "Paris"}), call("time", {})
+        made_up = call("a::b::c", {"city": "Paris"})
+        message = {
+            "role": "assistant",
+            "content": "Let me look.",
+            "reasoning_content": "Both.",
+            "tool_calls": [before, made_up, after],
+        }
+        self.assertEqual(
+            template_messages([message], syntax=DEEPSEEK_DSML),
+            [
+                {**message, "tool_calls": [before]},
+                {
+                    "role": "assistant",
+                    "content": 'Incomplete tool call:\n{"name": "a::b::c", '
+                    '"arguments": {"city": "Paris"}}',
+                },
+                {"role": "assistant", "content": "", "tool_calls": [after]},
+            ],
+        )
+        # Qwen's and Flint's templates write any name.
+        for syntax in (None, QWEN_XML, GLM_ARGS):
+            with self.subTest(syntax=syntax and syntax.key_open):
+                self.assertEqual(template_messages([message], syntax=syntax), [message])
+
     def test_other_families_take_the_names_they_took(self):
-        # Their markup is or holds < or >, which no tool name holds.
+        # Their markup is or holds < or >, which no tool name holds, and their
+        # templates read no namespace from a name.
         for syntax in (QWEN_XML, GLM_ARGS):
             for markup in (syntax.marker, syntax.name_end):
                 self.assertTrue({"<", ">"} & set(markup), markup)
-            for name in (f"read{DSML}file", 'bash"x', "weather"):
+            self.assertIsNone(syntax.namespace_separator)
+            for name in (f"read{DSML}file", 'bash"x', "a::b::c", "weather"):
                 with self.subTest(syntax=syntax.key_open, name=name):
                     self.assertEqual(list(self.policy(name, syntax).schemas), [name])
 
@@ -515,8 +574,9 @@ class DeepSeekTokenizerContractTests(unittest.TestCase):
 class DeepSeekPromptTests(unittest.TestCase):
     """DeepSeek's embedded template renders as its reference encoder does,
     through the options a request passes it, also where a message's text
-    quotes the image placeholder the template refuses there, and its
-    generation prompt opens the think block where the request thinks."""
+    quotes the image placeholder the template refuses there or a history
+    call names a function by a name it refuses, and its generation prompt
+    opens the think block where the request thinks."""
 
     def frontend(self, **changes):
         """A frontend serving DeepSeek's format, with `changes` to it."""
@@ -568,14 +628,33 @@ class DeepSeekPromptTests(unittest.TestCase):
                     expected,
                 )
                 # As requests render it, with a marker for its image
-                # placeholder, which the image blocks of case 5 write.
+                # placeholder, which the image blocks of case 5 write, and
+                # their calls as calls.
                 self.assertEqual(
                     frontend._apply_chat_template(
-                        data["messages"],
+                        template_messages(data["messages"], syntax=DEEPSEEK_DSML),
                         options | {"chat_template": TEMPLATE, "tokenize": False},
                     ),
                     expected,
                 )
+                # Cases 1 and 2 hold only what a request carries, the others
+                # DeepSeek's own roles and fields or images by path: requests
+                # of them render alike, through every step of preparation.
+                # Each ends with an answer, after which the template sets no
+                # generation prompt.
+                if case.name in ("test_input_1.json", "test_input_2.json"):
+                    body = fixtures.chat_body(
+                        messages=data["messages"],
+                        tools=data.get("tools"),
+                        reasoning_effort=data.get("reasoning_effort")
+                        if thinking
+                        else "none",
+                        add_generation_prompt=False,
+                    )
+                    self.assertEqual(
+                        frontend.apply_template(body, deadline=fixtures.FOREVER),
+                        expected,
+                    )
 
     def test_the_probe_finds_later_system_messages_native_and_two_prompts(self):
         template = ChatTemplates(deepseek_tokenizer()).select(None)
@@ -655,6 +734,207 @@ class DeepSeekPromptTests(unittest.TestCase):
             ),
             prompt,
         )
+
+    def test_the_template_refuses_the_names_its_syntax_refuses(self):
+        # In a tool's declaration and in a call of it alike: a name it takes
+        # it writes as it is, its namespace's :: too.
+        tokenizer = deepseek_tokenizer()
+        ask = {"role": "user", "content": "Go."}
+        for name in (
+            "lookup",
+            "ns::lookup",
+            "a:::b",
+            "::",
+            ":::",
+            "lookup::",
+            "::lookup",
+            "a::b::c",
+            "a::::b",
+            "::::",
+            "a::b:::c",
+            "ns::lookup::",
+        ):
+            call = {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"type": "function", "function": {"name": name, "arguments": {}}}
+                ],
+            }
+            for where, messages, options, written in (
+                (
+                    "declaration",
+                    [ask],
+                    {"tools": [{"type": "function", "function": {"name": name}}]},
+                    f'{{"name": {json.dumps(name)}}}',
+                ),
+                ("call", [ask, call, ask], {}, f'invoke name="{name}">'),
+            ):
+                with self.subTest(name=name, where=where):
+                    options = options | {
+                        "add_generation_prompt": True,
+                        "tokenize": False,
+                    }
+                    if not DEEPSEEK_DSML.refuses_name(name):
+                        self.assertIn(
+                            written, render_chat_template(tokenizer, messages, options)
+                        )
+                        continue
+                    with self.assertRaisesRegex(
+                        TemplateError, "Tool name must not contain '::'"
+                    ):
+                        render_chat_template(tokenizer, messages, options)
+
+    def test_a_history_call_of_a_name_the_template_refuses_renders_as_text(self):
+        # A model that calls tools freely may call one by any name, made up or
+        # read in a page, and the server returns the call as it reads it; the
+        # client sends it back in every later request of the conversation.
+        def call(call_id, name, arguments):
+            return {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }
+
+        def result(call_id, content):
+            return {"role": "tool", "tool_call_id": call_id, "content": content}
+
+        ask = {"role": "user", "content": "Weather in Paris?"}
+        made_up = call("call_2", "a::b::c", '{"city": "Paris"}')
+        alone = [
+            ask,
+            {"role": "assistant", "content": "", "tool_calls": [made_up]},
+            result("call_2", "unknown tool"),
+        ]
+        between = [
+            ask,
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "Look it up.",
+                "tool_calls": [
+                    call("call_1", "weather", '{"city": "Paris"}'),
+                    made_up,
+                    call("call_3", "time", "{}"),
+                ],
+            },
+            result("call_1", "Sunny"),
+            result("call_2", "unknown tool"),
+            result("call_3", "noon"),
+        ]
+        later = [
+            *between,
+            {"role": "assistant", "content": "Sunny at noon."},
+            {"role": "user", "content": "And Rome?"},
+        ]
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": name, "parameters": SCHEMAS[name]},
+            }
+            for name in SCHEMAS
+        ]
+        tokenizer, frontend = deepseek_tokenizer(), self.frontend()
+        text = (
+            'Incomplete tool call:\n{"name": "a::b::c", "arguments": {"city": "Paris"}}'
+        )
+        for name, messages in (
+            ("alone", alone),
+            ("between calls", between),
+            ("later turn", later),
+        ):
+            body = fixtures.chat_body(messages=messages, tools=tools)
+            with self.subTest(conversation=name):
+                # The template's own refusal.
+                with self.assertRaisesRegex(
+                    TemplateError, "Tool name must not contain '::': b::c"
+                ):
+                    render_chat_template(
+                        tokenizer,
+                        messages,
+                        {
+                            "tools": tools,
+                            "add_generation_prompt": True,
+                            "tokenize": False,
+                        },
+                    )
+                prompt = frontend.apply_template(body, deadline=fixtures.FOREVER)
+                self.assertEqual(prompt.count(text), 1, prompt)
+                self.assertNotIn('invoke name="a::b::c"', prompt)
+                frontend.prepare(body, deadline=fixtures.FOREVER)
+                frontend.count_tokens(body, deadline=fixtures.FOREVER)
+        # The turn's other calls stay calls, in their order around it.
+        prompt = frontend.apply_template(
+            fixtures.chat_body(messages=between, tools=tools),
+            deadline=fixtures.FOREVER,
+        )
+        self.assertTrue(
+            prompt.endswith(
+                "<｜User｜>Weather in Paris?<｜Assistant｜><think>Look it up.</think>"
+                + dsml_calls(("weather", {"city": "Paris"}))
+                + f"<｜end▁of▁sentence｜></think>{text}<｜end▁of▁sentence｜></think>"
+                + dsml_calls(("time", {}))
+                + "<｜end▁of▁sentence｜><｜User｜><tool_result>Sunny</tool_result>\n\n"
+                "<tool_result>unknown tool</tool_result>\n\n"
+                "<tool_result>noon</tool_result><｜Assistant｜><think>"
+            ),
+            prompt,
+        )
+
+    def test_ordinary_requests_render_and_encode_as_without_the_name_rule(self):
+        # The names the template takes, a namespace's among them, in tools
+        # and in calls of them.
+        names = ("weather", "ns::weather", "a:::b", "lookup::")
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": name, "parameters": SCHEMAS["weather"]},
+            }
+            for name in names
+        ]
+        calls = [
+            {
+                "id": f"call_{index}",
+                "type": "function",
+                "function": {"name": name, "arguments": '{"city": "Paris"}'},
+            }
+            for index, name in enumerate(names)
+        ]
+        body = fixtures.chat_body(
+            messages=[
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "Weather in Paris?"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "Look it up.",
+                    "tool_calls": calls,
+                },
+                *(
+                    {"role": "tool", "tool_call_id": call["id"], "content": "Sunny"}
+                    for call in calls
+                ),
+                {"role": "assistant", "content": "Sunny.", "reasoning_content": "Hm"},
+                {"role": "user", "content": "And Rome?"},
+            ],
+            tools=tools,
+        )
+
+        def prompt(app, request):
+            """The request's prompt text and tokens."""
+            return (
+                app.apply_template(request, deadline=fixtures.FOREVER),
+                app.prepare(request, deadline=fixtures.FOREVER).prompt_tokens,
+            )
+
+        frontend = self.frontend()
+        unruled = self.frontend(
+            call_syntax=replace(DEEPSEEK_DSML, namespace_separator=None)
+        )
+        for effort in (None, *REASONING_EFFORTS):
+            request = body | {"reasoning_effort": effort}
+            with self.subTest(effort=effort):
+                self.assertEqual(prompt(frontend, request), prompt(unruled, request))
 
     def test_text_quoting_the_image_placeholder_renders_as_it_is(self):
         # The template refuses a message whose text holds its image
@@ -825,6 +1105,8 @@ class DeepSeekServingTests(fixtures.HarnessTestCase):
             f'is</{DSML} parameter>\n<{DSML} parameter name="days" string="false">'
             f"3</{DSML} parameter>\n</{DSML} invoke>\n</{DSML} calls>"
         ),
+        # A call of a name the template refuses, which no tool may hold.
+        49: dsml_calls(("a::b::c", {"city": "Paris"})),
     }
     # DeepSeek's format over the fake vocabulary's IDs.
     CHAT_FORMAT = replace(DEEPSEEK, think_end_id=42, call_open_id=48)
@@ -963,6 +1245,139 @@ class DeepSeekServingTests(fixtures.HarnessTestCase):
             f"tool name {name} must not contain '{DSML}', "
             "the markup of this model's tool calls",
         )
+
+    def test_a_call_of_a_name_the_template_refuses_is_returned_and_sent_back(self):
+        # Without a grammar the model calls a tool by any name: the server
+        # returns the call as the model wrote it, and the conversation that
+        # sends it back goes on, in each API, its call kept as text.
+        harness = self.harness(
+            fixtures.Plan([[41], [42], [43], [49]]),
+            # Each later request but count_tokens generates.
+            *(fixtures.Plan([[41], [42], [43]]) for _ in range(3)),
+        )
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body()
+        )
+        self.assertEqual(status, 200, payload)
+        message = json.loads(payload)["choices"][0]["message"]
+        (call,) = message["tool_calls"]
+        self.assertEqual(
+            (call["function"]["name"], call["function"]["arguments"]),
+            ("a::b::c", '{"city":"Paris"}'),
+        )
+        ask, failed = "Weather in Paris?", "unknown tool a::b::c"
+        chat = [
+            {"role": "user", "content": ask},
+            message,
+            {"role": "tool", "tool_call_id": call["id"], "content": failed},
+        ]
+        responses = [
+            {"type": "message", "role": "user", "content": ask},
+            {
+                "type": "function_call",
+                "call_id": call["id"],
+                "name": "a::b::c",
+                "arguments": call["function"]["arguments"],
+            },
+            {"type": "function_call_output", "call_id": call["id"], "output": failed},
+        ]
+        messages = [
+            {"role": "user", "content": ask},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": call["id"],
+                        "name": "a::b::c",
+                        "input": {"city": "Paris"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call["id"],
+                        "content": failed,
+                    }
+                ],
+            },
+        ]
+        function = {
+            "type": "function",
+            "name": "weather",
+            "parameters": SCHEMAS["weather"],
+        }
+        tool = {"name": "weather", "input_schema": SCHEMAS["weather"]}
+        for path, body in (
+            ("/v1/chat/completions", self.body(messages=chat)),
+            (
+                "/v1/responses",
+                fixtures.responses_body(input=responses, tools=[function]),
+            ),
+            ("/v1/messages", fixtures.anthropic_body(messages=messages, tools=[tool])),
+            (
+                "/v1/messages/count_tokens",
+                fixtures.anthropic_body(messages=messages, tools=[tool]),
+            ),
+        ):
+            with self.subTest(path=path):
+                status, _, payload = harness.request("POST", path, body)
+                self.assertEqual(status, 200, payload)
+                rendered, _ = harness.tokenizer.templates[-1]
+                self.assertIn(
+                    {
+                        "role": "assistant",
+                        "content": 'Incomplete tool call:\n{"name": "a::b::c", '
+                        '"arguments": {"city": "Paris"}}',
+                    },
+                    rendered,
+                )
+
+    def test_a_tool_whose_name_holds_the_namespace_separator_twice_is_refused(self):
+        # Before any template renders, in each API, naming the whole name.
+        harness = self.harness()
+        tool = {"name": "a::b::c", "input_schema": {"type": "object"}}
+        namespace = {
+            "type": "namespace",
+            "name": "a::b",
+            "tools": [{"type": "function", "name": "c::d"}],
+        }
+        for path, body, name in (
+            (
+                "/v1/chat/completions",
+                fixtures.chat_body(
+                    tools=[{"type": "function", "function": {"name": "a::b::c"}}]
+                ),
+                "a::b::c",
+            ),
+            (
+                "/v1/responses",
+                fixtures.responses_body(
+                    tools=[{"type": "function", "name": "a::b::c"}]
+                ),
+                "a::b::c",
+            ),
+            # A namespace's function goes by namespace__name.
+            ("/v1/responses", fixtures.responses_body(tools=[namespace]), "a::b__c::d"),
+            ("/v1/messages", fixtures.anthropic_body(tools=[tool]), "a::b::c"),
+            (
+                "/v1/messages/count_tokens",
+                fixtures.anthropic_body(tools=[tool]),
+                "a::b::c",
+            ),
+        ):
+            with self.subTest(path=path, name=name):
+                status, _, payload = harness.request("POST", path, body)
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(
+                    json.loads(payload)["error"]["message"],
+                    f"tool name {name} must not contain '::' more than once, "
+                    "the separator of this model's tool namespaces",
+                )
+        self.assertEqual(harness.tokenizer.templates, [])
 
 
 if __name__ == "__main__":

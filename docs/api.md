@@ -78,7 +78,10 @@ delta, and an assistant message sent back may carry its `reasoning_content`
 `output_text` and `input_image` parts too, and a `refusal` part, an assistant's
 refusal, is text. A history tool call whose `arguments` are not a JSON object,
 such as one the output limit cut, is kept as text, so the conversation
-continues. `n` other than 1 and `logprobs: true` return 400.
+continues, and so is one whose name the chat template refuses, as DeepSeek's
+refuses a name that holds `::` more than once: a model that calls tools
+freely may call one by any name, and the call returns as written.
+`n` other than 1 and `logprobs: true` return 400.
 
 `POST /v1/completions` serves OpenAI's legacy text completions. `prompt` is one
 string, which the loaded tokenizer encodes as a raw prompt, adding its own
@@ -485,7 +488,8 @@ keeps text in, other than `<`, `>`, line breaks and lone surrogates, and does
 not start or end with whitespace; a `tool_reference` names a tool the same way.
 Where DeepSeek's DSML lays the calls out, a tool's name also holds neither
 `｜DSML｜`, which opens each of its tags, nor the quote a function's name ends
-at, and the 400 names the tool.
+at, nor `::` more than once, as its template reads the text before the first
+`::` as the tool's namespace; the 400 names the tool.
 A Chat tool or named `tool_choice` that gives no `type` is a function. A
 Responses `namespace` function goes by `namespace__name`. Hosted search is
 unsupported; configure client-owned tools such as MCP.

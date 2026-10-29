@@ -1127,7 +1127,10 @@ def _check_tool_schema(name, schema):
 def normalize_tools(tools, tool_choice, parallel, namespaces=None, *, syntax=None):
     """The tools of a request and its ToolPolicy. With `syntax`, the layout
     the served model writes its calls in (ToolCallSyntax), a function's name
-    holds none of its markup (_name_markup)."""
+    holds none of its markup (_name_markup), and its template takes it
+    (ToolCallSyntax.refuses_name): a tool it refuses would fail every request
+    that offers it with the template's error, which may name only part of
+    the tool's name."""
     if parallel is None:
         parallel = True
     if not isinstance(parallel, bool):
@@ -1162,6 +1165,13 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None, *, syntax=Non
                 400,
                 f"tool name {name} must not contain {markup!r}, "
                 "the markup of this model's tool calls",
+            )
+        if syntax is not None and syntax.refuses_name(name):
+            raise APIError(
+                400,
+                f"tool name {name} must not contain "
+                f"{syntax.namespace_separator!r} more than once, "
+                "the separator of this model's tool namespaces",
             )
         if name in schemas:
             raise APIError(400, f"duplicate tool name: {name}")

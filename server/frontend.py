@@ -910,7 +910,8 @@ class Frontend:
                 vision=self.vision,
                 deadline=deadline,
                 without_slot=without_slot,
-            )
+            ),
+            syntax=self.chat_format.call_syntax,
         )
         tools, tool_policy = normalize_tools(
             body.get("tools"),

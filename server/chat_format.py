@@ -66,6 +66,10 @@ class ToolCallSyntax:
     calls_open: str = ""
     calls_close: str = ""
     call_end: str = ""
+    # What sets a function's namespace apart from its name where the template
+    # reads one from the name, as DeepSeek's reads the text before a name's
+    # first "::" (refuses_name). None where it reads none.
+    namespace_separator: str | None = None
 
     @property
     def call_open(self):
@@ -88,6 +92,14 @@ class ToolCallSyntax:
         return (
             self.calls_open + "".join(self.call_tags[:1]) + self.function_opening(name)
         )
+
+    def refuses_name(self, name):
+        """Whether the template refuses a function's `name`, which it writes
+        in the function's declaration and in each of its calls: where it
+        reads a namespace from the name, one that holds namespace_separator
+        more than once, since what follows the namespace must not hold it."""
+        separator = self.namespace_separator
+        return separator is not None and name.count(separator) > 1
 
     @property
     def name_end(self):
@@ -163,7 +175,8 @@ GLM_ARGS = ToolCallSyntax(
 # DeepSeek-V4.1's DSML: a turn's calls in one block after its text, an invoke
 # tag around each call, the name in its attribute, and a parameter tag around
 # each argument whose string attribute says whether the value is text or JSON.
-# Each tag opens with < or </ and DSML, one token; the rest is text.
+# Each tag opens with < or </ and DSML, one token; the rest is text. The
+# template reads a name's text before its first :: as a namespace.
 DEEPSEEK_DSML = ToolCallSyntax(
     name_open=f'<{DSML} invoke name="',
     name_close='">\n',
@@ -180,6 +193,7 @@ DEEPSEEK_DSML = ToolCallSyntax(
     calls_open=f"\n\n<{DSML} calls>\n",
     calls_close=f"</{DSML} calls>",
     call_end="\n",
+    namespace_separator="::",
 )
 
 
