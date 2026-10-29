@@ -230,7 +230,8 @@ QUANT_FORMATS(GGUF_DECODE_GATE_UP_FORMAT)
                        p.out_stride, column0, simd_group * 32 + simd_lane, &arrival,                              \
                        [&](uint row, uint column, float v) { output[ulong(row) * p.out_stride + column0 + column] = bfloat(v); }); \
   }
-GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32)
+// The 64-row instance runs fused prefill chunks of 33 to 64 rows (ops::Linear).
+GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32) GGUF_DECODE_FUSED(64)
 #undef GGUF_DECODE_FUSED
 
 // The prefill kernels: grid (GGUF_PREFILL_ROWS-row tiles of the chunk, column tiles), four simdgroups; the residual

@@ -625,12 +625,13 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   }
 }
 
-// The staged decode tiles, for decode and prefill chunks of up to 32 rows:
-// every row of the plan's storage in each threadgroup's tile, grid (64-column
-// tiles, K splits). Decode runs one dispatch per projection (addDecodeTensor,
-// fusedSegments), gate/up as two passes, or, where ggufBaseline sets
-// LinearConfig::oneGateUpPass, as one pass over 32-column threadgroups of one
-// simdgroup each. Prefill chunks run one dispatch per segment.
+// The staged decode tiles, for decode and prefill chunks of up to 32 rows (64
+// on Apple10): every row of the plan's storage in each threadgroup's tile,
+// grid (64-column tiles, K splits). Decode runs one dispatch per projection
+// (addDecodeTensor, fusedSegments), gate/up as two passes, or, where
+// ggufBaseline sets LinearConfig::oneGateUpPass, as one pass over 32-column
+// threadgroups of one simdgroup each. Prefill chunks run one dispatch per
+// segment, but a fused projection's chunk of 33 to 64 rows runs one.
 void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
                              const Projection &p, const LinearPlan &plan,
                              const Projection *gate) const {
@@ -647,7 +648,34 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
               GgufDecodeParams{k, splits, n, s.columnOffset, config.spread},
               {s.outputSize / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
   };
+  // A fused projection's segments in one dispatch (gguf_decode_fused_m*),
+  // in tile order: segments with the most bytes per tile first, so their
+  // threadgroups do not form the tail.
+  const auto fused = [&] {
+    std::vector<const QuantizedSegment *> order;
+    for (const QuantizedSegment &s : segments) order.push_back(&s);
+    const auto bitsPerWeight = [](const QuantizedSegment &s) {
+      const QuantFormat &f = s.format();
+      return (f.plane0_bytes + f.plane1_bytes) * 8.0 / 32.0 + f.meta_bytes * 8.0 / (32.0 * f.meta_groups);
+    };
+    std::stable_sort(order.begin(), order.end(), [&](const QuantizedSegment *a, const QuantizedSegment *c) {
+      return bitsPerWeight(*a) > bitsPerWeight(*c);
+    });
+    std::vector<metal::MetalBuffer> bindings{b.input};
+    const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
+    bindings.insert(bindings.end(), {b.output, partials, counters});
+    graph.add("gguf_decode_fused_m" + std::to_string(rows), std::move(bindings), params,
+              {segmentColumns(p) / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
+  };
   if (w.phase == LinearPhase::Prefill) {
+    // A fused projection's chunk of 33 to 64 rows runs its segments in one
+    // dispatch: a dispatch costs about 0.045 ms however narrow, and one per
+    // segment of a 35B GDN layer's qkv|z|ab made its resumes 3-5% slower
+    // than the prefill tile's one per format.
+    if (segments.size() > 1 && w.rows > kMaximumDecodeTileRows && w.epilogue == LinearEpilogue::None) {
+      fused();
+      return;
+    }
     for (const QuantizedSegment &s : segments)
       tensor(s, epilogueSuffix(w.epilogue), b.output, epilogueInput(b, w.epilogue));
     return;
@@ -668,22 +696,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
     addDecodeTensor(b, w.epilogue, segments.front(), gate, tensor);
     return;
   }
-  // Dispatch order is tile order: segments with the most bytes per tile
-  // first, so their threadgroups do not form the tail.
-  std::vector<const QuantizedSegment *> order;
-  for (const QuantizedSegment &s : segments) order.push_back(&s);
-  const auto bitsPerWeight = [](const QuantizedSegment &s) {
-    const QuantFormat &f = s.format();
-    return (f.plane0_bytes + f.plane1_bytes) * 8.0 / 32.0 + f.meta_bytes * 8.0 / (32.0 * f.meta_groups);
-  };
-  std::stable_sort(order.begin(), order.end(), [&](const QuantizedSegment *a, const QuantizedSegment *c) {
-    return bitsPerWeight(*a) > bitsPerWeight(*c);
-  });
-  std::vector<metal::MetalBuffer> bindings{b.input};
-  const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
-  bindings.insert(bindings.end(), {b.output, partials, counters});
-  graph.add("gguf_decode_fused_m" + std::to_string(rows), std::move(bindings), params,
-            {segmentColumns(p) / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
+  fused();
 }
 
 // The prefill tile, which runs prefill chunks of more than
