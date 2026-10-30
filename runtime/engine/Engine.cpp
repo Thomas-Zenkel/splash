@@ -1756,15 +1756,23 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
   // can release its lane before completed prefill is discarded.
   if (denied.empty())
     throw std::logic_error("empty resource admission result");
+  // No lane runs: the copies Spill requests owe and have not started, as a
+  // chain a lane restored has before its first command or those the memory
+  // governor's pass left when it collected the ones that landed, start now.
+  // A lane alone waits while they are written (judge).
+  if (spill)
+    static_cast<void>(cache_.writeThrough());
   // Memory on its way back arrives without anyone yielding. The lanes still
   // take a retry deadline: the transfer's completion wakes the engine, and
   // the deadline is what makes the wait end if that wake is ever missed.
-  if (std::any_of(denied.begin(), denied.end(),
-                  [](const Denied &entry) { return entry.denial.pending; })) {
+  const auto wait = [&] {
     for (const Denied &entry : denied)
       deferResourceRetry(request(entry.requestId), now, entry.denial);
     return Prepared::Waiting;
-  }
+  };
+  if (std::any_of(denied.begin(), denied.end(),
+                  [](const Denied &entry) { return entry.denial.pending; }))
+    return wait();
   const Denied &victim = *std::min_element(
       denied.begin(), denied.end(),
       [&](const Denied &left, const Denied &right) {
@@ -1780,12 +1788,20 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
   // capacity, not to the blocked lane's requirement.
   const uint64_t resumeTarget =
       own != denied.end() ? own->workEnd : kvCapacity(active.request.id);
-  if (judge(victim.denial, active.request.id) != Verdict::Fail) {
+  switch (judge(victim.denial, active.request.id)) {
+  case Verdict::Wait:
+    // Alone, it waits for the copies owed, retrying as they land, within the
+    // resource wait its first refusal started: copies that never land, or
+    // keep failing, end it there.
+    return wait();
+  case Verdict::Yield:
     suspendForGrowth(active, resumeTarget, victim.denial.allocationFailure, now);
     return Prepared::Yielded;
+  case Verdict::Fail:
+    break;
   }
-  // Alone with nothing left to reclaim. A Spill lane that decodes ends at
-  // its length once the SSD cache can hold no more of its KV.
+  // Alone with nothing left to reclaim or write. A Spill lane that decodes
+  // ends at its length once the SSD cache can hold no more of its KV.
   Request &lone = request(victim.requestId);
   if (!victim.kv)
     settle(lone, capacityExhausted(victim.memory, victim.denial.allocationFailure));
@@ -2008,6 +2024,10 @@ Engine::Verdict Engine::judge(const Denial &denial, uint64_t requestId) const {
   if (anotherResident(requestId) ||
       denial.allocationFailure == metal::AllocationFailure::HostPressure)
     return Verdict::Yield;
+  // Alone, it waits for the copies Spill requests owe, the slowest memory
+  // to come back: they free its Full pages as the SSD cache writes them.
+  if (cache_.owedCopiesReturn(denial.pages, denial.form))
+    return Verdict::Wait;
   return Verdict::Fail;
 }
 
@@ -2063,6 +2083,10 @@ auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
   if (!admission.granted()) {
     denial.allocationFailure = admission.allocationFailure;
     denial.pending = denial.pending || transferPending(admission);
+    if constexpr (std::is_same_v<Admission, TokenAdmission>) {
+      denial.pages = admission.additionalPages;
+      denial.form = admission.form;
+    }
     // Memory on its way back ends the shortage without the residents.
     if (memoryDenied(admission) && !denial.pending && !optional)
       allocationFailed_ = true;
@@ -2513,6 +2537,10 @@ Engine::LaneEnd Engine::capacityExhausted(std::string_view what,
                         metal::allocationFailureName(failure);
   if (!detail.empty())
     message += " (" + std::string(detail) + ")";
+  // A lone lane judge failed: only other limits fit it.
+  message += "; the request does not fit in the memory this server may use, even after "
+             "every cached prefix was evicted: restart the server with a larger "
+             "--max-memory or a smaller --max-context";
   return {LaneOutcome::CapacityExhausted, std::move(message)};
 }
 

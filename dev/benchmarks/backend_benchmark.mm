@@ -779,10 +779,11 @@ struct BenchmarkScenarios final {
   bool context = true;
   bool exact = false;
   bool logits = false;
+  bool resume = false;
 };
 
 BenchmarkScenarios parseScenarios(std::string_view value) {
-  BenchmarkScenarios selected{false, false, false, false, false, false, false};
+  BenchmarkScenarios selected{false, false, false, false, false, false, false, false};
   for (;;) {
     const size_t comma = value.find(',');
     const std::string_view name = value.substr(0, comma);
@@ -793,6 +794,7 @@ BenchmarkScenarios parseScenarios(std::string_view value) {
                      : name == "context"     ? &selected.context
                      : name == "exact"       ? &selected.exact
                      : name == "logits"      ? &selected.logits
+                     : name == "resume"      ? &selected.resume
                                              : nullptr;
     if (!scenario)
       throw std::invalid_argument("unknown benchmark scenario");
@@ -879,7 +881,7 @@ int main(int argc, char **argv) {
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
                    "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
                    "[--logits DIR [--logits-from DIR] [--logits-width LANES]]\n"
-                   "  NAME: decode, partial, short, transcripts, context, exact or logits "
+                   "  NAME: decode, partial, short, transcripts, context, exact, logits or resume "
                    "(default: decode,partial,context)\n"
                    "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
                    "to run instead of calibrating one (0: GPU alone)\n"
@@ -1298,6 +1300,46 @@ int main(int argc, char **argv) {
         measurements.push_back(std::move(partialCold));
         measurements.push_back(std::move(partialSeed));
         measurements.push_back(std::move(partialHit));
+      }
+    }
+
+    // Resumes of a cached prefix that re-read a few rows, as a conversation's
+    // next turn does from the replay state of the turn before: a seed of a
+    // page and one token keeps its state at the page boundary, so a prompt of
+    // the seed and `suffix` more tokens re-reads suffix + 1 rows over the
+    // context of that boundary, 2K and 32K. Each context is seeded once; a
+    // resume's own states lie past the seed's last token, where the next
+    // resume's tokens differ.
+    if (selected.resume) {
+      constexpr std::array<uint32_t, 2> resumeContexts{2048, 32768};
+      constexpr std::array<uint32_t, 8> resumeSuffixes{4, 19, 31, 32, 35, 47, 55, 63};
+      for (const uint32_t context : resumeContexts) {
+        // The longest resume, and the token it generates, past what the
+        // memory plan holds on a Mac with less memory.
+        if (context + 1 + resumeSuffixes.back() + 1 >= engineConfig.maxContext) {
+          skippedLengths.push_back(context);
+          continue;
+        }
+        const std::vector<uint32_t> seed = prompt(context + 1, uint64_t{context} << 32 | 0x524553554dULL);
+        evictAllCache(resources->cache());
+        const Measurement seeded = runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                                              "resume_seed_" + std::to_string(context), 0, seed);
+        if (seeded.cacheStatus != "miss")
+          throw std::runtime_error("resume seed was not a cold miss: " + seeded.cacheStatus);
+        for (uint32_t sample = 0; sample < samples; ++sample)
+          for (const uint32_t suffix : resumeSuffixes) {
+            std::vector<uint32_t> tokens = seed;
+            const std::vector<uint32_t> more =
+                prompt(suffix, (uint64_t{suffix} << 40) ^ (uint64_t{sample} << 32) ^ context ^ 0x5355464658ULL);
+            tokens.insert(tokens.end(), more.begin(), more.end());
+            Measurement result = runRequest(engine, driver, *executor, events, progress.get(), requestId++,
+                                            "resume_" + std::to_string(context) + "_r" + std::to_string(suffix + 1),
+                                            sample, std::move(tokens));
+            if (result.cacheStatus != "prefix_hit" || result.matchedTokens != context)
+              throw std::runtime_error("resume of " + std::to_string(suffix + 1) + " rows matched " +
+                                       std::to_string(result.matchedTokens) + " tokens: " + result.cacheStatus);
+            measurements.push_back(std::move(result));
+          }
       }
     }
 

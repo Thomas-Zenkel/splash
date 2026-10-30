@@ -33,6 +33,13 @@ RESTART_BACKOFF_SECONDS = 5.0
 # Control requests use a short live probe and explicitly label stale snapshots.
 STATUS_REFRESH_TIMEOUT_SECONDS = 0.05
 
+# Engine outcomes whose message the engine words from its own limits and
+# counts, never from a request: the client gets it as it is, and the console
+# prints it beside the code.
+_ENGINE_RESOURCE_CODES = frozenset(
+    {"capacity_exhausted", "kv_disk_quota", "kv_write_budget", "resource_timeout"}
+)
+
 
 class ThinkingEndError(ValueError):
     """A --thinking-end-text the model's tokenizer cannot end thinking with."""
@@ -994,17 +1001,10 @@ class NativeBackend:
             message = error.message_bytes.decode("utf-8", "replace")
             if code == "deadline_exceeded":
                 return APIError(504, message, "request_timeout")
-            if code == "capacity_exhausted":
-                return APIError(
-                    400,
-                    "the request does not fit in the memory this server may use, even "
-                    "after every cached prefix was evicted; restart the server with a "
-                    f"larger --max-memory or a smaller --max-context ({message})",
-                    code,
-                )
-            # The SSD cache cannot hold even the prompt's KV of a request that
-            # does not fit in memory; the message names its quota.
-            if code == "kv_disk_quota":
+            # A request that does not fit even alone, in memory or in the SSD
+            # cache, fails the same way on a retry; the engine's message names
+            # what it lacked and the limits that would fit it.
+            if code in ("capacity_exhausted", "kv_disk_quota"):
                 return APIError(400, message, code)
             request_codes = {
                 "invalid_constraint",
@@ -1057,6 +1057,8 @@ class NativeBackend:
             }
         if error:
             record["error_code"] = error.code
+            if error.code in _ENGINE_RESOURCE_CODES:
+                record["engine_reason"] = error.message
         self._log(record)
 
     def _log(self, record):

@@ -14,7 +14,7 @@
 //   count, whose tiles' walks wrap past the partition's end;
 // - gate/up: each format's gate with the next format the tile takes as up, and in one pass
 //   (LinearConfig::oneGateUpPass) bitwise the two passes at the same K split, one lane on the 16-row tile too;
-// - prefill: 128-row tiles with each epilogue, whose simdgroups past the chunk write nothing, and chunks of up to 32
+// - prefill: 128-row tiles with each epilogue, whose simdgroups past the chunk write nothing, and chunks of up to 64
 //   rows on the decode tiles equal to them bitwise; fused segments at their column offsets;
 // - split visibility: two projections that share the split scratch, at every pair of K splits either tile's policy
 //   picks for 8-80 cores (the register tile's for Flash-Next's hyper-connection pair too), independent of poisoned
@@ -421,7 +421,7 @@ bool sameRows(const std::vector<uint16_t> &a, uint64_t aRow, const std::vector<u
   return std::equal(a.begin() + aRow * columns, a.begin() + (aRow + rows) * columns, b.begin() + bRow * columns);
 }
 
-// The configuration of `tile` for a decode workload, or of the staged tile for a prefill chunk of up to 32 rows; the
+// The configuration of `tile` for a decode workload, or of the staged tile for a prefill chunk of up to 64 rows; the
 // staged tile walks K spread or in lockstep.
 LinearConfig config(LinearTile tile, const LinearWorkload &w, uint32_t splits, bool spread = false) {
   return {.tile = w.phase == LinearPhase::Prefill ? LinearTile::GgufStaged : tile, .splits = splits, .spread = spread};
@@ -670,8 +670,9 @@ void oneGateUpPass(MetalBackend &backend, const Linear &linear, bool spread) {
 // 168- and 136-row chunks on the 128-row tiles: the second tile holds 40 or 8 rows, so its last two or three 32-row
 // simdgroups skip their matmuls, though not the barriers of the stage they share, and leave the rows from 192 or 160
 // unwritten. Chunks of up to 32 rows run the decode tiles, whose rows equal the 128-row tiles' bitwise without K
-// splits and lie within fp64 with them. Each of `formats` ([1024, K]) at each epilogue, and a fused projection at its
-// segments' column offsets.
+// splits and lie within fp64 with them; chunks of 33-64 rows run the 64-row decode tile, alike, and also at eight
+// partitions, which the split law takes for some shapes, where K takes them. Each of `formats` ([1024, K]) at each
+// epilogue, and a fused projection at its segments' column offsets.
 void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std::vector<Fmt> &formats) {
   constexpr uint32_t kChunks[] = {168, 136}, kSimdgroupRows = 32;
   // The split chunks' partitions: the most up to four that take whole 32-input groups.
@@ -705,8 +706,10 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
         fail(name + ": simdgroups past the chunk write their rows");
       if (tileOutput.empty()) tileOutput = whole.output;
     }
-    for (const uint32_t rows : {8u, 16u, 24u, 32u})
-      for (const uint32_t splits : {1u, splitChunk}) {
+    for (const uint32_t rows : {8u, 16u, 24u, 32u, 33u, 40u, 48u, 57u, 64u})
+      for (const uint32_t splits : {1u, splitChunk, 8u}) {
+        if (splits == 8 && (rows <= 32 || (K / 32) % 8))
+          continue;
         const LinearWorkload chunk{{columns, K}, rows, LinearPhase::Prefill, epilogue};
         const LinearPlan plan =
             Linear::plan(chunk, config(LinearTile::GgufStaged, chunk, splits), FloatOutput::BFloat16);
@@ -732,7 +735,8 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
   }
   section("prefill: " + std::to_string(formats.size()) + " formats, K " + std::to_string(K) +
           ", plain/residual/up-with-gate and fused segments, 128-row tiles over 168- and 136-row chunks and chunks of "
-          "8-32 rows (S 1 and " + std::to_string(splitChunk) + ") within fp64, equal to the 128-row tiles");
+          "8-64 rows (S 1 and " + std::to_string(splitChunk) + (K / 32 % 8 ? "" : ", and 8 past 32 rows") +
+          ") within fp64, equal to the 128-row tiles");
 }
 
 // ---------------------------------------------------------------- leading inputs

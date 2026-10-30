@@ -1193,6 +1193,77 @@ void testCommittedPagesTakeTheSpilledChainOfAStateInRam() {
   process.cache.checkInvariants();
 }
 
+// A conversation that starts cold over a prefix another conversation left
+// on the SSD computes the prefix's blocks again: they keep the other's copies
+// (KvCache::insert), and its own restore point persists only the blocks past
+// them. When its next turn spills, those blocks, with copies of their own,
+// spill at once: the prefix waiting for its own copies holds back none of
+// them.
+void testAPrefixWithoutOwnCopiesHoldsBackNoSpill() {
+  const auto budget = std::make_shared<model::DiskBudget>(100'000);
+  test::TestKvStorage storage{256, 100, 4, 10};
+  KvPool pool{storage, 4};
+  test::TestKvTier tier(true);
+  tier.budget = budget;
+  tier.transferLimit = 1024;
+  const auto shelf = std::make_shared<Shelf>();
+  shelf->capacity = 100;
+  engine::Cache cache(pool, &tier, budget, CacheSpillPolicy{1, 1});
+  require(cache.spillWritten().granted(), "the Index runway was not allocated");
+  const auto publish = [&](uint64_t block) {
+    cache.publishCompositeState(block, std::make_shared<ShelvedState>(shelf, false), false);
+  };
+  // The first conversation's four pages leave RAM for their copies.
+  const std::vector<uint32_t> prefix = promptOf(1000, 4);
+  cache.beginRequest(1);
+  require(admitTokens(cache, 1, prefix.size()).granted(), "the first conversation was not admitted");
+  cache.publishCommittedBlocks(1, prefix, static_cast<uint32_t>(prefix.size()), {});
+  const uint64_t prefixEnd = cache.blockAt(1, static_cast<uint32_t>(prefix.size()));
+  cache.endRequest(1);
+  publish(prefixEnd);
+  for (;;) {
+    const CacheReclaimResult step = cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
+    tier.complete();
+    const bool landed = cache.pollTransfers();
+    if (!step.madeProgress && !landed)
+      break;
+  }
+  require(!cache.snapshot().pool.pagesPrefix, "the first conversation's prefix stayed in RAM");
+  // The second computes the prefix again and eight pages of its own, and its
+  // restore point persists.
+  std::vector<uint32_t> second = prefix;
+  const std::vector<uint32_t> own = promptOf(5000, 8);
+  second.insert(second.end(), own.begin(), own.end());
+  cache.beginRequest(2);
+  require(admitTokens(cache, 2, second.size()).granted(), "the second conversation was not admitted");
+  cache.publishCommittedBlocks(2, second, static_cast<uint32_t>(second.size()), {});
+  const uint64_t point = cache.blockAt(2, static_cast<uint32_t>(second.size()));
+  cache.endRequest(2);
+  publish(point);
+  PersistStatus status = PersistStatus::Busy;
+  for (uint32_t attempt = 0; attempt < 100 && status != PersistStatus::Durable; ++attempt) {
+    status = cache.persist(point);
+    tier.complete();
+    static_cast<void>(cache.pollTransfers());
+  }
+  require(status == PersistStatus::Durable && cache.copiedBlocks(point) == 8,
+          "the restore point did not persist its own blocks alone");
+  // Its next turn spills the chain it restores: the pages past the dense
+  // history and before the window whose copies are its own, seven, spill at
+  // the first scan.
+  std::vector<uint32_t> next = second;
+  next.push_back(7);
+  cache.beginRequest(3, KvMode::Spill);
+  require(cache.commitSpill(3, 13), "the next turn's commitment was refused");
+  const CacheLookup found = cache.lookup(next, {});
+  require(found.state && cache.restoreRequest(3, found).granted(), "the next turn did not restore the chain");
+  require(cache.spillWritten().granted(), "the spill was refused");
+  require(std::ranges::count_if(test::indexBlocks(cache, 3), [](uint64_t block) { return block != 0; }) == 7,
+          "the prefix waiting for its own copies held back the pages that had theirs");
+  cache.checkInvariants();
+  cache.endRequest(3);
+}
+
 } // namespace
 
 int main() {
@@ -1223,6 +1294,7 @@ int main() {
     testWriteThroughCopiesAreRestorePoints();
     testRecomputedChainsStayWhole();
     testCommittedPagesTakeTheSpilledChainOfAStateInRam();
+    testAPrefixWithoutOwnCopiesHoldsBackNoSpill();
     std::cout << "Persistent cache tests passed\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

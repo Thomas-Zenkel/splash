@@ -5358,6 +5358,35 @@ void testBlocksAreWrittenOnce() {
   spill.cache.endRequest(2);
 }
 
+// The copies a Spill request owes give back Full pages while the SSD cache
+// writes them, whichever is written first: its dense history's, whose pages
+// stay Full, and the owed copies after them free theirs. They count past the
+// Index pages free now, which the Full extents they empty fund. Nothing is on
+// its way back while no copy is written.
+void testOwedCopiesReturnWhileAnyIsWritten() {
+  // A dense history of four pages; one write at a time.
+  Spilling spill(CacheSpillPolicy{4, 1});
+  spill.tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = 1;
+  const std::vector<uint32_t> tokens = Spilling::prompt(1, 12);
+  spill.start(1, tokens, 12);
+  require(!spill.cache.owedCopiesReturn(1, kv::PageForm::Full),
+          "copies no write had started gave memory back");
+  require(spill.cache.writeThrough() == 1, "the first copy was not written");
+  // Seven of its pages spill once their copies land: past the dense history
+  // and before the window. Three Full pages are free, four Index pages.
+  require(spill.pool.freePageCount(kv::PageForm::Full) == 3 &&
+              spill.pool.freePageCount(kv::PageForm::Index) == 4,
+          "the pool did not hold the expected free pages");
+  require(spill.cache.owedCopiesReturn(10, kv::PageForm::Full) &&
+              !spill.cache.owedCopiesReturn(11, kv::PageForm::Full),
+          "the copies owed behind the dense history's gave back other than their pages");
+  require(!spill.cache.owedCopiesReturn(1, kv::PageForm::Index), "owed copies gave back Index pages");
+  spill.tier.complete();
+  static_cast<void>(spill.cache.pollTransfers());
+  spill.cache.endRequest(1);
+  spill.cache.checkInvariants();
+}
+
 // A Resident request that computes a chain on disk again keeps the blocks'
 // copies, which hold what another command computed, and writes nothing. A
 // Spill request that holds those blocks later owes copies of their pages,
@@ -5870,6 +5899,7 @@ int main() {
     testConversionSpillsTheHistoryWithCopiesAtOnce();
     testEveryHolderDecidesWhetherAPageSpills();
     testBlocksAreWrittenOnce();
+    testOwedCopiesReturnWhileAnyIsWritten();
     testRecomputedBlocksSpillToCopiesOfTheirPages();
     testUnreadableCopyLeavesWithItsHolders();
     testCutsShareUnchangedChunks();

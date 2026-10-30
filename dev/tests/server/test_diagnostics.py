@@ -296,6 +296,25 @@ class DiagnosticsTests(HarnessTestCase):
         )
         self.assertEqual(output.getvalue(), "")
 
+    def test_console_error_names_the_engines_resource_reason(self):
+        reason = (
+            "requests past 147449 tokens keep their KV on the SSD cache, "
+            "which takes no writes"
+        )
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as errors:
+            diagnostics.print_request(
+                {
+                    "outcome": "error",
+                    "error_code": "capacity_exhausted",
+                    "engine_reason": reason,
+                    "error_message": "private prompt",
+                }
+            )
+        self.assertRegex(
+            errors.getvalue(),
+            r"^\d{2}:\d{2}:\d{2} Error · capacity_exhausted · " + reason + "\n$",
+        )
+
     def test_concurrent_console_lines_stay_whole(self):
         # Status lines on stdout and errors on stderr, both on one unbuffered
         # file, as `python -u server.py > log 2>&1` or launchd writes them.

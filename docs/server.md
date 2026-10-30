@@ -616,7 +616,8 @@ what memory holds, as a dense target's is.
   waits while the others' copies land.
 - A spilling request writes each committed page once to the SSD cache. Once
   the copy has landed, the page keeps only its index, 24 KiB of the int8
-  page's 414 KiB. Its first 2,048 tokens, which rows with less history read
+  page's 414 KiB. Alone at the memory wall, it waits while its writes land
+  rather than fail. Its first 2,048 tokens, which rows with less history read
   whole, its last 64 pages and up to two prefill groups' pages still being
   written stay whole. The memory the pages free leaves with the extents they
   empty, all of them once every spilling request decodes, but one while a

@@ -691,6 +691,10 @@ private:
     bool pending = false;
     // Not memory but the SSD cache's quota of active KV (ResourceWait).
     bool diskQuota = false;
+    // The KV pages a refusal of pages lacked, of their form; none for the
+    // model's memory (Cache::owedCopiesReturn).
+    uint32_t pages = 0;
+    kv::PageForm form = kv::PageForm::Full;
   };
   // An allocation's last attempt, and what the engine knows about the memory
   // it could not get.
@@ -707,11 +711,12 @@ private:
   // running.
   [[nodiscard]] std::function<bool(const Denial &)>
   spillFallback(Request &request, const CacheLookup *restoring = nullptr);
-  // What a lane does about memory it could not get. Pending memory returns
-  // by itself: the lane waits. Otherwise a lane fails only when it is alone
-  // with nothing left to reclaim; while other lanes hold memory or the host
-  // refuses it, a running lane yields its memory and a lane being admitted
-  // waits.
+  // What a lane does about memory it could not get, the sooner way back
+  // first. Pending memory returns by itself: the lane waits. While other
+  // lanes hold memory or the host refuses it, a running lane yields its
+  // memory and a lane being admitted waits. Alone, a lane waits while the
+  // copies Spill requests owe give memory back as the SSD cache writes them,
+  // and fails only once nothing is left to reclaim or write.
   enum class Verdict : uint8_t { Wait, Yield, Fail };
   [[nodiscard]] Verdict judge(const Denial &denial, uint64_t requestId) const;
   [[nodiscard]] bool anotherResident(uint64_t requestId) const;

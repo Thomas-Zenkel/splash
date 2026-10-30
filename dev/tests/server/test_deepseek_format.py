@@ -253,6 +253,25 @@ class DsmlReadingTests(unittest.TestCase):
                     [call["function"]["name"] for call in calls], ["weather"]
                 )
 
+    def test_an_invoke_that_names_no_function_reads_as_its_text(self):
+        # As in Qwen's layout: an invoke without a name, or with one too long
+        # to be a name, is the text the model wrote, and a call after it in
+        # the block still reads.
+        for name in ("", "  ", "x" * (model_output.MAX_NAME_LENGTH + 1)):
+            text = dsml_calls((name, {"item": "x"}), ("time", {}))
+            for size in (None, 1, 5):
+                with self.subTest(name=name[:8], size=size):
+                    content, calls, events = project(
+                        text, tool_policy(SCHEMAS), size=size, syntax=DEEPSEEK_DSML
+                    )
+                    self.assertEqual(
+                        (content.strip(), streamed_text(events)),
+                        (dsml_call(name, {"item": "x"}), content),
+                    )
+                    self.assertEqual(
+                        [call["function"]["name"] for call in calls], ["time"]
+                    )
+
     def test_without_tools_a_block_is_text(self):
         text = "Here:" + dsml_calls(("weather", {"city": "Paris"}))
         projector = model_output.StreamingToolCallProjector(None, "x")

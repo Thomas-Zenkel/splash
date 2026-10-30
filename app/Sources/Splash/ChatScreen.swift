@@ -117,19 +117,23 @@ private struct ConversationView: View {
     @Environment(\.displayScale) private var displayScale
 
     var body: some View {
+        let shown = state.chats.current.flatMap { $0.messages.isEmpty ? nil : $0 }
         VStack(spacing: 0) {
-            if let conversation = state.chats.current, !conversation.messages.isEmpty {
+            if let conversation = shown {
                 TranscriptView(transcript: state.transcript, page: page(conversation))
                     // The line the window draws under its toolbar over a scroll view there, which
                     // a web view isn't to it.
                     .overlay(alignment: .top) { Rectangle().fill(.separator).frame(height: 1 / displayScale) }
-                footer
             } else {
                 // A new chat: the mark, showing what the Server does, over the composer.
                 Spacer()
                 StatusMark(look: state.markLook == .failed ? .off : state.markLook, since: state.server.since, size: 44)
                     .padding(.bottom, 28)
-                footer
+            }
+            // One composer either way, so that its text view, and what the input method composes
+            // in it, stays when a chat gets its first message or a new chat opens.
+            footer
+            if shown == nil {
                 Spacer()
                 Spacer()
             }
