@@ -523,7 +523,16 @@ windows (`gguf::TensorRows::windows`), so slice s's rows of each projection foll
 (`moe_group_routes_s2`, `moe_expert_gguf_m8_a_s2`); the softmax router's one gated slice is the
 unsuffixed instances. The expert passes launch the live tiles alone: the grouping kernel writes
 each pass's grid with the tile count, and the pass reads it as an indirect dispatch
-(`ComputeDispatch::indirectThreadgroups`). The staged tile runs gate and up in one pass, a gate
+(`ComputeDispatch::indirectThreadgroups`). They find a routed expert through the block's slot
+table and the chunks that hold its slots (`ops::ExpertChunks`): slot s below floor_slots is at
+place s of the floor chunk, chunk 0, and slot s from floor_slots on at place
+e - (c - 1) * chunk_slots of elastic chunk c = 1 + e / chunk_slots, where e = s - floor_slots (a
+branch uniform per threadgroup). The passes reach the chunks' regions through a table of
+`MOE_EXPERT_CHUNK_ADDRESSES` GPU addresses per chunk (`MoE.h`, `moe_expert_chunk`,
+[Residency](#residency-and-kv-extents)); a resident block's experts are one chunk of its routed
+planes, floor_slots = chunk_slots = its slots, a streamed block's the expert store's floor and
+elastic chunks of its size (`model/ExpertChunkLayout.hpp`,
+[Streamed experts](server.md#streamed-experts)). The staged tile runs gate and up in one pass, a gate
 and an up simdgroup on the same columns, bitwise the two passes' intermediate; the simdgroups
 share one pair table where gate and up share their routed and their shared formats.
 An expert's only tile of at most `MOE_GGUF_COLUMN_ROWS` live rows runs on the column tile
@@ -616,10 +625,18 @@ format's up and the prefill tiles, each output inside the fp64 bound of
 split, and one lane on the staged 16-row tile bitwise against the 8-row tile; and
 `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
 plan, the staged 8- and 32-row tiles and the Apple9 register tile whatever GPU runs it, each in
-every format it takes as each routed and shared expert tensor, against fp64, and bitwise against
-the full grids and two gate/up passes; `gguf-moe-e512` runs it at Qwen3.8-Flash-Next's 512
-experts and `gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated
-shared slices. The goldens and how to regenerate them are
+every format it takes as each routed and shared expert tensor, against fp64, bitwise against
+the full grids and two gate/up passes, and with the experts in permuted slots across a floor
+chunk and elastic chunks of other, few slots, the last of fewer, bitwise as in one chunk, and
+refuses floor and elastic chunks one unit short, a malformed chunk list or chunks made for
+another block; `gguf-moe-e512` runs all of it at Qwen3.8-Flash-Next's 512 experts and
+`gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated shared slices;
+and `expert-store`, streamed experts at four shapes bitwise against the resident ones, in loads
+of every kind, through a release and a restore, in a floor and three smaller elastic chunks,
+beside a size of one block, which the store reads whole into its floor
+chunk, and refuses a size its largest buffer holds in more than 48 chunks and a size of one
+block it does not hold; `expert-chunk-layout`, in `make test-engine-cpu`, checks the chunk
+layout rule itself. The goldens and how to regenerate them are
 in `dev/tests/fixtures/weight-goldens/`; with `SPLASH_GGML_ORACLE=<libggml-base.dylib>`,
 `gguf-reference` also compares the reference with GGML directly and prints GGML's hashes.
 
@@ -1001,6 +1018,23 @@ reclaims below, memory pressure among them. Memory returns to macOS when the
 engine releases it, never because macOS compressed or dropped an idle buffer.
 macOS page cache, driver allocations and other applications still affect memory
 pressure and swap.
+
+A buffer a dispatch binds is resident for it; one kernels reach by address is
+made resident in one of two ways. KV extents (`BufferReach::Addressed`) join
+the command queue's set, since nearly every command reads KV. A dispatch may
+instead list buffers in an address table (`metal::AddressTable`,
+`CommandGraph::addresses`): the backend writes their GPU addresses as it
+encodes the command, after the dispatch's parameters (`setBytes`, so at most
+512), and makes them resident from that dispatch to the end of its encoder
+(`useResources`, for reading, or reading and writing, declared once per table
+and usage in each encoder), never for the queue.
+The addresses are those of the buffers' memory when the command is encoded, so
+a buffer released and restored since (which comes back at another address) is
+reached where it is, and a table that reaches released memory is refused like
+a binding of it. The routed experts are reached this way, the expert store's
+chunks as a resident model's routed planes: a decode command reads few of
+them, and in the queue's set the 18 GiB of a streamed 35B's chunks made every
+command buffer wait for all of them, a decode cycle ten times longer.
 
 KV pages live in extents: ordinary shared Metal buffers of one size per pool,
 between half and one and a half times 128 MiB, in which every tensor region of

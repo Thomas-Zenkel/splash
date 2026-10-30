@@ -2,8 +2,8 @@
 
 // The order the slots of a store are recycled in, and which key each holds:
 // which slot a load's missing key takes, never one of a key the same load
-// uses. The stores are an expert arena (model::ExpertStore), whose keys are
-// experts, and a layer of the hot block cache of spilled K/V
+// uses. The stores are an expert size's slots (model::ExpertStore), whose
+// keys are experts, and a layer of the hot block cache of spilled K/V
 // (model::KvBlockCache), whose keys are blocks' tier copies. A load is a
 // number that grows from load to load; a long prefill chunk's (`chunk`)
 // routes nearly every expert of its block, a scan of them.

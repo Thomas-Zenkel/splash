@@ -7,14 +7,21 @@
 // resident and streamed experts run the same kernels.
 //
 // Experts of one size (the formats and shapes of their gate, up and down
-// projections) share an arena of slots, or several, each of some of its
-// blocks, when one would take more than the device's largest buffer. A size
-// of several blocks streams: an arena's slots are recycled across its blocks
-// by adaptive replacement (SlotRecycler), which keeps the experts decode steps
-// route again and again, and recycles a long prefill chunk's loads first. A
+// projections) share its slots, which chunks hold, each a buffer of its own
+// (ops::ExpertChunks, model/ExpertChunkLayout.hpp): the floor chunk holds the
+// size's floor, 0.85 of its slots (kExpertFloorShare), and elastic chunks of
+// about 1 GiB each the rest; the store keeps every chunk while it serves. The
+// kernels reach the chunks through their GPU addresses, which the backend
+// writes per dispatch and declares resident once per encoder
+// (metal::AddressTable); each chunk an encoder makes resident costs GPU time,
+// so they are few. A size of several blocks streams: its slots are
+// recycled across its blocks by adaptive replacement (SlotRecycler), which
+// keeps the experts decode steps route again and again, and recycles a long
+// prefill chunk's loads first. A
 // size of one block (a layer whose experts take formats no other layer's do, as a
-// dynamic quantization leaves some) holds every one of its experts: they are
-// read when the store is built or restored, and nothing loads them again.
+// dynamic quantization leaves some) holds every one of its experts, in its
+// floor chunk alone: they are read when the store is built or restored, and
+// nothing loads them again.
 //
 // A streamed block's load runs after its steps' grouping (ops::
 // MoeExpertStream), in rounds: each a host step of the command, which claims
@@ -45,7 +52,7 @@
 // are, reading what the readers had not (or failed to: a read ahead of an
 // expert no step routes is no failure).
 //
-// The arena and the staging are memory the engine gives back while idle
+// The chunks and the staging are memory the engine gives back while idle
 // (model::WeightMemory): released, every slot is free; a restore reads the
 // experts of the sizes of one block again, and the loads after it every
 // expert they route.
@@ -67,6 +74,7 @@
 // query never waits behind a command's reads.
 
 #include "metal/MetalBackend.hpp"
+#include "model/ExpertChunkLayout.hpp"
 #include "model/ExpertStoreStats.hpp"
 #include "model/GgufImage.hpp"
 #include "model/SsdReaders.hpp"
@@ -93,43 +101,55 @@ struct StreamedBlocks final {
 
 struct ExpertStoreOptions final {
   // Every byte the store allocates (--expert-memory): its staging and tables
-  // (ExpertStore::fixedBytes), and in the rest the arenas' slots, which hold
+  // (ExpertStore::fixedBytes), and in the rest the chunks' slots, which hold
   // at least a block's experts of each size and all of a size of one block.
   uint64_t memoryBytes = 0;
   // The readers its reads run on: the engine's one pool, which the other
   // streamed weights and KV reads share.
   std::shared_ptr<SsdReaders> readers;
-  // The most bytes one arena takes: the device's largest buffer
-  // (maxBufferLength) when zero or more.
+  // The most bytes one chunk takes, the floor chunk too: the device's
+  // largest buffer (maxBufferLength) when zero or more. A streamed size whose
+  // slots it holds only in more than MOE_EXPERT_MAX_CHUNKS chunks, and a
+  // size of one block whose experts it does not hold, are refused
+  // (streamedExpertChunkLayout, wholeExpertChunkLayout).
   uint64_t bufferBytes = 0;
+  // About the most bytes a streamed size's elastic chunk takes, unless the
+  // size needs larger ones to fit the expert kernels' table
+  // (streamedExpertChunkLayout).
+  uint64_t elasticChunkBytes = kExpertElasticChunkBytes;
 };
 
 class ExpertStore final : public ops::MoeExpertStream, public WeightMemory {
 public:
-  // Allocates the arenas, the staging and the slot tables, and reads the
+  // Allocates the chunks, the staging and the slot tables, and reads the
   // experts of the sizes of one block. Throws std::invalid_argument when a
-  // block's experts differ from `shape`, or when options.memoryBytes, less
+  // block's experts differ from `shape`, when options.memoryBytes, less
   // the staging and tables (fixedBytes), holds fewer slots than a block's
-  // experts of each streamed size and every expert of a size of one block.
+  // experts of each streamed size and every expert of a size of one block,
+  // when a streamed size's slots would take more than MOE_EXPERT_MAX_CHUNKS
+  // chunks of the largest buffer (options.bufferBytes or the device's
+  // maxBufferLength), or when a size of one block's experts take more than
+  // it.
   ExpertStore(metal::MetalBackend &backend, StreamedBlocks blocks, ops::MoeShape shape, ExpertStoreOptions options);
   ~ExpertStore() override;
   ExpertStore(const ExpertStore &) = delete;
   ExpertStore &operator=(const ExpertStore &) = delete;
 
-  // Block `block`'s routed segments (views of its size's arena) and slot
-  // table, which `weights` reads them through, and, when its experts stream,
-  // the store, which loads them; the store keeps the block's router and
-  // shared-expert gate, set before, which predict its routes.
+  // Block `block`'s routed segments (the format and size of its size's
+  // slots), chunks and slot table, which `weights` reads them through, and,
+  // when its experts stream, the store, which loads them; the store keeps the
+  // block's router and shared-expert gate, set before, which predict its
+  // routes.
   void bind(uint32_t block, ops::BlockMoeWeights &weights);
   void addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLoadPart> parts, uint32_t block) const override;
   [[nodiscard]] ExpertStoreStats stats() const;
-  // The arena and the staging, while no command is in flight; restore()
-  // takes both back in one part and reads the experts of the sizes of one
-  // block again.
+  // The chunks and the staging, while no command is in flight; restore()
+  // takes them all back in one part and reads the experts of the sizes of
+  // one block again.
   [[nodiscard]] bool released() const noexcept override;
   void release() override;
   [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override;
-  // The bytes a store of these blocks allocates besides its arenas: its
+  // The bytes a store of these blocks allocates besides its chunks: its
   // staging, slot tables, jobs and the decode prediction's buffers.
   [[nodiscard]] static uint64_t fixedBytes(const StreamedBlocks &blocks, ops::MoeShape shape);
   // The smallest store of these blocks (ExpertStoreOptions::memoryBytes),

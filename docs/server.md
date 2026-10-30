@@ -363,7 +363,8 @@ expert, as a SIZE that holds them all does.
   passes run. A decode step's load is one such round; a prefill command's
   loads take as many rounds as its rows may route experts, each staging half
   of the staging while the other half is read ahead. The kernels read every
-  routed expert through the layer's slot table, so resident and streamed
+  routed expert through the layer's slot table and the chunks that hold its
+  slots, so resident experts, one chunk of every expert, and streamed
   experts run the same kernels.
 - An expert's rows a GGUF stores as they are are read straight into the
   staging (`F_NOCACHE`, widened to whole 16 KiB pages, which the kernel reads
@@ -378,9 +379,23 @@ expert, as a SIZE that holds them all does.
   expert no load routes may fail without failing anything. A decode step
   loads and predicts only the experts its lanes' verify rows route
   ([Drafts](models.md#drafts)); the selector writes those rows before the step's load.
-- Experts of one format share an arena of slots; when it would take more than
-  the device's largest buffer (`maxBufferLength`), their layers are split
-  between arenas that each fit, each recycling its own slots.
+- Experts of one format share their slots, held in chunks, each a buffer of
+  its own of at most the device's largest buffer (`maxBufferLength`). One
+  chunk holds each format's floor, 0.85 of its slots by default; the rest lie
+  in chunks of about 1 GiB (more where they would take more than 47, since the
+  expert kernels' address table holds at most 48 chunks), the last of fewer
+  slots. The store keeps every chunk while it serves. The kernels reach the
+  chunks through their GPU addresses, which the backend writes for each expert
+  dispatch as it encodes the command, and makes them resident for that
+  dispatch's encoder rather than for every command on the queue
+  ([Residency](internals.md#residency-and-kv-extents)). Chunks are few
+  because each one a decode encoder makes resident costs GPU time: 36 chunks
+  of about 512 MiB cost a streamed decode cycle 2.3% of its GPU time on the
+  M5 Max, about 0.065% a chunk. A format has about one elastic chunk per
+  6.7 GiB of its slots (0.15 of them, in chunks of about 1 GiB), so the
+  Studio's 17.2 GiB Flash-Next store, a floor and 3 elastic chunks, costs about
+  0.25%. A size of one block (layers in formats of their own) is one chunk of
+  every expert.
 - A decode step's loads keep the GPU awake through their host steps
   ([Host steps](internals.md#host-steps)), so the work after a load starts at once and at
   full clocks rather than after the GPU's wake-up.
@@ -397,12 +412,13 @@ expert, as a SIZE that holds them all does.
   a file was written) fails its command, and every later load fails too.
 - The store's memory is released while idle with the weights and restored
   with them ([Weight loading](internals.md#weight-loading)).
-- `/status` reports the store under `streamed_experts`: its arena and
-  staging bytes, slots, its experts and those resident; per use (`prefill`,
-  `decode`) its loads, the distinct experts they routed, those read and of
-  them those read ahead, the experts read ahead whole, the hit rate, the bytes
-  read and the host steps' round trips, one per round (`host_steps`:
-  `pickup_ms`, `work_ms`, `resume_ms`); and the `failure` that stopped it.
+- `/status` reports the store under `streamed_experts`: its chunks' bytes
+  (`arena_bytes`) and staging bytes, slots, its experts and those resident;
+  per use (`prefill`, `decode`) its loads, the distinct experts they routed,
+  those read and of them those read ahead, the experts read ahead whole, the
+  hit rate, the bytes read and the host steps' round trips, one per round
+  (`host_steps`: `pickup_ms`, `work_ms`, `resume_ms`); and the `failure` that
+  stopped it.
 
 ### KV cache precision
 

@@ -88,11 +88,12 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
   // An ungated block's weights carry no scalar gate.
   const QuantizedSegment sharedGateSegment =
       shape.sharedGate ? floatSegment(backend, sharedGate, 1, H) : QuantizedSegment{};
-  const BlockMoeWeights gguf{routerSegment, sharedGateSegment,
-                             {planes(gateUpFormat, E * I, H), planes(sharedFormat, shape.sharedSlices * I, H)},
-                             {planes(gateUpFormat, E * I, H), planes(sharedFormat, shape.sharedSlices * I, H)},
-                             {planes(downFormat, E * H, I), planes(sharedFormat, shape.sharedSlices * H, I)},
-                             splash::model::residentExpertSlots(backend, E), E};
+  BlockMoeWeights gguf{routerSegment, sharedGateSegment,
+                       {planes(gateUpFormat, E * I, H), planes(sharedFormat, shape.sharedSlices * I, H)},
+                       {planes(gateUpFormat, E * I, H), planes(sharedFormat, shape.sharedSlices * I, H)},
+                       {planes(downFormat, E * H, I), planes(sharedFormat, shape.sharedSlices * H, I)},
+                       splash::model::residentExpertSlots(backend, E), E};
+  gguf.chunks = splash::ops::residentExpertChunks(gguf);
   // Rows whose expert e scores 4 x[e]: the first E inputs rank the experts, the row's routes at 1 - 0.05 rank and the
   // others below 0.05.
   const auto input = [&](uint32_t rows, Routing routing) {
