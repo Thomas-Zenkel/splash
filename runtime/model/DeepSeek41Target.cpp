@@ -30,6 +30,14 @@ constexpr uint32_t kLanes = ExecutionLimits::maximumBatchWidth;
 // read and write inside the chunk's buffers.
 constexpr uint32_t kLayerTile = 256;
 static_assert(kPrefillRows % kLayerTile == 0, "a prefill chunk is whole tiles");
+// The rows of a prefill's indexer layer between host steps. Metal fails a
+// wait still unmet 5 s after its queue reached it (MetalBackend.hpp), and an
+// indexer's scores of every group grow with the context: at 60K tokens a
+// layer's attention of a command's 8192 rows took 2.5 s on an M4 Pro, and
+// past 5 s while it was hot. Two tiles take a sixteenth of that, and a
+// command's 16 steps a layer keep its buffers within the queue's.
+constexpr uint32_t kIndexerStepRows = 2 * kLayerTile;
+static_assert(kPrefillRows % kIndexerStepRows == 0, "a prefill chunk is whole indexer steps");
 constexpr uint32_t kLatent = LATENT_ATTENTION_DIM;
 
 template <class T> T *contents(const metal::MetalBuffer &buffer) { return static_cast<T *>(buffer.contents()); }
@@ -508,6 +516,10 @@ void DeepSeek41Target::addAttention(metal::CommandGraph &graph, const Scratch &s
     }
     project(graph, s.joined, layer.outputB, decode ? s.branch : fromRow(s.branch, begin, hidden, 2), n, decode, lanes,
             linear);
+    // A prefill's indexer layer waits for the host after each
+    // kIndexerStepRows of a chunk's rows: the work before a wait is a
+    // sixteenth of a command's.
+    if (!decode && layer.indexer && (begin + n) % kIndexerStepRows == 0) graph.host([] {});
   }
   if (!decode)
     for (const Rows &sequence : sequences) {

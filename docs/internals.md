@@ -796,7 +796,11 @@ follows:
   groups after its retained rows from the step's latents and projections.
 - A prefill runs a layer's queries, attention and output projections in tiles
   of 256 rows, each sequence's rows of a tile through its indexer in pieces
-  whose scores of every group fit 64 MiB. A step of more than 16 rows
+  whose scores of every group fit 64 MiB. Its indexer layers wait for the
+  host after every 512 rows of a chunk: their scores grow with the context,
+  and a layer's attention of a command's 8192 rows at 60K tokens took 2.5 s
+  on an M4 Pro and past Metal's 5 s bound on a wait while it was hot
+  ([Host steps](#host-steps)). A step of more than 16 rows
   multiplies each row's 64 heads by its keys, and their weights by the keys'
   values, in 8x8 simdgroup matrices (`latent_attention_scores_mma`,
   `latent_attention_values_mma`: bf16 products and fp32 weights summed in
