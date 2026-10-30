@@ -284,7 +284,8 @@ public:
                     const Projection *gate = nullptr) const;
 
   // The projections of `rows` rows through their own matrix. `scratch` holds
-  // the partials and counters of split plans (chunks of up to 32 rows);
+  // the partials and counters of split plans (the chunks the staged tile
+  // runs: up to 32 rows, on Apple10 up to kMaximumStagedPrefillRows);
   // reused serially within one command stream, as in decode.
   void addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
                   metal::MetalBuffer output, uint32_t rows, LinearScratch scratch = {}) const;

@@ -434,7 +434,10 @@ per core unsplit, in four or eight partitions) the 16-row tile takes 4-36% more 
 stages), against 2-8% less at 4 to 20 threadgroups per core on the M6 and 7% less to 2% more on
 the 27B's 5120-column projections in four on the M5 Max. Q4_K's 4.5 bits take more time on it on
 the M6. Prefill runs the staged kernels on both families: the 128-row prefill tile
-(`LinearTile::GgufPrefill`), and the staged tile for chunks of up to 32 rows.
+(`LinearTile::GgufPrefill`), and the staged tile for chunks of up to 32 rows. On Apple10 chunks of
+33 to 64 rows run the staged tile's 64-row height too, which reads the weights once where the prefill
+tile costs about as much for 33 rows as for 64; a fused projection's chunk runs its segments there in
+one dispatch, as decode does.
 
 Apple10's staged tile splits K across threadgroups, and runs a gate/up pair in one pass or two,
 by one wave law (`apple10Staged` in `runtime/ops/LinearGguf.cpp`), for decode steps and short
@@ -578,7 +581,8 @@ up in one pass `gguf_decode_<format>_m<rows>_gate_up`, and
 leading inputs of wider rows), the register ones `gguf_decode_sg_<format>_l<lanes>_<e>`, and the
 experts `moe_expert_gguf_m<rows>_<e>` and `moe_expert_gguf_sg_<e>`, with gate and up in one pass
 `moe_expert_gguf_m<rows>_gate_up`; the fused projections run
-`gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode, and in prefill one
+`gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode and, on Apple10, in
+prefill chunks of 33 to 64 rows (`gguf_decode_fused_m64`), and in longer prefill chunks one
 `gguf_prefill_<format>_a` per format over that format's segments. The norm, GDN,
 attention-gate and attention-gather variants that also write the register kernels' input
 table carry `table16` in their names. The epilogue kinds of both GGUF families are in
@@ -628,7 +632,7 @@ staged 16-row tile, `staged16`; a gate/up pair on the staged tile in two passes,
 the walks spread also in one, `pair` and `pair16`) and every K split, and marks the device policy's
 pick; widths emulate core counts, since the policy counts threadgroups per core. Or, with a trailing
 `prefill=R[,R...]` after the epilogue and the round count, one format's 128-row prefill tile at each
-chunk of `R` rows (more than 32); the formats `float-bf16` and `float-f32`, and `float-<format>` for
+chunk of `R` rows (more than 32), and for `R` up to 64 the staged 64-row tile at every K split; the formats `float-bf16` and `float-f32`, and `float-<format>` for
 a quantized format's native rows (such as `float-af8g64`), time the float projection
 (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles instead, marking
 `Linear::ggufFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape,

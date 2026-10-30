@@ -184,8 +184,8 @@ struct DFlashWindowCapture final {
 
 struct DFlashPrefillBuffers final {
   metal::MetalBuffer capturedTargetHidden;
-  // The split partials and counters of the context projections' chunks of
-  // up to a decode batch (Linear::addPrefill).
+  // The split partials and counters of the context projections' chunks the
+  // staged tile runs (Linear::addPrefill).
   ops::LinearScratch linearScratch;
   metal::MetalBuffer projected;
   metal::MetalBuffer hidden;

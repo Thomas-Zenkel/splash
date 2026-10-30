@@ -1314,6 +1314,12 @@ int main(int argc, char **argv) {
       constexpr std::array<uint32_t, 2> resumeContexts{2048, 32768};
       constexpr std::array<uint32_t, 8> resumeSuffixes{4, 19, 31, 32, 35, 47, 55, 63};
       for (const uint32_t context : resumeContexts) {
+        // The longest resume, and the token it generates, past what the
+        // memory plan holds on a Mac with less memory.
+        if (context + 1 + resumeSuffixes.back() + 1 >= engineConfig.maxContext) {
+          skippedLengths.push_back(context);
+          continue;
+        }
         const std::vector<uint32_t> seed = prompt(context + 1, uint64_t{context} << 32 | 0x524553554dULL);
         evictAllCache(resources->cache());
         const Measurement seeded = runRequest(engine, driver, *executor, events, progress.get(), requestId++,

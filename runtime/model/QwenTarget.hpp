@@ -261,7 +261,7 @@ struct QwenTargetPrefillSequence final {
 };
 
 struct QwenTargetPrefillBuffers final {
-  // Split projections of chunks of up to 32 rows (LinearGguf.cpp).
+  // Split projections of the chunks the staged tile runs (LinearGguf.cpp).
   ops::LinearScratch linearScratch{};
   std::array<metal::MetalBuffer, 2> hidden;
   metal::MetalBuffer normalized;

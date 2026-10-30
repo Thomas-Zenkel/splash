@@ -189,7 +189,7 @@ uint64_t gateBytes(const LinearPlan &plan) {
 
 // GGUF projections plan with their segments: the staged split policy for
 // every projection kind, exact split scratch over the tile's rows, and
-// prefill tiles of 8, 16, 32 or 128 rows.
+// prefill tiles of 8, 16, 32, 64 (Apple10) or 128 rows.
 void ggufPlans() {
   const Linear linear = gpu(10, 16);
   // A block projection without segments would reach the dispatch paths with

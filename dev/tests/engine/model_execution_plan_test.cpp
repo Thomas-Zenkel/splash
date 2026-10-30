@@ -160,7 +160,7 @@ void checkGateUpLayers() {
               "the arenas are below a gate/up pair in two formats");
     }
     const auto sizes = model::prefillTensorBytes(geometry, plans);
-    for (uint32_t rows : {1U, 8U, 17U, 32U}) {
+    for (uint32_t rows : {1U, 8U, 17U, 32U, 33U, 48U, 64U}) {
       const auto required = plans.linear().plan({{up.outputSize, up.inputSize}, rows,
           ops::LinearPhase::Prefill, ops::LinearEpilogue::None}, up).scratchSize();
       require(sizes[uint32_t(model::PrefillTensor::LinearPartials)] >= required.partials &&

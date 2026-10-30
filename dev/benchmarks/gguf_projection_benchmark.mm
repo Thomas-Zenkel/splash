@@ -6,7 +6,8 @@
 //                             [prefill=R[,R...]]
 // The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 64
 // columns. With prefill=, it times the 128-row prefill tile instead, one case per chunk of R rows (more than 32: the
-// decode tiles run the smaller chunks) of a single segment, and for R up to 64 the staged 64-row tile at every K split; gateup is then the up projection's gated epilogue. The
+// decode tiles run the smaller chunks) of a single segment, and for R up to 64 the staged 64-row tile at every K
+// split; gateup is then the up projection's gated epilogue. The
 // weights stay DRAM-cold: a command streams every copy of a ring of at least 384 MiB once, each projection with the
 // next copy (decode gate/up: the gate and up weights of two copies). The register tile reads the activation table its
 // producers write alongside their output (LinearBuffers::prepared), prepared once and not timed. The cases run in

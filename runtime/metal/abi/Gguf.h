@@ -12,8 +12,9 @@
 // counts column tiles), and an expert tile the grouped rows of one MoE expert.
 #define GGUF_TILE_COLUMNS 64u
 // Decode tile of the staged kernels, which also runs prefill chunks of up to
-// 32 rows: two simdgroups, each staging its own GGUF_STAGED_COLUMNS columns
-// GGUF_STAGED_STEP inputs at a time over 8, 16 or 32 rows.
+// 32 rows (64 on Apple10): two simdgroups, each staging its own
+// GGUF_STAGED_COLUMNS columns GGUF_STAGED_STEP inputs at a time over 8, 16,
+// 32 or 64 rows.
 #define GGUF_STAGED_COLUMNS 32u
 #define GGUF_STAGED_STEP 32u
 #define GGUF_STAGED_THREADS (GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS * 32u)
@@ -78,7 +79,8 @@ static_assert(sizeof(GgufPrefillSegmentsParams) == 36, "GGUF segmented prefill p
 
 // Decode tiles: the register tile, which Apple9 runs but for the projections
 // it stages (ops/LinearGguf.cpp, apple9Stages), and the staged tile, which
-// runs every other decode and prefill chunks of up to 32 rows. One tensor per
+// runs every other decode and prefill chunks of up to 32 rows (64 on
+// Apple10). One tensor per
 // dispatch, over the dispatch's tiles (grid.x) and K partitions (grid.y).
 struct GgufDecodeParams {
   uint32_t input_size;  // K
