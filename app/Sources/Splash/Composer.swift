@@ -308,8 +308,12 @@ private struct ComposerField: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.field = self
         guard let view = scroll.documentView as? MessageTextView else { return }
-        if view.string != text {
-            // A change made here, sending the message, is no edit to undo.
+        // Only a change made elsewhere, as sending the message clears it, goes to the view: the
+        // view's own edits are in `text` already, and what the input method composes is in the
+        // view alone until it is committed.
+        if text != context.coordinator.published {
+            context.coordinator.published = text
+            // A change made here is no edit to undo.
             view.string = text
             context.coordinator.undo.removeAllActions()
             context.coordinator.measure(view)
@@ -324,6 +328,8 @@ private struct ComposerField: NSViewRepresentable {
     final class Coordinator: NSObject, NSTextViewDelegate {
         var field: ComposerField
         var focusRequests = 0
+        /// The text the view and the draft last agreed on.
+        var published = ""
         /// The field's own edits, which a message sent clears.
         let undo = UndoManager()
 
@@ -335,6 +341,7 @@ private struct ComposerField: NSViewRepresentable {
 
         func textDidChange(_ notification: Notification) {
             guard let view = notification.object as? NSTextView else { return }
+            published = view.string
             field.text = view.string
             measure(view)
         }
