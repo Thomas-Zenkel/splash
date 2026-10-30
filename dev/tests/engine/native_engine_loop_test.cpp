@@ -89,11 +89,11 @@ struct PoolShape {
 
 // A native loop over the fake model, collecting the bytes it writes. Its
 // config is completed with the engine's (test::engineConfig), and the
-// fixture's metrics and weights, each weight allocation admitted
-// (test::admitAll), where the test gave none; the weights' idle release is
-// production's unless the test gives one. Its unix clock stands
-// still and its awake clock reads `monotonic`, advanced by `clockStep` on
-// every read.
+// fixture's metrics and weights, each weight allocation admitted, the
+// optional growth too (test::admitAll), where the test gave none; the
+// weights' idle release is production's unless the test gives one. Its unix
+// clock stands still and its awake clock reads `monotonic`, advanced by
+// `clockStep` on every read.
 struct LoopFixture {
   explicit LoopFixture(NativeLoopConfig config = {}, PoolShape shape = {},
                        protocol::ProtocolLimits limits = {},
@@ -124,6 +124,8 @@ struct LoopFixture {
       config.weights = &weights;
     if (!config.weightAdmission)
       config.weightAdmission = test::admitAll;
+    if (!config.growthAdmission)
+      config.growthAdmission = test::admitAll;
     config.unixMicros = [] { return uint64_t{1'000'000}; };
     config.monotonicMilliseconds = [this] { return monotonic += clockStep; };
     return config;
@@ -768,7 +770,7 @@ void testInvalidLimitsAreRejectedAtConstruction() {
 // The loop refuses a config without the metrics, the weights or their
 // admission the bootstrap always gives it; each case lacks one of them.
 void testLoopNeedsItsComponents() {
-  for (const int lacking : {0, 1, 2}) {
+  for (const int lacking : {0, 1, 2, 3}) {
     test::TestKvStorage storage(8, 4096, 4);
     KvPool pool(storage, 8);
     engine::Cache cache(pool, nullptr, nullptr);
@@ -778,13 +780,14 @@ void testLoopNeedsItsComponents() {
     NativeLoopConfig config{.engine = test::engineConfig(),
                             .metrics = lacking == 0 ? nullptr : &runtimeMetrics,
                             .weights = lacking == 1 ? nullptr : &weights,
-                            .weightAdmission = lacking == 2 ? nullptr : test::admitAll};
+                            .weightAdmission = lacking == 2 ? nullptr : test::admitAll,
+                            .growthAdmission = lacking == 3 ? nullptr : test::admitAll};
     rejects([&] {
       engine::NativeRuntime(std::move(config), metal::kResidencyKeepAliveSeconds, cache,
                             executor, [](std::span<const uint8_t>) {},
                             test::readyStatusJson, protocol::ProtocolLimits{});
     }, "the native engine loop lacks a component it needs",
-            "a loop without its metrics, its weights or their admission was built");
+            "a loop without its metrics, its weights or their admissions was built");
   }
 }
 
@@ -1662,7 +1665,7 @@ void testReleasableMemoryRestoresTheExpertsAfterTheImages() {
     uint32_t restores = 0;
     [[nodiscard]] bool released() const noexcept override { return !held; }
     void release() override { held = false; }
-    bool restore(const metal::AllocationAdmission &) override {
+    bool restore(const metal::AllocationAdmission &, const metal::AllocationAdmission &) override {
       require(!held, "a held arena was restored");
       held = true;
       ++restores;
@@ -1678,12 +1681,14 @@ void testReleasableMemoryRestoresTheExpertsAfterTheImages() {
   require(memory.released() && weights.released() && experts.released(),
           "the release kept the images or the arena");
   for (uint32_t image = 0; image < Weights::kImages; ++image)
-    require(!memory.restore(admit) && experts.released(), "the arena came back before the last image");
+    require(!memory.restore(admit, admit) && experts.released(),
+            "the arena came back before the last image");
   require(!weights.released() && memory.released(), "the restore ended without the arena");
-  require(memory.restore(admit) && !memory.released() && experts.restores == 1,
+  require(memory.restore(admit, admit) && !memory.released() && experts.restores == 1,
           "the arena did not come back in one restore after the images");
   memory.release();
-  require(!memory.restore(admit) && weights.held() == 1, "a restore did not write the first image back");
+  require(!memory.restore(admit, admit) && weights.held() == 1,
+          "a restore did not write the first image back");
   memory.release();
   require(weights.held() == 0 && experts.released() && experts.restores == 1,
           "a release during a restore kept what came back");
@@ -2076,6 +2081,554 @@ void testMemoryStatusReporterLogsTransitionsOnly() {
           "requests held behind a refusal were reported as no wait");
 }
 
+// Ticks until no command is in flight, where the transport runs the control
+// pass.
+void settleCommand(engine::NativeRuntime &loop) {
+  for (uint32_t step = 0; step < 8 && loop.commandInFlight(); ++step)
+    static_cast<void>(loop.tick());
+  require(!loop.commandInFlight(), "the command in flight did not complete");
+}
+
+// A control pass the policy asks nothing of takes back one chunk of the
+// expert store toward its cap while memory is ample: the host has the
+// recovery margin to spare beyond the chunk, or the idle engine returns the
+// rest to the system first, no request waits for memory, the weights are
+// neither released nor being restored, and the cool-down after reclaim last
+// gave a chunk back has passed. Beside a resident lane it takes only room
+// the engine's limit has free, and asks for none it lacks.
+void testControlPassGrowsTheExpertStoreWhenMemoryIsAmple() {
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
+  Executor &executor = fixture.executor;
+  loop.announceReady();
+  constexpr uint64_t chunk = 1ULL << 30;
+  executor.expertChunks = {chunk};
+  executor.releasedExpertChunks = {chunk, chunk, chunk};
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  constexpr uint64_t hostReserve = 2ULL << 30;
+  constexpr uint64_t limit = 40ULL << 30;
+  // Half the chunk short of the recovery margin, which the empty extents
+  // the idle engine returns do not cover.
+  std::optional<uint64_t> available = hostReserve + kHostRecoveryMarginBytes + chunk / 2;
+  MemoryGovernor governor(backend, limit, hostReserve, hostReserve,
+                          [&available] { return hostMemory(available); }, 0);
+  MemoryControl control(governor, backend, loop);
+  const auto pass = [&](double elapsed = 0.0) {
+    fixture.monotonic += elapsed;
+    require(!control.run(MemoryPressure::Normal), "a pass waited for a transfer");
+    return executor.expertChunks.size();
+  };
+  require(pass() == 1 && executor.expertGrowthAttempts == 0,
+          "the store grew without the recovery margin to spare beyond its chunk");
+  available = hostReserve + (16ULL << 30);
+  require(pass() == 2, "a pass with memory to spare did not take one chunk back");
+
+  // A request waiting for memory holds the growth back.
+  executor.beginGrowthBlocked = [] { return true; };
+  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  require(loop.receive(protocol::peer::serialize(request(1))) && !loop.tick() &&
+              loop.resourceWaitSnapshot().memory == 1,
+          "the request did not wait for memory");
+  require(pass() == 2, "the store grew while a request waited for memory");
+  executor.beginGrowthBlocked = {};
+  fixture.monotonic += 2 * engine::kResourceRetryBackoffMilliseconds;
+  runUntilIdle(loop);
+
+  // Beside a resident lane only room the engine's limit has free.
+  auto running = request(2, 900);
+  for (uint32_t &token : running.promptTokens)
+    token += 200;
+  fixture.executor.decodeFinishes = false;
+  require(loop.receive(protocol::peer::serialize(running)), "the long request failed");
+  for (uint32_t step = 0; step < 8; ++step)
+    static_cast<void>(loop.tick());
+  settleCommand(loop);
+  require(fixture.executor.requests.contains(2) && fixture.executor.requests.at(2).resident,
+          "the long request did not decode");
+  test::metalStatistics().allocatedBytes = limit - chunk / 2;
+  const uint32_t attempts = executor.expertGrowthAttempts;
+  require(pass() == 2 && executor.expertGrowthAttempts == attempts,
+          "growth beside a resident lane asked for room the engine's limit lacked");
+  test::metalStatistics().allocatedBytes = limit - 2 * chunk;
+  require(pass() == 3, "growth beside a resident lane did not take free room");
+  test::metalStatistics().allocatedBytes = 0;
+  fixture.executor.decodeFinishes = true;
+  runUntilIdle(loop);
+
+  // A host short of the warning margin takes a chunk back; the store grows
+  // again only once the cool-down after it has passed.
+  available = hostReserve + kHostWarningMarginBytes / 2;
+  require(pass() == 2 && loop.expertReleases() == 1,
+          "a short host did not take a chunk of the store");
+  available = hostReserve + (16ULL << 30);
+  require(pass(1000.0) == 2 && pass(kExpertGrowthCooldownMilliseconds - 1001.0) == 2,
+          "the store grew back within the cool-down after a chunk went");
+  require(pass(1.0) == 3, "the store did not grow back after the cool-down");
+
+  // Released weights hold the growth back, until their restore is over.
+  executor.releasedExpertChunks.push_back(chunk);
+  executor.expertChunks.pop_back();
+  require(!releaseAnswer(fixture, 9).restoring && fixture.weights.released(),
+          "the weights were not released");
+  require(pass() == 2, "the store grew while the weights were released");
+  require(loop.receive(protocol::peer::serialize(request(3))) && loop.tick() &&
+              fixture.weights.released() && pass() == 2,
+          "the store grew while the weights were being restored");
+  runUntilIdle(loop);
+  require(!fixture.weights.released() && pass() == 3,
+          "the store did not grow once the weights were back");
+}
+
+// A conversation that finishes leaves its replay point, and a prompt of its
+// own shares no prefix with another's.
+void finishConversation(LoopFixture &fixture, uint64_t id) {
+  auto input = request(id);
+  for (uint32_t &token : input.promptTokens)
+    token += static_cast<uint32_t>(100 * id);
+  require(fixture.loop.receive(protocol::peer::serialize(input)), "a conversation failed");
+  runUntilIdle(fixture.loop);
+}
+
+// The pool of the exchange tests: extents of two pages, one allocated up
+// front as the runway, and chunks of the expert store of two extents' bytes.
+constexpr PoolShape kExchangePool{.pages = 64, .extentPages = 2, .runwayPages = 2};
+constexpr uint64_t kExchangeExtentBytes = 2 * 4096;
+constexpr uint64_t kExchangeChunkBytes = 2 * kExchangeExtentBytes;
+
+// With no request in the engine, a control pass whose host's headroom lacks
+// a chunk of the expert store beyond the recovery margin exchanges cache for
+// it: the engine returns the cache nothing in use holds to the system,
+// releasing the extents it empties, until what it returned covers the
+// chunk, and keeps the resume point; the governor's growth admission counts
+// those bytes as the host's already and admits the chunk, which the host's
+// headroom alone does not. One chunk comes back per pass. Without such
+// cache none does.
+void testIdleControlPassExchangesCacheForTheExpertStore() {
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  LoopFixture fixture(config, kExchangePool);
+  engine::NativeRuntime &loop = fixture.loop;
+  Executor &executor = fixture.executor;
+  const engine::Cache &resources = fixture.cache;
+  const KvPool &pool = fixture.pool;
+  loop.announceReady();
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  constexpr uint64_t hostReserve = 2ULL << 30;
+  constexpr uint64_t chunk = kExchangeChunkBytes;
+  // Between the warning margin and the recovery margin.
+  const std::optional<uint64_t> available =
+      hostReserve + kHostWarningMarginBytes + kHostWarningMarginBytes / 2;
+  MemoryGovernor governor(backend, 40ULL << 30, hostReserve, hostReserve,
+                          [&available] { return hostMemory(available); }, 0);
+  MemoryControl control(governor, backend, loop);
+  executor.expertAdmission = governor.growthAdmission();
+  executor.expertChunks = {chunk};
+  executor.releasedExpertChunks = {chunk, chunk};
+  const auto pass = [&] {
+    require(!control.run(MemoryPressure::Normal), "a pass waited for a transfer");
+    return executor.expertChunks.size();
+  };
+  require(pass() == 1 && executor.expertGrowthAttempts == 0 &&
+              pool.snapshot().allocatedBytes == kExchangeExtentBytes,
+          "the store grew with no cache to return for it, or the runway extent went");
+
+  for (uint64_t id = 1; id <= 6; ++id)
+    finishConversation(fixture, id);
+  const auto before = resources.snapshot();
+  const uint64_t buffers = executor.reclaimedIdleStateBytes;
+  require(pass() == 2 && executor.releasedExpertChunks.size() == 1,
+          "an idle pass did not exchange cache for one chunk of the store");
+  const auto after = resources.snapshot();
+  const uint64_t extents = before.pool.allocatedBytes - after.pool.allocatedBytes;
+  require(extents + executor.reclaimedIdleStateBytes - buffers >= chunk && extents <= chunk &&
+              after.pool.extentReleases > before.pool.extentReleases &&
+              after.stateCache.entries < before.stateCache.entries,
+          "the exchange did not release about a chunk of cache to the system");
+  require(!governor.growthAdmission()(chunk, [] {}),
+          "the host's headroom alone admitted the chunk, or the exchange's credit outlived it");
+  require(pass() == 3 && pass() == 3, "the store did not grow a chunk per pass up to its cap");
+  const uint64_t releases = pool.snapshot().extentReleases;
+  require(pass() == 3 && pool.snapshot().extentReleases == releases,
+          "a store at its cap took cache");
+  const uint64_t hits = loop.snapshot().cacheHits;
+  finishConversation(fixture, 6);
+  require(loop.snapshot().cacheHits == hits + 1,
+          "the newest conversation did not resume from the state the exchange kept");
+}
+
+// The exchange waits where the store's growth does: beside a resident
+// request, which takes only the host's headroom beyond the margin, while a
+// request waits for memory, within the cool-down after a chunk went, and
+// under macOS's pressure, whose passes give cache back but take no chunk
+// back. None returns cache for the store or asks for a chunk.
+void testExpertExchangeWaitsWhereGrowthDoes() {
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  LoopFixture fixture(config, kExchangePool);
+  engine::NativeRuntime &loop = fixture.loop;
+  Executor &executor = fixture.executor;
+  const engine::Cache &resources = fixture.cache;
+  const KvPool &pool = fixture.pool;
+  loop.announceReady();
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  constexpr uint64_t hostReserve = 2ULL << 30;
+  constexpr uint64_t chunk = kExchangeChunkBytes;
+  // The host lacks the whole chunk beyond the recovery margin.
+  const uint64_t between = hostReserve + kHostWarningMarginBytes + kHostWarningMarginBytes / 2;
+  std::optional<uint64_t> available = between;
+  MemoryGovernor governor(backend, 40ULL << 30, hostReserve, hostReserve,
+                          [&available] { return hostMemory(available); }, 0);
+  MemoryControl control(governor, backend, loop);
+  executor.expertAdmission = governor.growthAdmission();
+  executor.expertChunks = {chunk};
+  executor.releasedExpertChunks = {chunk, chunk};
+  for (uint64_t id = 1; id <= 6; ++id)
+    finishConversation(fixture, id);
+  // A pass that neither took a chunk back nor asked for one, and, unless
+  // its pressure gives cache back, returned none.
+  const auto waits = [&](MemoryPressure pressure = MemoryPressure::Normal) {
+    const size_t chunks = executor.expertChunks.size();
+    const uint32_t attempts = executor.expertGrowthAttempts;
+    const uint64_t releases = pool.snapshot().extentReleases;
+    require(!control.run(pressure), "a pass waited for a transfer");
+    return executor.expertChunks.size() <= chunks && executor.expertGrowthAttempts == attempts &&
+           (pressure != MemoryPressure::Normal || pool.snapshot().extentReleases == releases);
+  };
+
+  // Beside a resident lane.
+  auto running = request(20, 900);
+  for (uint32_t &token : running.promptTokens)
+    token += 2000;
+  executor.decodeFinishes = false;
+  require(loop.receive(protocol::peer::serialize(running)), "the long request failed");
+  for (uint32_t step = 0; step < 8; ++step)
+    static_cast<void>(loop.tick());
+  settleCommand(loop);
+  require(executor.requests.contains(20) && executor.requests.at(20).resident,
+          "the long request did not decode");
+  require(waits(), "the exchange took cache beside a resident lane");
+  executor.decodeFinishes = true;
+  runUntilIdle(loop);
+
+  // While a request waits for memory: the host has the recovery margin it
+  // waits for, beside half a chunk.
+  available = hostReserve + kHostRecoveryMarginBytes + chunk / 2;
+  executor.beginGrowthBlocked = [] { return true; };
+  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  require(loop.receive(protocol::peer::serialize(request(21))) && !loop.tick() &&
+              loop.resourceWaitSnapshot().memory == 1,
+          "the request did not wait for memory");
+  require(waits(), "the exchange took cache while a request waited for memory");
+  executor.beginGrowthBlocked = {};
+  fixture.monotonic += 2 * engine::kResourceRetryBackoffMilliseconds;
+  runUntilIdle(loop);
+
+  // Within the cool-down after a short host took the store's chunks.
+  available = hostReserve + kHostWarningMarginBytes / 2;
+  require(!control.run(MemoryPressure::Normal) && executor.expertChunks.empty() &&
+              loop.expertReleases() != 0,
+          "a short host did not take the store's chunks");
+  for (uint64_t id = 7; id <= 12; ++id)
+    finishConversation(fixture, id);
+  available = hostReserve + kHostRecoveryMarginBytes + chunk / 2;
+  fixture.monotonic += kExpertGrowthCooldownMilliseconds - 1.0;
+  require(waits(), "the exchange took cache within the cool-down");
+  fixture.monotonic += 1.0;
+  require(!control.run(MemoryPressure::Normal) && executor.expertChunks.size() == 1,
+          "the exchange did not take a chunk back after the cool-down");
+
+  // Under macOS's warning and critical pressure.
+  available = between;
+  require(waits(MemoryPressure::Warning) && resources.snapshot().stateCache.entries != 0,
+          "the store took a chunk back under macOS's warning");
+  require(waits(MemoryPressure::Critical), "the store took a chunk back under critical pressure");
+}
+
+// An idle pass whose cache cannot cover what the host lacks of a chunk of the
+// expert store leaves that cache in place: the idle buffers beyond a lane's
+// and every entry nothing in use holds return less than the chunk, so the
+// chunk stays out, and an exchange that buys no chunk evicts nothing.
+void testExpertExchangeKeepsCacheThatCannotCoverTheChunk() {
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  LoopFixture fixture(config, kExchangePool);
+  engine::NativeRuntime &loop = fixture.loop;
+  Executor &executor = fixture.executor;
+  const engine::Cache &resources = fixture.cache;
+  loop.announceReady();
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  constexpr uint64_t hostReserve = 2ULL << 30;
+  // More than the whole pool and every cached state's buffers.
+  constexpr uint64_t chunk = 1ULL << 30;
+  // The host lacks the whole chunk beyond the recovery margin.
+  const std::optional<uint64_t> available =
+      hostReserve + kHostWarningMarginBytes + kHostWarningMarginBytes / 2;
+  MemoryGovernor governor(backend, 40ULL << 30, hostReserve, hostReserve,
+                          [&available] { return hostMemory(available); }, 0);
+  MemoryControl control(governor, backend, loop);
+  executor.expertAdmission = governor.growthAdmission();
+  executor.expertChunks = {chunk};
+  executor.releasedExpertChunks = {chunk};
+  for (uint64_t id = 1; id <= 6; ++id)
+    finishConversation(fixture, id);
+  const auto before = resources.snapshot();
+  require(before.stateCache.entries > 1, "the fixture kept no cache beside the resume point");
+  const uint32_t attempts = executor.expertGrowthAttempts;
+  require(!control.run(MemoryPressure::Normal), "a pass waited for a transfer");
+  require(executor.expertChunks.size() == 1 && executor.expertGrowthAttempts == attempts,
+          "the store asked for a chunk the cache could not cover");
+  const auto after = resources.snapshot();
+  require(after.stateCache.entries == before.stateCache.entries &&
+              after.pool.allocatedBytes == before.pool.allocatedBytes &&
+              after.pool.extentReleases == before.pool.extentReleases,
+          "an exchange that bought no chunk evicted cache");
+}
+
+// The chunk takes from the engine only the room its limit has free. With no
+// request in the engine the pass exchanges cache for what the limit lacks of
+// it, as for what the host lacks, and the extents the exchange releases make
+// the room. Where both lack some of the chunk, what the exchange returns adds
+// to both, so it returns the larger lack alone. Without cache that covers
+// the lack the pass neither takes cache nor asks for the chunk.
+void testExpertExchangeCoversTheEngineLimit() {
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  LoopFixture fixture(config, kExchangePool);
+  engine::NativeRuntime &loop = fixture.loop;
+  Executor &executor = fixture.executor;
+  const engine::Cache &resources = fixture.cache;
+  loop.announceReady();
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  constexpr uint64_t hostReserve = 2ULL << 30;
+  constexpr uint64_t limit = 40ULL << 30;
+  constexpr uint64_t chunk = kExchangeChunkBytes;
+  // More than the whole pool and every cached state's buffers.
+  constexpr uint64_t large = 1ULL << 30;
+  // The host has the chunk and more to spare.
+  constexpr uint64_t ample = hostReserve + (16ULL << 30);
+  std::optional<uint64_t> available = ample;
+  MemoryGovernor governor(backend, limit, hostReserve, hostReserve,
+                          [&available] { return hostMemory(available); }, 0);
+  MemoryControl control(governor, backend, loop);
+  executor.expertAdmission = governor.growthAdmission();
+  executor.expertChunks = {chunk};
+  executor.releasedExpertChunks = {large, chunk, chunk};
+  // The pool's extents are the backend's memory, which the governor charges.
+  fixture.storage.released = [] { test::metalStatistics().allocatedBytes -= kExchangeExtentBytes; };
+  // A pass while the engine's limit lacks `lacked` of the next chunk: whether
+  // it took the chunk back, and how many extents the cache released for it.
+  const auto pass = [&](uint64_t lacked) {
+    test::metalStatistics().allocatedBytes = limit - (executor.expertGrowthBytes() - lacked);
+    const size_t chunks = executor.expertChunks.size();
+    const uint64_t releases = resources.snapshot().pool.extentReleases;
+    require(!control.run(MemoryPressure::Normal), "a pass waited for a transfer");
+    return std::pair{executor.expertChunks.size() > chunks,
+                     resources.snapshot().pool.extentReleases - releases};
+  };
+  uint32_t attempts = executor.expertGrowthAttempts;
+  require(pass(kExchangeExtentBytes) == std::pair{false, uint64_t{0}} &&
+              executor.expertGrowthAttempts == attempts,
+          "the store asked for a chunk the engine's limit lacked with no cache to make room");
+
+  for (uint64_t id = 1; id <= 6; ++id)
+    finishConversation(fixture, id);
+  const auto [grown, released] = pass(kExchangeExtentBytes);
+  require(grown && released != 0,
+          "an idle pass did not exchange cache for the room the engine's limit lacked");
+  const uint64_t hits = loop.snapshot().cacheHits;
+  finishConversation(fixture, 6);
+  require(loop.snapshot().cacheHits == hits + 1,
+          "the newest conversation did not resume from the state the exchange kept");
+
+  // The host lacks one extent of the chunk beyond the recovery margin, the
+  // engine's limit the whole chunk, two extents.
+  available = hostReserve + kHostRecoveryMarginBytes + chunk - kExchangeExtentBytes;
+  require(pass(chunk) == std::pair{true, uint64_t{2}},
+          "an exchange did not return the larger of what the host and the engine's limit lacked");
+  available = ample;
+
+  const uint32_t entries = resources.snapshot().stateCache.entries;
+  attempts = executor.expertGrowthAttempts;
+  require(pass(large) == std::pair{false, uint64_t{0}} && executor.expertGrowthAttempts == attempts &&
+              resources.snapshot().stateCache.entries == entries,
+          "an exchange that could not cover what the engine's limit lacked took cache");
+}
+
+// An exchange whose chunk is refused after all, as by memory another process
+// took meanwhile, leaves what it returned with the system and takes no more
+// than the chunk lacked: the next pass's sample shows those bytes, and the
+// chunk comes back from them without taking cache again.
+void testRefusedExchangeLeavesItsBytesToTheNextPass() {
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  LoopFixture fixture(config, kExchangePool);
+  engine::NativeRuntime &loop = fixture.loop;
+  Executor &executor = fixture.executor;
+  const engine::Cache &resources = fixture.cache;
+  loop.announceReady();
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  constexpr uint64_t hostReserve = 2ULL << 30;
+  constexpr uint64_t chunk = kExchangeChunkBytes;
+  // The host has the recovery margin and nothing beyond it: it lacks the
+  // whole chunk.
+  std::optional<uint64_t> available = hostReserve + kHostRecoveryMarginBytes;
+  MemoryGovernor governor(backend, 40ULL << 30, hostReserve, hostReserve,
+                          [&available] { return hostMemory(available); }, 0);
+  MemoryControl control(governor, backend, loop);
+  executor.expertAdmission = governor.growthAdmission();
+  executor.expertChunks = {chunk};
+  executor.releasedExpertChunks = {chunk};
+  // The host refuses the first chunk asked for and admits every later one.
+  bool askedBefore = false;
+  executor.expertGrowthRoom = [&askedBefore] { return std::exchange(askedBefore, true); };
+  executor.expertGrowthRefusal = metal::AllocationFailure::HostPressure;
+  for (uint64_t id = 1; id <= 6; ++id)
+    finishConversation(fixture, id);
+
+  const auto before = resources.snapshot();
+  const uint64_t buffers = executor.reclaimedIdleStateBytes;
+  const uint32_t attempts = executor.expertGrowthAttempts;
+  require(!control.run(MemoryPressure::Normal), "a pass waited for a transfer");
+  const auto after = resources.snapshot();
+  const uint64_t returned = before.pool.allocatedBytes - after.pool.allocatedBytes +
+                            executor.reclaimedIdleStateBytes - buffers;
+  require(executor.expertChunks.size() == 1 && executor.expertGrowthAttempts == attempts + 1 &&
+              returned >= chunk && after.stateCache.entries > 1,
+          "a refused exchange did not return the chunk's bytes alone");
+
+  available = *available + returned;
+  require(!control.run(MemoryPressure::Normal) && executor.expertChunks.size() == 2 &&
+              resources.snapshot().pool.extentReleases == after.pool.extentReleases &&
+              resources.snapshot().stateCache.entries == after.stateCache.entries,
+          "the next pass took cache again for the bytes the refused exchange returned");
+}
+
+// The store's chunks above its floor are the model's (Executor::
+// expertChunks): a release gives them back with the floor, and a restore
+// takes the floor back under the admission of what is needed (`floors`
+// counts those), then each chunk while the optional growth's grants it.
+struct StoreMemory final : model::WeightMemory {
+  explicit StoreMemory(Executor *&model) : model(model) {}
+  [[nodiscard]] bool released() const noexcept override { return out; }
+  void release() override {
+    while (!model->expertChunks.empty()) {
+      model->releasedExpertChunks.push_back(model->expertChunks.back());
+      model->expertChunks.pop_back();
+    }
+    out = true;
+  }
+  bool restore(const metal::AllocationAdmission &admit,
+               const metal::AllocationAdmission &optional) override {
+    if (const metal::AllocationResult admitted = admit(kFloorBytes, [] {}); !admitted)
+      throw metal::MetalAllocationError("the store's floor was refused", admitted.failure);
+    ++floors;
+    while (!model->releasedExpertChunks.empty() &&
+           optional(model->releasedExpertChunks.back(), [] {})) {
+      model->expertChunks.push_back(model->releasedExpertChunks.back());
+      model->releasedExpertChunks.pop_back();
+    }
+    out = false;
+    return true;
+  }
+  static constexpr uint64_t kFloorBytes = 1ULL << 28;
+  Executor *&model;
+  bool out = false;
+  uint32_t floors = 0;
+};
+
+// The expert store's idle restore takes its floor back as memory the
+// request waiting needs, and each chunk above it only while the optional
+// growth's admission grants it (model::ExpertStore::restore): a chunk refused
+// stays released, the request waiting runs at once, and the control pass
+// grows the store back toward its cap, a chunk per pass, once memory is
+// ample.
+void testShrunkRestoreGrowsBackAfterTheRequest() {
+  Executor *model = nullptr;
+  StoreMemory store(model);
+  // Admission grants the first chunk of each restore and refuses the rest.
+  uint32_t granted = 0;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  config.weights = &store;
+  config.growthAdmission = [&](uint64_t, const std::function<void()> &allocate) {
+    if (granted++)
+      return metal::AllocationResult{metal::AllocationFailure::EngineBudget};
+    allocate();
+    return metal::AllocationResult{};
+  };
+  LoopFixture fixture(config);
+  model = &fixture.executor;
+  engine::NativeRuntime &loop = fixture.loop;
+  constexpr uint64_t chunk = 1ULL << 30;
+  fixture.executor.expertChunks = {chunk, chunk, chunk};
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  constexpr uint64_t hostReserve = 2ULL << 30;
+  MemoryGovernor governor(backend, 40ULL << 30, hostReserve, hostReserve,
+                          [] { return hostMemory(hostReserve + (16ULL << 30)); }, 0);
+  MemoryControl control(governor, backend, loop);
+  loop.announceReady();
+  require(!releaseAnswer(fixture, 1).restoring && store.released() &&
+              fixture.executor.releasedExpertChunks.size() == 3,
+          "the store was not released");
+  require(loop.receive(protocol::peer::serialize(request(1))), "the request failed");
+  runUntilIdle(loop);
+  require(loop.snapshot().completed == 1 && loop.resourceWaitSnapshot().memory == 0 &&
+              store.floors == 1 && fixture.executor.expertChunks.size() == 1,
+          "a refused chunk above the floor held the restore back");
+  for (size_t chunks = 2; chunks <= 3; ++chunks) {
+    require(!control.run(MemoryPressure::Normal) && fixture.executor.expertChunks.size() == chunks,
+            "the control pass did not grow the restored store a chunk per pass");
+  }
+}
+
+// Under the governor's admissions (Bootstrap's), the restore takes the
+// chunks above the floor back only while the host has each and the recovery
+// margin to spare, under no pressure, whatever the serving mark a request
+// waiting sets: on a host short of that only the floor comes back, and the
+// request runs; on an ample host the store comes back at its cap.
+void testRestoreTakesChunksOnlyFromAHostWithRoomToSpare() {
+  constexpr uint64_t chunk = 1ULL << 30;
+  constexpr uint64_t hostReserve = 2ULL << 30;
+  for (const bool ample : {false, true}) {
+    Executor *model = nullptr;
+    StoreMemory store(model);
+    test::metalStatistics() = {};
+    metal::MetalBackend backend("unused");
+    // The floor fits beside the warning margin; a chunk does not beside the
+    // recovery margin unless the host is ample.
+    const uint64_t spare = ample ? 3 * chunk + kHostRecoveryMarginBytes
+                                 : chunk + kHostRecoveryMarginBytes - 4096;
+    MemoryGovernor governor(backend, 40ULL << 30, hostReserve, hostReserve,
+                            [&] { return hostMemory(hostReserve + spare); }, 0);
+    engine::NativeLoopConfig config;
+    config.engine.maxContext = 1024;
+    config.engine.serving = [&governor](bool serving) { return governor.setServing(serving); };
+    config.weights = &store;
+    config.weightAdmission = governor.allocationAdmission();
+    config.growthAdmission = governor.growthAdmission();
+    LoopFixture fixture(config);
+    model = &fixture.executor;
+    fixture.executor.expertChunks = {chunk, chunk, chunk};
+    fixture.loop.announceReady();
+    require(!releaseAnswer(fixture, 1).restoring && store.released(), "the store was not released");
+    require(fixture.loop.receive(protocol::peer::serialize(request(1))), "the request failed");
+    runUntilIdle(fixture.loop);
+    require(fixture.loop.snapshot().completed == 1 && store.floors == 1 &&
+                fixture.executor.expertChunks.size() == (ample ? 3U : 0U),
+            ample ? "an ample host did not restore the store at its cap"
+                  : "a host short of a chunk and the recovery margin took one back in a restore");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -2117,6 +2670,14 @@ int main() {
     testReleasableMemoryRestoresTheExpertsAfterTheImages();
     testIdleReleaseRestoresTheSplitLast();
     testRefusedRestoreWaitsForMemory();
+    testControlPassGrowsTheExpertStoreWhenMemoryIsAmple();
+    testIdleControlPassExchangesCacheForTheExpertStore();
+    testExpertExchangeWaitsWhereGrowthDoes();
+    testExpertExchangeKeepsCacheThatCannotCoverTheChunk();
+    testExpertExchangeCoversTheEngineLimit();
+    testRefusedExchangeLeavesItsBytesToTheNextPass();
+    testShrunkRestoreGrowsBackAfterTheRequest();
+    testRestoreTakesChunksOnlyFromAHostWithRoomToSpare();
     testIdleReleaseOffReleasesOnlyOnRequest();
     testReleaseRequestGivesTheWeightsBackWhenIdle();
     testHoldingRequestsSpansFirstToLastRequest();

@@ -251,8 +251,20 @@ The governor admits each image's memory (`MemoryGovernor::allocationAdmission`)
 as memory the waiting requests need: neither the host's margins nor macOS's
 warning refuse it, as for a request in service, and it fits the
 engine's limit, since the cache does not grow while the engine holds no
-request; critical pressure refuses it. A refused image, or one the driver or
-its writer cannot allocate, stays released, and the images before it stay. The
+request; critical pressure refuses it. The [expert
+store](server.md#streamed-experts) is the exception to that fit: a chunk it gave
+back while memory was short left room the cache may have taken since. So it
+comes back in parts: its floor chunks and staging in one, which fits as the
+images do, since they were live when it was released, then each elastic chunk in
+a part of its own, as growth the store can do without
+(`MemoryGovernor::growthAdmission`): the serving mark does not lift its host
+checks, and it comes back only while macOS reports no memory pressure and the
+host has the chunk and the 2 GiB recovery margin to spare. The first elastic
+chunk refused stays released with those after it, which the control pass takes
+back later as it does any chunk given back, and the restore goes on as if it had
+come back: only the floor holds the restore up. A refused image, or one the
+driver or its writer cannot allocate, stays released, and the images before it
+stay. The
 requests wait for memory, retrying every 0.1 s as a refused request does and
 counted in `admission.waiting_memory`, and the log says `Weights wait for
 memory to be restored`. Once the 30 s resource wait has passed since the first
@@ -1118,7 +1130,42 @@ in use unless a request waits, and keeps the state a follow-up resumes from,
 even while a request waits, whose growth the warning refuses as well (`/status`:
 `memory_governor.system_pressure`, and `growth_allowed` is false meanwhile). A
 pass counts only memory that leaves the engine; a cached state it evicts first
-refills the lane's state buffers it keeps. A start needs only what macOS can
+refills the lane's state buffers it keeps. Where routed experts stream, a pass
+the host is really short for, its headroom measured short of the pass's margin
+or macOS reporting critical pressure, also takes the [expert
+store](server.md#streamed-experts)'s chunks above its floor, a chunk at a time
+while its target is unmet, once nothing outside what is in use is left to free
+and before anything in use; the experts a chunk held move to the chunks below it
+or are evicted, and later steps read them from the SSD again. Memory on its way
+back holds the store back: while cache nothing in use holds waits for a
+transfer, a KV demotion or a state write, the pass ends pending, and the pass
+that continues it once the transfer landed takes that cache first. macOS's
+warning alone never takes the store. Once memory allows again the control
+pass takes one chunk back per pass, its slots empty: when macOS reports no
+memory pressure, no request waits for memory, the host lets growth go on, the
+weights are neither released nor being restored, and 30 s have passed since a
+chunk last went. The chunk takes from the host only its headroom beyond the
+2 GiB recovery margin, and from the engine only room `--max-memory` leaves
+free. While the engine holds any request, resident, queued or draining, it
+takes only that. With none the chunk is an exchange for cache nothing in use
+holds, which ranks below the store, for what the chunk lacks of either: the
+engine first returns that cache to the system, one reclaim step at a time,
+each releasing the extent it empties, until the bytes that left the engine
+cover what the chunk lacks, and keeps the resume point of the newest
+conversation. The governor's growth admission then counts those bytes as the
+host's already (`MemoryGovernor::setGrowthCredit`): its own sample of the host
+may not show them yet, and the pass checked the rest against the sample it
+took before the exchange. Cache that cannot pay for the chunk in that pass
+stays. The exchange starts no copy to the SSD cache, whose memory would come
+back only after the pass: a state or page that needs one stays, and so do the
+pages above that page and the newer states of that state's class (checkpoint
+or ordinary). Unless the idle state buffers beyond a lane's and the extents
+that what leaves at once would empty cover what the chunk lacks
+(`Engine::exchangeableBytes`, `Cache::exchangeable`), the exchange takes
+nothing and the chunk waits; it waits too while a transfer is in flight. With
+the SSD cache on, a cached conversation buys a chunk only once its state and
+pages have copies there, as `--persistent-cache` writes them. A start
+needs only what macOS can
 hand out at all beyond a reserve of a tenth of a small Mac's memory and 2 GiB of
 a larger one, counting what compressing the anonymous pages would free at the
 compressor's present ratio, at most half of them, short of critical pressure:
@@ -1164,9 +1211,19 @@ it (`cache.priority_suspensions` in `/status`) and resumes once a lane and its
 memory are free. A new request below the priority of a running lane neither
 starts nor takes a lane until no lane of that priority runs, since it could not
 run before. Critical pressure evicts every unpinned cache entry and stops all
-growth. Refused at `--max-memory`, a lane's state, or the model's memory for
-reading KV from the SSD cache, takes cached KV only while evicting it can empty
-an extent, and is tried again only once an extent or a state has gone.
+growth; it takes the expert store down to its floor after what nothing in use
+holds and before what is in use, in one compaction per format. Refused at
+`--max-memory`, a lane's state, or the model's memory for reading KV from the
+SSD cache, takes cached KV only while evicting it can empty an extent, and is
+tried again only once an extent or a state has gone. Any growth `--max-memory`
+refuses, a start's beside a resident request too, takes a chunk of the expert
+store above its floor once nothing outside what is in use is left and before
+anything in use, and is tried again; so does the prompt's replay point before
+it recycles another request's state in use. Growth that only shortens a command
+(the KV a prefill captures past its first state boundary) or leaves memory for
+later takes neither the store nor anything in use, a junction or checkpoint
+capture never takes the store, and neither does a refusal of the host, which
+the paced passes answer.
 
 A request keeps its reusable model state at the last whole 32-token page before
 its generation prompt, the text a chat template appends to open the reply: the
@@ -1177,7 +1234,14 @@ the KV it restores through. When the last request using it ends, the point
 becomes the newest ordinary state; the older points on its chain keep their age.
 Cache victims come in three classes: checkpoints, then ordinary states and KV
 (first the KV no state restores through, which saves no prefill), then what is
-in use. No work displaces anything of a class above its own. Memory for running
+in use. No work displaces anything of a class above its own. The expert store's
+chunks above its floor rank between the last two: they go once nothing ordinary
+is left, before anything in use, for work that may take what is in use and for
+needed growth whose class stops at ordinary, but never for growth that only
+shortens a command or leaves memory for later, which takes nothing in use
+either. One exception is kept: a paced pass a request waits for under macOS's
+warning alone, the host not short, takes what is in use while the store keeps
+its chunks, since the warning alone never shrinks the store. Memory for running
 requests takes what is in use after everything else, and so does a paced pass
 that a request waits for. Three kinds of work take nothing in use: a paced pass
 that nothing waits for, under macOS's warning too, and the two that follow. A
@@ -1296,7 +1360,8 @@ waiting request, or admitted before the request was first refused memory or
 suspended. Such a lane holds memory the request waits for until it finishes.
 Other lanes do not extend the wait. Readiness does not guarantee that a
 request-sized allocation fits. A request that cannot fit even alone, after every
-cached prefix was evicted, fails with 400 `capacity_exhausted`, naming
+cached prefix was evicted and the expert store shrank to its floor, fails with
+400 `capacity_exhausted`, naming
 `--max-memory` and `--max-context`; retrying it fails the same way.
 
 A cached state holds the target's GDN cell and the draft's context window, not

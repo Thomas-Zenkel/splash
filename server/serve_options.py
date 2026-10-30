@@ -475,10 +475,14 @@ SERVE_OPTIONS = (
             type=parse_expert_memory,
             default=None,
             metavar="SIZE",
-            help="RAM slots of the routed experts of a MoE model, e.g. 16G, which "
-            "reads the others from the SSD when a token routes them; off loads "
-            "every expert (default: auto, which loads them all where memory "
-            "holds them and otherwise gives them what the context leaves)",
+            help="least RAM for the routed experts of a MoE model, e.g. 16G: "
+            "they load whole where memory holds them all, and otherwise take "
+            "all the memory the plan leaves them, at least this, give memory "
+            "back down to it while requests need it, and read the other "
+            "experts from the SSD when a token routes them; off loads every "
+            "expert (default: auto, which loads them all where memory holds "
+            "them, and otherwise gives them what the context leaves, giving "
+            "back down to 85%% of their slots)",
         ),
     ),
     ServeOption(

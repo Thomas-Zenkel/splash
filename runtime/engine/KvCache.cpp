@@ -456,6 +456,14 @@ uint32_t KvCache::idlePagesOnChains(std::span<const uint64_t> blocks, kv::PageFo
   return pages;
 }
 
+std::vector<uint64_t> KvCache::uncopiedBlocks() const {
+  std::vector<uint64_t> blocks;
+  for (const auto &[id, entry] : blocks_)
+    if (entry.page != noPage && (!entry.slot || entry.transfer != Transfer::None))
+      blocks.push_back(id);
+  return blocks;
+}
+
 bool KvCache::residentLeaf(uint64_t blockId) const {
   const Block &entry = block(blockId);
   return entry.page != noPage && !entry.residentChildren && !entry.activeUsers &&

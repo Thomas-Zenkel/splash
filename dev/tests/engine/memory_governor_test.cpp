@@ -795,6 +795,95 @@ void testSystemWarningGivesCacheBack() {
           "growth or the passes did not follow macOS back to normal pressure");
 }
 
+// A pass may take the expert store's chunks above its floor only while the
+// host really lacks memory: a measured deficit to the pass's margin, which a
+// waiting request raises to the recovery margin, or critical pressure.
+// macOS's warning alone asks caches to give memory back and never sets it,
+// nor does a host whose headroom cannot be measured, and the passes that
+// continue a target transfers held back keep it.
+void testOnlyAShortHostTakesTheExpertStore() {
+  MemoryPressurePolicy policy;
+  MemoryGovernorSnapshot host{.pressure = MemoryPressure::Warning,
+                              .hostMeasurementValid = true,
+                              .hostHeadroomBytes = 16 * kGiB,
+                              .systemPressure = MemoryPressure::Warning};
+  const auto warned = policy.update(host, 0.0, false);
+  require(warned && warned->targetBytes == kHostWarningMarginBytes && !warned->hostShort,
+          "macOS's warning alone let a pass take the expert store");
+  host.hostHeadroomBytes = kGiB / 2;
+  const auto warnedShort = policy.update(host, 1000.0, false);
+  require(warnedShort && warnedShort->targetBytes == kHostWarningMarginBytes && warnedShort->hostShort,
+          "a measured deficit under macOS's warning kept the expert store");
+  host.systemPressure = MemoryPressure::Normal;
+  host.hostHeadroomBytes = 3 * kGiB / 2;
+  const auto between = policy.update(host, 2000.0, false);
+  const auto waited = policy.update(host, 3000.0, true);
+  require(between && !between->hostShort && waited && waited->targetBytes == kGiB / 2 &&
+              waited->hostShort,
+          "the margin a waiting request raises did not decide whether the host is short");
+  host.hostMeasurementValid = false;
+  host.systemPressure = MemoryPressure::Warning;
+  const auto unmeasured = policy.update(host, 4000.0, false);
+  require(unmeasured && !unmeasured->hostShort, "a host that could not be measured counted as short");
+  host.hostMeasurementValid = true;
+  host.systemPressure = MemoryPressure::Normal;
+  host.hostHeadroomBytes = kGiB / 2;
+  const auto held = policy.update(host, 5000.0, false);
+  policy.reclaimed(*held, {0, ReclaimOutcome::Pending});
+  const auto continued = policy.update(host, 5100.0, false);
+  require(held && held->hostShort && continued && continued->targetBytes == kGiB / 2 &&
+              continued->hostShort,
+          "a pass that continued a held-back target forgot the host was short");
+  host.pressure = MemoryPressure::Critical;
+  const auto critical = policy.update(host, 5200.0, false);
+  require(critical && critical->critical && critical->hostShort,
+          "critical pressure did not let a pass take the expert store");
+}
+
+// The bytes an exchange returned to the system for the expert store's
+// growth are the host's already (MemoryGovernor::setGrowthCredit): growth
+// the engine can do without counts only the bytes beyond them against the
+// host's headroom, which must keep the recovery margin beside them, and
+// with none beyond them no margin holds it back. The engine's limit counts
+// every byte, and macOS's warning and a host it cannot measure still refuse
+// it. Memory a request needs takes no credit.
+void testGrowthCreditCountsOnlyTheRest() {
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 2 * kGiB, limit = 40 * kGiB, chunk = kGiB;
+  // Between the warning margin and the recovery margin.
+  const uint64_t between = hostReserve + kHostWarningMarginBytes + kGiB / 2;
+  std::optional<uint64_t> available = between;
+  MemoryGovernor governor(backend, limit, hostReserve, hostReserve,
+                          [&available] { return hostMemory(available); }, 0);
+  const auto grows = [&] { return static_cast<bool>(governor.growthAdmission()(chunk, [] {})); };
+  require(!grows(), "growth was admitted inside the recovery margin");
+  require(governor.setGrowthCredit(chunk) == 0 && grows(),
+          "a credit that covers the growth did not admit it");
+  require(!admit(governor, kGiB), "memory a request needs took the growth's credit");
+
+  // Half a chunk beyond the recovery margin: the rest must fit there.
+  available = hostReserve + kHostRecoveryMarginBytes + chunk / 2;
+  static_cast<void>(governor.setGrowthCredit(chunk / 4));
+  require(!grows(), "the bytes beyond the credit were admitted without the recovery margin");
+  static_cast<void>(governor.setGrowthCredit(chunk / 2));
+  require(grows(), "the bytes beyond the credit were refused with the recovery margin to spare");
+
+  static_cast<void>(governor.setGrowthCredit(chunk));
+  available = between;
+  test::metalStatistics().allocatedBytes = limit - chunk / 2;
+  require(!grows(), "the credit lifted the engine's limit");
+  test::metalStatistics().allocatedBytes = 0;
+  governor.setPressure(MemoryPressure::Warning);
+  require(!grows(), "the credit lifted macOS's warning");
+  governor.setPressure(MemoryPressure::Normal);
+  available = std::nullopt;
+  require(!grows(), "the credit admitted growth on a host that could not be measured");
+  available = between;
+  require(grows() && governor.setGrowthCredit(0) == chunk && !grows(),
+          "the credit outlived its clearing");
+}
+
 } // namespace
 
 int main() {
@@ -816,6 +905,8 @@ int main() {
     testRequestInServiceGrowsThroughHostPressure();
     testOptionalGrowthKeepsTheSpareReserve();
     testSystemWarningGivesCacheBack();
+    testOnlyAShortHostTakesTheExpertStore();
+    testGrowthCreditCountsOnlyTheRest();
     std::cout << "memory governor tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

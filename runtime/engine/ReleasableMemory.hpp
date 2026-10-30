@@ -49,13 +49,14 @@ public:
     if (!splitReleased_)
       splitReleased_ = split_ && split_->release();
   }
-  [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override {
+  [[nodiscard]] bool restore(const metal::AllocationAdmission &admit,
+                             const metal::AllocationAdmission &optional) override {
     // Every part, then the program. With nothing released, the first part
     // refuses the restore.
     auto part = std::ranges::find_if(parts_, &model::WeightMemory::released);
     if (part == parts_.end() && !splitReleased_) part = parts_.begin();
     if (part != parts_.end())
-      return (*part)->restore(admit) && !released() && !splitReleased_;
+      return (*part)->restore(admit, optional) && !released() && !splitReleased_;
     splitReleased_ = false;
     split_->restore();
     return true;

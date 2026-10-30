@@ -181,7 +181,12 @@ leave out their routed experts, and a PLE table that streams has no image
 `verify --full` hashes, and the digests do not cover them. Any size a store
 takes records the same images. Where the images and stores of a load exceed
 the engine's Metal memory budget, `weight-digests` refuses it before loading
-any image and names the options.
+any image and names the options. A tool's expert store is SIZE and stays so,
+its chunks laid out as `splash serve`'s, where `splash serve` takes SIZE as
+the floor of a store that may be larger (`dev/tools/LoadOptions.hpp`), and
+loads the experts whole where memory holds every one: an HTTP smoke that
+streams them there takes a smaller `--max-memory` beside `--expert-memory` in
+`HTTP_SMOKE_ARGS`.
 
 Results go to `build/release/<owner>--<repo>[--VARIANT]/`. The weight images
 do not depend on the GPU, so each model's `weights.json`, recorded with the

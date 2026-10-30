@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -113,10 +114,15 @@ struct BlockExpertProjection final {
 // (metal::AddressTable). Slot s < floorSlots is local slot s of chunk 0; any
 // other is local slot (s - floorSlots) % chunkSlots of chunk
 // 1 + (s - floorSlots) / chunkSlots. A local slot l's planes start at row
-// l * N of its chunk's regions. The blocks of a store size share one list. A
-// list is checked view by view once, where `of` makes it, for the slots,
-// floor and chunk slots and routed formats and sizes it records; a block's
-// expert passes then only require its own slots and segments to be those
+// l * N of its chunk's regions. The blocks of a store size share the chunks
+// and how many of them are live: a store gives its last chunks back while
+// memory is short and takes them again, between commands (keep), and every
+// copy's list names the live chunks alone, one list per count of them, so
+// that the dispatches of a command share one address table, which never
+// names memory given back. The chunks are checked view by view once, where
+// `of` makes them, for the slots, floor and chunk slots and routed formats
+// and sizes it records, which stay those of every chunk; a block's expert
+// passes then only require its own slots and segments to be those
 // (checkedFor). A default value is empty.
 class ExpertChunks final {
 public:
@@ -134,12 +140,27 @@ public:
                                        uint32_t chunkSlots, uint32_t slots, const QuantizedSegment &gate,
                                        const QuantizedSegment &up, const QuantizedSegment &down);
 
+  // The live chunks' views, MOE_EXPERT_CHUNK_ADDRESSES per chunk in the
+  // expert kernels' order; null for a default value.
   [[nodiscard]] const std::shared_ptr<const std::vector<metal::MetalBuffer>> &planes() const noexcept {
-    return planes_;
+    static const std::shared_ptr<const std::vector<metal::MetalBuffer>> none;
+    return live_ ? live_->planes[live_->count.load(std::memory_order_acquire) - 1] : none;
   }
   [[nodiscard]] uint32_t floorSlots() const noexcept { return floorSlots_; }
   [[nodiscard]] uint32_t chunkSlots() const noexcept { return chunkSlots_; }
-  [[nodiscard]] bool empty() const noexcept { return !planes_; }
+  [[nodiscard]] bool empty() const noexcept { return !live_; }
+  // Every chunk, and the first of them that are live, all of them until
+  // keep() keeps fewer.
+  [[nodiscard]] uint32_t chunks() const noexcept { return live_ ? static_cast<uint32_t>(live_->planes.size()) : 0; }
+  [[nodiscard]] uint32_t liveChunks() const noexcept {
+    return live_ ? live_->count.load(std::memory_order_acquire) : 0;
+  }
+  // Every copy's planes() names the first `chunks` chunks alone (1 to
+  // chunks()) for the commands encoded from now on: a store keeps fewer
+  // between commands, once no slot of its blocks lies past them, before it
+  // gives the memory of the others back, and more once it took theirs again.
+  // Throws std::invalid_argument for another count.
+  void keep(uint32_t chunks);
   // Whether `of` checked them, at their floor and chunk slots, for `slots`
   // slots of routed segments of gate's, up's and down's formats and sizes.
   [[nodiscard]] bool checkedFor(uint32_t slots, const QuantizedSegment &gate, const QuantizedSegment &up,
@@ -157,7 +178,13 @@ private:
     return {segment.formatId, segment.outputSize, segment.inputSize};
   }
 
-  std::shared_ptr<const std::vector<metal::MetalBuffer>> planes_;
+  // The views of the first k chunks (planes[k - 1]), and k of the live
+  // chunks, which every copy shares.
+  struct Live final {
+    std::vector<std::shared_ptr<const std::vector<metal::MetalBuffer>>> planes;
+    std::atomic<uint32_t> count = 0;
+  };
+  std::shared_ptr<Live> live_;
   uint32_t floorSlots_ = 0;
   uint32_t chunkSlots_ = 0;
   uint32_t slots_ = 0;

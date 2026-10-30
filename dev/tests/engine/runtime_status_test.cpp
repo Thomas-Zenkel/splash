@@ -603,9 +603,10 @@ void testWeightsStatus() {
 }
 
 // Streamed routed experts' store (--expert-memory): null without one; with
-// one its arena, staging, slots, residency, loads, hit rate, the
-// latencies of its host steps' round trips and its failure. An added field:
-// the schema version stays.
+// one its cap and floor, its live chunks and those at the cap, its shrinks
+// and regrows, its live arena, staging, slots, residency, loads, hit rate,
+// the latencies of its host steps' round trips and its failure. An added
+// field: the schema version stays.
 void testStreamedExpertsStatus() {
   const auto memoryPlan = plan();
   const auto status = [&](const std::optional<model::ExpertStoreStats> &experts) {
@@ -614,8 +615,17 @@ void testStreamedExpertsStatus() {
   };
   require(status(std::nullopt).find(",\"streamed_experts\":null,") != std::string::npos,
           "a model without streamed experts does not report null");
-  model::ExpertStoreStats experts{
-      .arenaBytes = 17179869184, .stagingBytes = 452984832, .slots = 8192, .experts = 25088, .resident = 8000};
+  model::ExpertStoreStats experts{.capBytes = 18602770432,
+                                  .floorBytes = 15837691904,
+                                  .capChunks = 4,
+                                  .chunks = 3,
+                                  .arenaBytes = 17179869184,
+                                  .stagingBytes = 452984832,
+                                  .slots = 8192,
+                                  .experts = 25088,
+                                  .resident = 8000,
+                                  .shrinks = 2,
+                                  .regrows = 1};
   experts.uses[1] = {.loads = 480,
                      .routed = 4000,
                      .read = 1000,
@@ -631,7 +641,9 @@ void testStreamedExpertsStatus() {
   experts.failure = "injected";
   const std::string none = "{\"p50\":0,\"p95\":0,\"p99\":0,\"max\":0,\"total\":0,\"samples\":0}";
   require(status(experts).find(
-              "\"streamed_experts\":{\"arena_bytes\":17179869184,\"staging_bytes\":452984832,\"slots\":8192,"
+              "\"streamed_experts\":{\"cap_bytes\":18602770432,\"floor_bytes\":15837691904,\"chunks\":3,"
+              "\"cap_chunks\":4,\"shrinks\":2,\"regrows\":1,\"arena_bytes\":17179869184,"
+              "\"staging_bytes\":452984832,\"slots\":8192,"
               "\"experts\":25088,\"resident\":8000,\"prefill\":{\"loads\":0,\"routed\":0,\"read\":0,\"prefetched\":0,"
               "\"read_ahead\":0,\"hit_rate\":0,\"read_bytes\":0,\"host_steps\":{\"pickup_ms\":" +
               none + ",\"work_ms\":" + none + ",\"resume_ms\":" + none +

@@ -42,8 +42,12 @@ namespace splash::tools {
 // through a row cache of SIZE bytes (model::ModelLoadOptions); SIZE as
 // parseBytes reads it, without the fraction (7.5G) and the spellings (7GB,
 // 7g) splash serve also takes. Unlike splash serve, which loads a part whole
-// where SIZE holds all of it, any SIZE streams. Throws std::invalid_argument
-// for a value that is not a size.
+// where SIZE holds all of it, any SIZE streams; and where splash serve's
+// SIZE is the expert store's floor below a cap the plan sizes, a tool's
+// store is SIZE and stays so: its chunks are laid out as splash serve's
+// above the store's own floor, but nothing gives them back, as a tool runs
+// no engine that reclaims memory. Throws std::invalid_argument for a value
+// that is not a size.
 [[nodiscard]] inline bool takeLoadOption(std::string_view option, std::string_view value,
                                          model::ModelLoadOptions &options) {
   const bool experts = option == "--expert-memory";

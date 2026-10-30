@@ -553,28 +553,40 @@ uint64_t Cache::releaseEmptyExtents(bool keepRunway) {
   return pool_.reclaimEmptyExtents(keepRunway, std::numeric_limits<uint32_t>::max());
 }
 
-CacheReclaimResult Cache::evictAll() {
+CacheReclaimResult Cache::evictAll(ReclaimClass upTo) {
   uint64_t released = releaseEmptyExtents(false);
   bool evicted = false;
   // Everything unpinned goes before anything moves.
-  while (evictOne({.mode = CacheReclaimMode::KeepExtents, .upTo = ReclaimClass::InUse}).madeProgress)
+  while (evictOne({.mode = CacheReclaimMode::KeepExtents, .upTo = upTo}).madeProgress)
     evicted = true;
   do {
     released += releaseEmptyExtents(false);
-  } while (compactExtent());
+  } while (upTo == ReclaimClass::InUse && compactExtent());
   return {.madeProgress = evicted || released != 0, .reclaimedBytes = released};
 }
 
 CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode, ReclaimClass upTo,
                                      bool keepResumePoint, bool keepRunway) {
-  const bool release = mode == CacheReclaimMode::ReleaseExtents;
+  return reclaimStep({.mode = mode, .upTo = upTo, .keepResumePoint = keepResumePoint}, keepRunway);
+}
+
+CacheReclaimResult Cache::reclaimForExchange() {
+  return reclaimStep({.mode = CacheReclaimMode::ReleaseExtents,
+                      .upTo = ReclaimClass::Ordinary,
+                      .keepResumePoint = true,
+                      .unwritten = StateCache::Unwritten::Stay,
+                      .timing = ReclaimTiming::Immediate},
+                     true);
+}
+
+CacheReclaimResult Cache::reclaimStep(const EvictionStep &step, bool keepRunway) {
+  const bool release = step.mode == CacheReclaimMode::ReleaseExtents;
   if (release) {
     if (const CacheReclaimResult released = releaseExtent(keepRunway);
         released.madeProgress)
       return released;
   }
-  CacheReclaimResult evicted =
-      evictOne({.mode = mode, .upTo = upTo, .keepResumePoint = keepResumePoint});
+  CacheReclaimResult evicted = evictOne(step);
   if (evicted.madeProgress && release)
     evicted.reclaimedBytes += pool_.reclaimEmptyExtents(keepRunway, 1);
   return evicted;
@@ -591,7 +603,7 @@ CacheReclaimResult Cache::evictOne(const EvictionStep &step) {
   // buffers give no page; one whose write must wait for the one in flight
   // stays and holds back nothing else.
   if (const auto oldest = states_.checkpointCandidate(step.keepResumePoint); oldest && !pagesOnly) {
-    if (states_.reclaim(oldest->id, StateCache::Unwritten::Wait).evicted)
+    if (states_.reclaim(oldest->id, step.unwritten).evicted)
       return {.madeProgress = true, .evictedState = true};
   }
 
@@ -606,8 +618,8 @@ CacheReclaimResult Cache::evictOne(const EvictionStep &step) {
       return {.pending = true};
     if (const auto victim = reclaimOldest({.inUse = inUse,
                                            .keepResumePoint = step.keepResumePoint,
-                                           .unwritten = StateCache::Unwritten::Wait,
-                                           .timing = ReclaimTiming::CanWait,
+                                           .unwritten = step.unwritten,
+                                           .timing = step.timing,
                                            .pagesOnly = pagesOnly}))
       return {.madeProgress = true, .evictedState = !victim->kv};
   }
@@ -723,6 +735,33 @@ uint32_t Cache::reusablePages(ReclaimClass upTo, kv::PageForm form) const {
   return unheld - kv_.idlePagesOnChains(states_.usedStates(), form);
 }
 
+CacheExchange Cache::exchangeable() const {
+  if (!writes_.empty() || !restores_.empty() || states_.writing())
+    return {};
+  // The chains reclaimForExchange leaves: those of the states in use, which
+  // only InUse takes, those of the RAM copies of states it leaves, whose
+  // leaves keep them, and, while the tier takes writes, those of the blocks
+  // that need a demotion, which an exchange starts none of.
+  std::vector<uint64_t> kept = states_.usedStates();
+  CacheExchange exchange{.states = states_.freedWithoutWrites(kept)};
+  if (kvTierWritable()) {
+    for (const uint64_t block : kv_.uncopiedBlocks())
+      if (kvNeededByState(block))
+        kept.push_back(block);
+  }
+  const uint32_t extent = pool_.extentPages();
+  for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index}) {
+    const uint32_t allocated = pool_.allocatedExtents(form);
+    const uint32_t staying =
+        allocated * extent - pool_.reusablePages(form) + kv_.idlePagesOnChains(kept, form);
+    // Compaction leaves the extents those pages fill, and the runway stays.
+    const uint32_t stay = (staying + extent - 1) / extent + 1;
+    if (allocated > stay)
+      exchange.extentBytes += uint64_t{allocated - stay} * extent * pool_.bytesPerPage(form);
+  }
+  return exchange;
+}
+
 std::optional<Cache::Victim> Cache::reclaimOldest(const VictimScan &scan) {
   // A dead leaf never needs a demotion; one whose disk subtree is busy
   // stays, and the next goes.
@@ -804,9 +843,12 @@ StateRoom Cache::reclaimOneState(StateClass state, bool growth) {
   } else if (recycle(states_.ordinaryCandidate(false), unwritten)) {
     return {true};
   }
-  if (state == StateClass::InUse && recycle(states_.inUseCandidate(), Unwritten::Wait))
-    return {true};
   return {};
+}
+
+StateRoom Cache::reclaimInUseState() {
+  const std::optional<CacheEvictionCandidate> candidate = states_.inUseCandidate();
+  return {candidate && states_.reclaim(candidate->id, StateCache::Unwritten::Wait).evicted};
 }
 
 CacheReclaimResult Cache::reclaimStateForLane(ReclaimClass upTo) {

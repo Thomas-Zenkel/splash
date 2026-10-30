@@ -110,6 +110,8 @@ struct SparseRowStats final {
   uint64_t cacheBytes = 0;    // cache and working-memory reservation
   uint64_t cacheCapacityRows = 0;
   uint64_t cachedRows = 0;
+  // Whether the cache's arrays hold all of their host memory (commit()).
+  bool committed = false;
   // Per SparseRowUse: stages, row ids they took, distinct rows, cache hits
   // and rows read.
   struct Use final {
@@ -162,6 +164,14 @@ public:
   // Cache bytes plus the fixed working-memory reservation, at most
   // options.cacheBytes; not the store's measured allocation high-water mark.
   [[nodiscard]] uint64_t committedBytes() const noexcept;
+  // Makes the cache's arrays, its rows with their ids, recency links and
+  // index, take all of their host memory now, by writing each of their pages
+  // back as it is: until then a page takes memory only once a row is cached
+  // in it, so that host memory measured meanwhile counts room the cache
+  // takes later. The working memory of stages and prefetches is not
+  // committed, as they allocate it while they run. The engine commits the
+  // store of the model it serves once, before it serves (RuntimeResources).
+  void commit();
 
   // Stages the rows of `ids` (any order, repeats allowed): row u of `rows`
   // (u * rowBytes) holds the u-th distinct id's row, and slots[i] = u for

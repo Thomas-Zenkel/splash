@@ -99,7 +99,8 @@ private:
 };
 
 // With a pool, it is a captured state whose buffers return to the model's
-// pool once the cache lets go of them, like State's.
+// pool once the cache lets go of them, like State's. A persistent tier also
+// writes its copy while it stays in RAM (persist).
 class OffloadState final : public CompositeState {
 public:
   explicit OffloadState(std::shared_ptr<OffloadControl> control,
@@ -113,6 +114,9 @@ public:
   uint64_t bytes() const noexcept override { return 64; }
   bool canOffload(bool) const noexcept override { return true; }
   std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
+    return std::make_unique<OffloadTicket>(control_);
+  }
+  std::unique_ptr<StateOffload> persist(std::function<void()>) const override {
     return std::make_unique<OffloadTicket>(control_);
   }
 private:
@@ -220,6 +224,11 @@ private:
 // tests' knobs and records.
 class Executor final : public model::Model {
 public:
+  // The model's own reclaim steps, in the order they ran: pooled buffers
+  // given back, a cache it can rebuild, and a chunk of its expert store
+  // given back or taken back.
+  enum class ReclaimStep : uint8_t { Buffers, Cache, ExpertRelease, ExpertGrowth };
+
   explicit Executor(
       uint32_t maximumLanes = model::ExecutionLimits::maximumBatchWidth)
       : maximumLanes(maximumLanes) {}
@@ -610,6 +619,18 @@ public:
   uint32_t statesToActivate() const noexcept override {
     return statesLacked ? statesLacked() : 0;
   }
+  // The production model's pool releases the buffers beyond a lane's
+  // (QwenStateStorage::idleBytes); the fake's are what reclaimIdleState
+  // gives: what the cache let go of already and each State it lets go of
+  // next, beyond what refills the lane's footprint. KeptState and
+  // RowsHoldingState return no buffers.
+  uint64_t idleBufferBytes(uint32_t evictedStates) const noexcept override {
+    const uint64_t each = keptTier || stateHeldRows ? 0 : State().bytes();
+    const uint64_t returned = *evictedStateBytes + uint64_t{evictedStates} * each;
+    const uint64_t refill =
+        std::min(returned, laneFootprintBytes - std::min(laneFootprintBytes, pooledLaneBytes));
+    return reclaimableIdleStateBytes + returned - refill;
+  }
   // The production model reserves a decoding lane's floor of the hot block
   // cache, which the fake refuses for the requests in refusedSpilledReads,
   // and while spilledReadsRoom reports no memory for the request's, with
@@ -656,6 +677,8 @@ public:
     reclaimedIdleStateBytes += released;
     if (released && kvGrowthBlocked)
       *kvGrowthBlocked = false;
+    if (released)
+      reclaimSteps.push_back(ReclaimStep::Buffers);
     if (released || scope == model::IdleMemory::Buffers)
       return released;
     ++cacheReclaims;
@@ -663,7 +686,54 @@ public:
       return 0;
     const uint64_t unit = cacheUnits.back();
     cacheUnits.pop_back();
+    reclaimSteps.push_back(ReclaimStep::Cache);
     return unit;
+  }
+  // The production model's expert store gives back its last live chunk
+  // above the floor, and takes back the next one toward its cap while
+  // memory admits it (model::ExpertStore). The fake's chunks above the floor
+  // are expertChunks, those given back releasedExpertChunks, each the last
+  // to go first; expertGrowthRoom, when set, says whether memory admits the
+  // next, refused with expertGrowthRefusal otherwise, and expertAdmission,
+  // when set, admits its bytes as the production store's admission does
+  // (Runtime::growExperts), refused with the admission's cause.
+  // expertReleaseObserver runs as a chunk goes, before it is logged.
+  uint64_t releaseExpertChunk() override {
+    if (expertChunks.empty())
+      return 0;
+    if (expertReleaseObserver)
+      expertReleaseObserver();
+    const uint64_t chunk = expertChunks.back();
+    expertChunks.pop_back();
+    releasedExpertChunks.push_back(chunk);
+    reclaimSteps.push_back(ReclaimStep::ExpertRelease);
+    return chunk;
+  }
+  uint64_t releaseExpertsToFloor() override {
+    uint64_t bytes = 0;
+    while (const uint64_t chunk = releaseExpertChunk())
+      bytes += chunk;
+    ++expertsToFloor;
+    return bytes;
+  }
+  uint64_t expertGrowthBytes() const override {
+    return releasedExpertChunks.empty() ? 0 : releasedExpertChunks.back();
+  }
+  model::ModelMemoryAdmission growExperts() override {
+    ++expertGrowthAttempts;
+    if (releasedExpertChunks.empty())
+      return {.ok = true};
+    if (expertGrowthRoom && !expertGrowthRoom())
+      return {.allocationFailure = expertGrowthRefusal};
+    if (expertAdmission) {
+      const metal::AllocationResult admitted = expertAdmission(releasedExpertChunks.back(), [] {});
+      if (!admitted)
+        return {.allocationFailure = admitted.failure};
+    }
+    expertChunks.push_back(releasedExpertChunks.back());
+    releasedExpertChunks.pop_back();
+    reclaimSteps.push_back(ReclaimStep::ExpertGrowth);
+    return {.ok = true};
   }
   std::optional<std::string> provideMask(uint64_t id,
                                          std::span<const uint32_t> words) override {
@@ -830,6 +900,18 @@ public:
   // take them once no buffer is idle; cacheReclaims counts those steps.
   std::vector<uint64_t> cacheUnits;
   uint32_t cacheReclaims = 0;
+  std::vector<ReclaimStep> reclaimSteps;
+  // The expert store's chunks above its floor and those given back, of their
+  // bytes (releaseExpertChunk, growExperts).
+  std::vector<uint64_t> expertChunks;
+  std::vector<uint64_t> releasedExpertChunks;
+  std::function<void()> expertReleaseObserver;
+  std::function<bool()> expertGrowthRoom;
+  metal::AllocationFailure expertGrowthRefusal = metal::AllocationFailure::EngineBudget;
+  metal::AllocationAdmission expertAdmission;
+  uint32_t expertGrowthAttempts = 0;
+  // The calls that gave every chunk above the floor back at once.
+  uint32_t expertsToFloor = 0;
   // Rows each state captured from then on holds (RowsHoldingState); the
   // executor must outlive the cache that keeps those states.
   uint64_t stateHeldRows = 0;

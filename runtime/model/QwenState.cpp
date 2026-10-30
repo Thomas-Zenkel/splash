@@ -403,6 +403,14 @@ uint32_t QwenStateStorage::statesToActivate() const noexcept {
   return std::max(cells, windows);
 }
 
+uint64_t QwenStateStorage::idleBytes(uint32_t evictedStates) const noexcept {
+  const auto beyond = [](uint64_t pooled, uint64_t kept) { return pooled - std::min(pooled, kept); };
+  return beyond(uint64_t{idleCells()} + evictedStates, CompositeStateLayout::kLaneGdnCells) *
+             layout_.target.cellBytes() +
+         beyond(idleRings(), 1) * layout_.draft.ringBytes() +
+         beyond(uint64_t{idleWindows()} + evictedStates, 1) * layout_.draft.windowBytes();
+}
+
 void QwenStateStorage::updateLengths(uint32_t index,
                                      QwenLogicalLengths lengths) {
   validateLengths(lengths, false);

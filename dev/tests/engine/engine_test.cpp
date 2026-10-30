@@ -9578,20 +9578,22 @@ void testLoneSpillLaneEndsAtTheWall() {
 
 // The hot block cache grows toward its planned size between commands, an
 // allocation that may be refused: refused, it takes no cache the model can
-// rebuild, among which that cache's own slots past its floor are, and
-// nothing while the host refuses growth. The lane decodes all the same.
+// rebuild, among which that cache's own slots past its floor are, nor a
+// chunk of the expert store, and nothing while the host refuses growth. The
+// lane decodes all the same.
 void testHotCacheGrowthTakesNoModelCache() {
   for (const auto failure :
        {metal::AllocationFailure::EngineBudget, metal::AllocationFailure::HostPressure}) {
     Spilling spill(64);
     spill.model.cacheUnits = {100};
+    spill.model.expertChunks = {1000};
     spill.model.refusedGrowth = failure;
     spill.engine.submit(Spilling::prompt(1, 1, 5, 20));
     spill.runUntilIdle();
     require(spill.model.growthAttempts > 0 && spill.model.cacheReclaims == 0 &&
-                spill.model.cacheUnits.size() == 1 && spill.events.completedCount == 1 &&
-                spill.events.failedCount == 0,
-            "the hot block cache's growth took a cache the model can rebuild");
+                spill.model.cacheUnits.size() == 1 && spill.model.expertChunks.size() == 1 &&
+                spill.events.completedCount == 1 && spill.events.failedCount == 0,
+            "the hot block cache's growth took a cache the model can rebuild or the expert store");
   }
 }
 
@@ -12317,6 +12319,536 @@ void testImpossibleSpeculativeCountsFailOnlyTheirOwnLane() {
           "invalid speculative counts poisoned another request's completion");
 }
 
+// A conversation that finished and one that decodes: an ordinary replay
+// point and one in use, beside the store's chunks above its floor; the KV
+// in extents of `extentPages` pages.
+struct StoreFixture {
+  explicit StoreFixture(uint32_t lanes = 2, uint32_t extentPages = 4)
+      : storage(16, 4096, extentPages), executor(lanes) {
+    guardReleases(storage, engine);
+    engine.submit(request(1, std::vector<uint32_t>(65, 1)));
+    tickUntil(engine, now, [&] { return idle(engine); }, "the first conversation did not finish");
+    executor.decodeFinishes = false;
+    auto running = request(2, std::vector<uint32_t>(65, 2));
+    running.maxNewTokens = 1000;
+    engine.submit(std::move(running));
+    tickUntil(engine, now, [&] { return events.outputs[2].size() >= 2; },
+              "the long decode did not start");
+    require(resources.snapshot().stateCache.entries == 2 &&
+                resources.snapshot().stateCache.inUse == 1,
+            "the fixture did not cache an ordinary replay point and one in use");
+  }
+  // Lets the decode finish.
+  void finish() {
+    executor.decodeFinishes = true;
+    tickUntil(engine, now, [&] { return idle(engine); }, "the decode did not finish");
+    require(events.failedCount == 0, "a request failed");
+  }
+
+  test::TestKvStorage storage;
+  KvPool pool{storage, 0};
+  engine::Cache resources{pool, nullptr, nullptr};
+  Executor executor;
+  Events events;
+  engine::Engine engine{test::engineConfig(), resources, executor, events};
+  double now = 1;
+};
+
+// A paced pass the host is short for takes what nothing in use holds, then
+// the expert store's chunks above its floor, one per step, and only then,
+// for a request that waits, what is in use: the replay point a running
+// request uses outlasts the store. With the store at its floor the pass goes
+// straight on to what is in use. Critical pressure keeps the same order and
+// takes the whole store down to its floor in one step
+// (Model::releaseExpertsToFloor). Either reports nothing left only once the
+// store is at its floor too.
+void testPressurePassTakesTheExpertStoreBeforeWhatIsInUse() {
+  enum class Pass { Short, AtFloor, Critical };
+  for (const Pass pass : {Pass::Short, Pass::AtFloor, Pass::Critical}) {
+    StoreFixture fixture;
+    Executor &executor = fixture.executor;
+    if (pass != Pass::AtFloor)
+      executor.expertChunks = {1000, 1000};
+    // The state cache's entries and in-use evictions as each chunk goes.
+    std::vector<std::pair<uint32_t, uint64_t>> atRelease;
+    executor.expertReleaseObserver = [&] {
+      const auto state = fixture.resources.snapshot().stateCache;
+      atRelease.emplace_back(state.entries, state.inUseEvictions);
+    };
+    executor.reclaimSteps.clear();
+    const MemoryReclaimResult result = fixture.engine.reclaimMemory(
+        pass == Pass::Critical
+            ? MemoryReclaimDirective{.critical = true, .hostShort = true}
+            : MemoryReclaimDirective{.targetBytes = std::numeric_limits<uint64_t>::max(),
+                                     .upTo = ReclaimClass::InUse,
+                                     .hostShort = true});
+    const auto state = fixture.resources.snapshot().stateCache;
+    const std::vector<std::pair<uint32_t, uint64_t>> expected =
+        pass == Pass::AtFloor ? std::vector<std::pair<uint32_t, uint64_t>>{}
+                              : std::vector<std::pair<uint32_t, uint64_t>>{{1, 0}, {1, 0}};
+    require(atRelease == expected,
+            "the store's chunks did not go after the ordinary replay point and before the one in use");
+    require(executor.expertChunks.empty() && state.entries == 0 && state.inUseEvictions == 1 &&
+                result.outcome == ReclaimOutcome::Exhausted &&
+                result.releasedBytes >= (pass == Pass::AtFloor ? 0U : 2000U),
+            "the pass did not take the whole store and what is in use before reporting nothing left");
+    // The ordinary replay point's buffers, the store's chunks, then the
+    // buffers of the replay point in use.
+    using Step = Executor::ReclaimStep;
+    const std::vector<Step> steps =
+        pass == Pass::AtFloor
+            ? std::vector<Step>{Step::Buffers, Step::Buffers}
+            : std::vector<Step>{Step::Buffers, Step::ExpertRelease, Step::ExpertRelease, Step::Buffers};
+    require(executor.reclaimSteps == steps &&
+                fixture.engine.expertReleases() ==
+                    (pass == Pass::AtFloor ? 0U : pass == Pass::Critical ? 1U : 2U) &&
+                executor.expertsToFloor == (pass == Pass::Critical ? 1U : 0U),
+            "the model's reclaim steps did not run in the class order, or went uncounted");
+    fixture.finish();
+  }
+}
+
+// Only a host that is really short gives the expert store's chunks back: a
+// pass macOS's warning alone asks for returns cache and keeps the store,
+// reporting nothing left that it may take. A measured deficit takes one
+// chunk per step while the target is unmet, and only once the store is at
+// its floor does a pass report nothing left.
+void testOnlyAShortHostTakesTheExpertStore() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor(1);
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+  constexpr uint64_t chunk = 1ULL << 30;
+  executor.expertChunks = {chunk, chunk, chunk};
+  MemoryPressurePolicy policy;
+  MemoryGovernorSnapshot host{.pressure = MemoryPressure::Warning,
+                              .hostMeasurementValid = true,
+                              .hostHeadroomBytes = 16 * chunk,
+                              .systemPressure = MemoryPressure::Warning};
+  const MemoryReclaimResult warned = engine.reclaimMemory(policy.update(host, 0.0, false).value());
+  require(executor.expertChunks.size() == 3 && !warned.releasedBytes &&
+              warned.outcome == ReclaimOutcome::Exhausted,
+          "macOS's warning alone took the expert store");
+  host.systemPressure = MemoryPressure::Normal;
+  host.hostHeadroomBytes = chunk / 2;
+  const MemoryReclaimResult deficit = engine.reclaimMemory(policy.update(host, 1000.0, false).value());
+  require(executor.expertChunks.size() == 2 && deficit.releasedBytes == chunk &&
+              deficit.outcome == ReclaimOutcome::Met,
+          "a measured deficit did not take one chunk of the store");
+  const MemoryReclaimResult two =
+      engine.reclaimMemory({.targetBytes = chunk + chunk / 2, .hostShort = true});
+  require(executor.expertChunks.empty() && two.releasedBytes == 2 * chunk &&
+              two.outcome == ReclaimOutcome::Met,
+          "a pass did not take a chunk per step while its target was unmet");
+  const MemoryReclaimResult floor = engine.reclaimMemory({.targetBytes = 64, .hostShort = true});
+  require(!floor.releasedBytes && floor.outcome == ReclaimOutcome::Exhausted,
+          "a store at its floor did not leave the pass with nothing left");
+}
+
+// A refusal of the engine's limit takes what nothing in use holds, then one
+// chunk of the expert store, and the allocation retries before anything in
+// use goes: a decoding lane's KV takes one chunk and its replay point stays,
+// and so does a start beside it, which takes nothing in use at all. A
+// refusal of the host leaves the store to the paced passes.
+void testEngineLimitTakesTheExpertStoreBeforeWhatIsInUse() {
+  enum class Refused { DecodeKv, StartBeside, HostKv };
+  for (const Refused refused : {Refused::DecodeKv, Refused::StartBeside, Refused::HostKv}) {
+    StoreFixture fixture;
+    Executor &executor = fixture.executor;
+    engine::Engine &engine = fixture.engine;
+    // Nothing but what is in use is left in the cache.
+    while (fixture.resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary)
+               .madeProgress) {
+    }
+    executor.expertChunks = {1000, 1000};
+    if (refused == Refused::StartBeside) {
+      executor.beginGrowthBlocked = [&] { return executor.releasedExpertChunks.empty(); };
+      engine.submit(request(3, std::vector<uint32_t>(65, 3)));
+      tickUntil(engine, fixture.now, [&] { return fixture.events.startIds.size() == 3; },
+                "the start beside the decoding lane did not start");
+    } else {
+      bool hostAllows = false;
+      if (refused == Refused::HostKv)
+        fixture.storage.allocationFailure = metal::AllocationFailure::HostPressure;
+      fixture.storage.growthAllowed = [&](uint32_t) {
+        return refused == Refused::HostKv ? hostAllows : !executor.releasedExpertChunks.empty();
+      };
+      // The decode outgrows the extents it holds.
+      const auto decoded = [&] { return fixture.events.outputs[2].size() >= 300; };
+      if (refused == Refused::HostKv) {
+        for (int step = 0; step < 100 && !decoded(); ++step)
+          static_cast<void>(engine.tick(fixture.now++));
+        require(!decoded() && executor.expertChunks.size() == 2,
+                "the host did not refuse the decode, or its refusal took a chunk of the expert store");
+        hostAllows = true;
+      }
+      tickUntil(engine, fixture.now, decoded, "the decode did not grow past its first extent");
+    }
+    const size_t taken = refused == Refused::HostKv ? 0 : 1;
+    require(executor.releasedExpertChunks.size() == taken &&
+                fixture.resources.snapshot().stateCache.inUseEvictions == 0,
+            "a refusal of the engine's limit did not take one chunk of the store before what is in use");
+    fixture.storage.growthAllowed = {};
+    fixture.finish();
+  }
+}
+
+// The control pass's growth of the expert store takes one chunk a call, and
+// with a request in the engine or without, only room the engine's limit has
+// free: it asks for none it lacks and takes no cache for it, which only the
+// exchange takes (reclaimForExperts). So it does beside a resident lane,
+// beside a request queued before its first tick, and with none.
+void testExpertGrowthTakesOnlyFreeRoom() {
+  StoreFixture fixture;
+  Executor &executor = fixture.executor;
+  engine::Engine &engine = fixture.engine;
+  const auto entries = [&] { return fixture.resources.snapshot().stateCache.entries; };
+  executor.expertChunks = {1000};
+  executor.releasedExpertChunks = {1000, 1000};
+  require(!engine.growExperts(999) && executor.expertGrowthAttempts == 0,
+          "growth beside a resident lane asked for room the engine's limit lacked");
+  require(engine.growExperts(1000) && executor.expertChunks.size() == 2 &&
+              executor.releasedExpertChunks.size() == 1,
+          "growth beside a resident lane did not take one chunk into free room");
+  fixture.finish();
+  require(entries() == 2, "the fixture did not keep its two replay points");
+  executor.reclaimSteps.clear();
+  uint32_t attempts = executor.expertGrowthAttempts;
+  require(!engine.growExperts(0) && executor.expertGrowthAttempts == attempts && entries() == 2 &&
+              executor.reclaimSteps.empty(),
+          "growth with no request asked for room the engine's limit lacked, or took cache for it");
+  require(engine.growExperts(1000) && executor.expertChunks.size() == 3 &&
+              executor.releasedExpertChunks.empty(),
+          "growth with no request did not take one chunk into free room");
+  require(!engine.growExperts(1000), "a store at its cap grew");
+  // A request queued before its first tick holds the cache it may look up.
+  executor.expertChunks.pop_back();
+  executor.releasedExpertChunks = {1000};
+  attempts = executor.expertGrowthAttempts;
+  engine.submit(request(3, std::vector<uint32_t>(65, 2)));
+  require(!engine.growExperts(0) && executor.expertGrowthAttempts == attempts && entries() == 2,
+          "growth beside a queued request asked for room the engine's limit lacked, or took cache");
+  require(engine.growExperts(1000) && executor.expertChunks.size() == 3,
+          "growth beside a queued request did not take free room");
+  tickUntil(engine, fixture.now, [&] { return idle(engine); }, "the queued request did not finish");
+}
+
+// The cache's side of the control pass's exchange for a chunk of the expert
+// store takes nothing beside a request, resident or queued before its first
+// tick. With none it takes cache only when all it may take covers the bytes
+// asked for, and then returns memory to the system until what it returned
+// covers them: idle buffers beyond one lane's, then the cache nothing in use
+// holds, releasing the extents it empties, but never the resume point, which
+// the newest conversation's next turn resumes from, nor the runway extent.
+// It reports only what left the engine: the extents released and the
+// buffers the model released. What it may take is exactly what it returns:
+// a byte more takes nothing.
+void testExpertExchangeReturnsCacheToTheSystem() {
+  StoreFixture fixture(2, 2);
+  Executor &executor = fixture.executor;
+  engine::Engine &engine = fixture.engine;
+  const KvPool &pool = fixture.pool;
+  constexpr uint64_t extentBytes = 2 * 4096;
+  const auto entries = [&] { return fixture.resources.snapshot().stateCache.entries; };
+  // What left the engine since `allocated` and `buffers` were read.
+  uint64_t allocated = pool.snapshot().allocatedBytes;
+  uint64_t buffers = executor.reclaimedIdleStateBytes;
+  const auto left = [&] {
+    return allocated - pool.snapshot().allocatedBytes + executor.reclaimedIdleStateBytes - buffers;
+  };
+  require(engine.reclaimForExperts(1) == 0 && left() == 0 && entries() == 2,
+          "the exchange took memory beside a resident lane");
+  fixture.finish();
+  const std::vector<uint32_t> newest(65, 3);
+  engine.submit(request(3, newest));
+  allocated = pool.snapshot().allocatedBytes;
+  require(engine.reclaimForExperts(1) == 0 && left() == 0 && entries() == 2,
+          "the exchange took memory beside a queued request");
+  tickUntil(engine, fixture.now, [&] { return idle(engine); }, "the queued request did not finish");
+  require(entries() == 3, "the fixture did not keep three replay points");
+
+  allocated = pool.snapshot().allocatedBytes;
+  buffers = executor.reclaimedIdleStateBytes;
+  const uint64_t first = engine.reclaimForExperts(1);
+  require(first != 0 && first == left() && entries() == 2,
+          "the exchange did not stop once what left the engine covered the bytes asked for, or "
+          "counted memory that stayed");
+  allocated = pool.snapshot().allocatedBytes;
+  buffers = executor.reclaimedIdleStateBytes;
+  const uint64_t extentReleases = pool.snapshot().extentReleases;
+  // All it may take is the extents of the two other conversations and the
+  // buffers of the state left beside the resume point.
+  const uint64_t cover = 2 * extentBytes + test::State().bytes();
+  require(engine.reclaimForExperts(cover + 1) == 0 && left() == 0 && entries() == 2 &&
+              pool.snapshot().extentReleases == extentReleases &&
+              executor.reclaimedIdleStateBytes == buffers,
+          "the exchange took cache that could not cover the bytes asked for");
+  const uint64_t rest = engine.reclaimForExperts(cover);
+  // The resume point's extent and the empty runway stay.
+  require(rest == cover && rest == left() && pool.snapshot().extentReleases == extentReleases + 2 &&
+              pool.snapshot().allocatedBytes == 2 * extentBytes &&
+              pool.snapshot().reclaimableBytes == extentBytes && entries() == 1 &&
+              engine.reclaimForExperts(1) == 0,
+          "the exchange did not return all but the resume point and the runway extent");
+  const uint64_t hits = engine.snapshot().cacheHits;
+  engine.submit(request(4, newest));
+  tickUntil(engine, fixture.now, [&] { return idle(engine); }, "the follow-up did not finish");
+  require(engine.snapshot().cacheHits == hits + 1,
+          "the newest conversation did not resume from the state the exchange kept");
+}
+
+// With a tier that takes writes, the exchange starts no copy to the SSD
+// cache, whose memory would come back only after the call: cache that needs
+// one stays and counts for nothing, so a call it could cover only once copies
+// had landed takes nothing. A conversation whose state and KV have copies on
+// the SSD leaves at once, and a state a lookup pins stays with its KV. When
+// what leaves at once covers the bytes asked for, the call returns them,
+// starting no copy, and the rest stays in RAM.
+void testExpertExchangeTakesOnlyWhatLeavesAtOnce() {
+  constexpr uint64_t pageBytes = 4096;
+  test::TestKvStorage storage(8, pageBytes, 1);
+  // Four conversations' pages and the runway.
+  KvPool pool(storage, 5);
+  test::TestKvTier tier(true);
+  engine::Cache cache(pool, &tier, nullptr);
+  Executor executor;
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, executor, events);
+  guardReleases(storage, engine);
+  // Four conversations of a page each, the newest the resume point; a state
+  // write lands as soon as the cache collects it.
+  auto transfer = std::make_shared<OffloadControl>();
+  transfer->ready = true;
+  constexpr uint32_t tokens = KvCache::pageTokens;
+  std::vector<std::vector<uint32_t>> prompts;
+  std::vector<uint64_t> leaves;
+  for (uint64_t id = 1; id <= 4; ++id) {
+    std::vector<uint32_t> &prompt = prompts.emplace_back(tokens + 1);
+    std::iota(prompt.begin(), prompt.end(), static_cast<uint32_t>(1000 * id));
+    cache.beginRequest(id);
+    require(cache.ensureTokens(id, tokens).granted(), "fixture KV failed");
+    leaves.push_back(test::publishBlocks(cache, id, prompt, tokens));
+    cache.publishCompositeState(
+        leaves.back(), std::make_shared<OffloadState>(transfer, executor.evictedStateBytes), false);
+    cache.endRequest(id);
+  }
+  const uint64_t stateBytes = test::State().bytes();
+  const auto copies = [&] { return tier.writes.size() + cache.snapshot().stateCache.offloads; };
+  const auto ramStates = [&] { return cache.snapshot().stateCache.bytes / stateBytes; };
+  const auto releases = [&] { return pool.snapshot().extentReleases; };
+  require(engine.reclaimForExperts(pageBytes) == 0 && copies() == 0 && ramStates() == 4 && releases() == 0,
+          "the exchange took cache that needs a copy to the SSD cache, or started one");
+
+  // The two oldest conversations keep copies of their states and pages,
+  // which stay in RAM (Cache::persist).
+  for (const uint64_t leaf : {leaves[0], leaves[1]}) {
+    require(cache.persist(leaf) == PersistStatus::Started, "the fixture's copies did not start");
+    tier.complete();
+    static_cast<void>(cache.pollTransfers());
+  }
+  require(cache.persist(leaves[1]) == PersistStatus::Durable, "the fixture's copies did not land");
+  const size_t copied = copies();
+  // A lookup of the second pins its state.
+  CacheLookup pinned = cache.lookup(prompts[1], {});
+  require(pinned.state && pinned.state->kvBlock() == leaves[1], "the fixture's lookup pinned no state");
+  const uint64_t oldest = pageBytes + stateBytes;
+  require(engine.reclaimForExperts(oldest + 1) == 0 && copies() == copied && ramStates() == 4 &&
+              releases() == 0,
+          "the exchange took cache that could not cover the bytes asked for at once");
+  require(engine.reclaimForExperts(oldest) == oldest && copies() == copied && ramStates() == 3 &&
+              releases() == 1 && cache.stateResident(leaves[1]) && cache.stateResident(leaves[2]),
+          "the exchange did not return the oldest conversation's copied cache alone");
+  // Released, the pinned state is the newest, and the resume point; the
+  // third conversation still needs copies.
+  pinned.state.reset();
+  require(engine.reclaimForExperts(1) == 0 && copies() == copied && ramStates() == 3 && releases() == 1,
+          "the exchange took the resume point or cache that needs a copy");
+}
+
+// The exchange passes over what needs a copy to the SSD cache before it
+// leaves, starting none, and takes newer cache that leaves at once: an older
+// state that needs a write stays, and the newer states of its class with it;
+// an older page whose state is on the SSD stays until a copy of it is.
+void testExpertExchangePassesOverWhatNeedsACopy() {
+  constexpr uint64_t pageBytes = 4096;
+  test::TestKvStorage storage(8, pageBytes, 1);
+  // Five conversations' pages and the runway.
+  KvPool pool(storage, 6);
+  test::TestKvTier tier(true);
+  engine::Cache cache(pool, &tier, nullptr);
+  Executor executor;
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, executor, events);
+  guardReleases(storage, engine);
+  // A state write lands as soon as the cache collects it.
+  auto transfer = std::make_shared<OffloadControl>();
+  transfer->ready = true;
+  constexpr uint32_t tokens = KvCache::pageTokens;
+  // A conversation of a page with its state in RAM, and its prompt.
+  const auto publish = [&](uint64_t id) {
+    std::vector<uint32_t> prompt(tokens + 1);
+    std::iota(prompt.begin(), prompt.end(), static_cast<uint32_t>(1000 * id));
+    cache.beginRequest(id);
+    require(cache.ensureTokens(id, tokens).granted(), "fixture KV failed");
+    const uint64_t leaf = test::publishBlocks(cache, id, prompt, tokens);
+    cache.publishCompositeState(
+        leaf, std::make_shared<OffloadState>(transfer, executor.evictedStateBytes), false);
+    cache.endRequest(id);
+    return std::pair{leaf, prompt};
+  };
+  const auto land = [&] {
+    tier.complete();
+    static_cast<void>(cache.pollTransfers());
+  };
+  // The first conversation's state and page have copies on the SSD, and only
+  // its state left RAM, for nothing.
+  const auto [copied, copiedPrompt] = publish(1);
+  require(cache.persist(copied) == PersistStatus::Started, "the fixture's copies did not start");
+  land();
+  require(cache.reclaimStateForLane(ReclaimClass::Ordinary).evictedState,
+          "the fixture's copied state did not leave RAM");
+  // The second's state was written to the SSD, and its page has no copy.
+  const uint64_t uncopied = publish(2).first;
+  require(cache.reclaimStateForLane(ReclaimClass::Ordinary).evictedState,
+          "the fixture's state did not go to the SSD");
+  land();
+  // Three in RAM: the oldest state needs a write, the next has copies of its
+  // state and page, and the newest is the resume point.
+  const uint64_t unwritten = publish(3).first;
+  const uint64_t blocked = publish(4).first;
+  require(cache.persist(blocked) == PersistStatus::Started, "the fixture's copies did not start");
+  land();
+  publish(5);
+  // A lookup makes the first conversation's page the newest.
+  require(cache.lookup(copiedPrompt, {}).kvBoundary == tokens, "the fixture's lookup missed");
+  const size_t copies = tier.writes.size() + cache.snapshot().stateCache.offloads;
+  const auto ramStates = [&] { return cache.snapshot().stateCache.bytes / test::State().bytes(); };
+  // The buffers of the two states that left RAM, and the first page.
+  const uint64_t leaving = 2 * test::State().bytes() + pageBytes;
+  require(engine.reclaimForExperts(leaving + 1) == 0 && ramStates() == 3 &&
+              pool.snapshot().extentReleases == 0,
+          "the exchange took cache that could not cover the bytes asked for at once");
+  require(engine.reclaimForExperts(leaving) == leaving && pool.snapshot().extentReleases == 1 &&
+              ramStates() == 3 && cache.stateResident(unwritten) && cache.stateResident(blocked) &&
+              cache.copiedBlocks(uncopied) == 0 &&
+              tier.writes.size() + cache.snapshot().stateCache.offloads == copies,
+          "the exchange did not take the cache that leaves at once alone, or started a copy");
+}
+
+// A pass the host is short for leaves the expert store while the cache
+// nothing in use holds waits for its copies to the SSD cache: the pass ends
+// Pending, and the passes that continue it once the copies land take that
+// cache leaf by leaf, the store's chunks only once no cached KV is left in
+// memory.
+void testShortPassWaitsForCopiesBeforeTheExpertStore() {
+  test::TestKvStorage storage(4, 100, 1);
+  KvPool pool(storage, 4);
+  test::TestKvTier tier;
+  engine::Cache cache(pool, &tier, nullptr);
+  Executor executor;
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, executor, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> prompt(129);
+  std::iota(prompt.begin(), prompt.end(), 1000);
+  cache.beginRequest(1);
+  require(cache.ensureTokens(1, 128).granted(), "fixture KV failed");
+  const uint64_t leaf = test::publishBlocks(cache, 1, prompt, 128);
+  auto transfer = std::make_shared<OffloadControl>();
+  transfer->ready = true;
+  cache.publishCompositeState(
+      leaf, std::make_shared<OffloadState>(transfer, executor.evictedStateBytes), false);
+  cache.endRequest(1);
+  executor.expertChunks = {1000, 1000};
+  std::vector<uint32_t> prefixAtRelease;
+  executor.expertReleaseObserver = [&] { prefixAtRelease.push_back(pool.snapshot().pagesPrefix); };
+  uint64_t target = 100'000;
+  const auto reclaim = [&] {
+    return engine.reclaimMemory(
+        {.targetBytes = target, .upTo = ReclaimClass::Ordinary, .hostShort = true});
+  };
+  MemoryReclaimResult result = reclaim();
+  require(result.outcome == ReclaimOutcome::Pending && tier.demotions == 1 &&
+              executor.expertChunks.size() == 2,
+          "a short pass took the store while cache nothing in use holds waited for its copy");
+  for (int pass = 0; pass < 16 && result.outcome == ReclaimOutcome::Pending; ++pass) {
+    target -= std::min(target, result.releasedBytes);
+    tier.complete();
+    result = reclaim();
+  }
+  require(result.outcome == ReclaimOutcome::Exhausted && executor.expertChunks.empty() &&
+              tier.demotions > 1 && prefixAtRelease == std::vector<uint32_t>{0, 0},
+          "the passes that continued a short pass took the store before the cache that waited for its "
+          "copies");
+}
+
+// The KV a prefill command takes past its first state boundary only
+// lengthens the command: refused at the engine's limit with nothing
+// ordinary left, it takes neither the expert store nor what is in use, and
+// the command ends at the boundary.
+void testCaptureKvPastABoundaryTakesNothingInUse() {
+  StoreFixture fixture(2, 1);
+  Executor &executor = fixture.executor;
+  engine::Engine &engine = fixture.engine;
+  while (fixture.resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary)
+             .madeProgress) {
+  }
+  static_cast<void>(fixture.resources.releaseEmptyExtents(false));
+  executor.expertChunks = {1000};
+  // The engine's limit refuses growth from the replay point's reservation
+  // to the command's submission.
+  bool refusing = false;
+  executor.reservationObserver = [&] { refusing = true; };
+  executor.submitObserver = [&] { refusing = false; };
+  fixture.storage.growthAllowed = [&](uint32_t) { return !refusing; };
+  const uint64_t cuts = engine.snapshot().captureCuts;
+  engine.submit(request(3, std::vector<uint32_t>(129, 3)));
+  tickUntil(engine, fixture.now, [&] { return engine.snapshot().captureCuts > cuts; },
+            "the command did not end at its boundary");
+  require(fixture.resources.snapshot().stateCache.inUseEvictions == 0 && executor.expertChunks.size() == 1,
+          "the KV past a boundary took the expert store or what is in use");
+  executor.reservationObserver = {};
+  executor.submitObserver = {};
+  fixture.storage.growthAllowed = {};
+  fixture.finish();
+}
+
+// The prompt's replay point, refused at the engine's limit with nothing
+// ordinary left, takes a chunk of the expert store above its floor before
+// another request's state in use, which goes only with the store at its
+// floor.
+void testReplayPointTakesTheExpertStoreBeforeWhatIsInUse() {
+  for (const bool atFloor : {false, true}) {
+    StoreFixture fixture;
+    Executor &executor = fixture.executor;
+    while (fixture.resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary)
+               .madeProgress) {
+    }
+    static_cast<void>(fixture.resources.releaseEmptyExtents(false));
+    if (!atFloor)
+      executor.expertChunks = {1000, 1000};
+    // Refused until a chunk went, or the state in use did.
+    executor.reservationRoom = [&] {
+      return !executor.releasedExpertChunks.empty() ||
+             fixture.resources.snapshot().stateCache.inUseEvictions != 0;
+    };
+    const uint64_t publications = fixture.engine.snapshot().replayStatePublications;
+    fixture.engine.submit(request(3, std::vector<uint32_t>(65, 3)));
+    tickUntil(fixture.engine, fixture.now,
+              [&] { return fixture.engine.snapshot().replayStatePublications > publications; },
+              "the replay point was not published");
+    require(executor.releasedExpertChunks.size() == (atFloor ? 0U : 1U) &&
+                fixture.resources.snapshot().stateCache.inUseEvictions == (atFloor ? 1U : 0U),
+            atFloor ? "the replay point did not take a state in use with the store at its floor"
+                    : "the replay point took a state in use before a chunk of the expert store");
+    executor.reservationRoom = {};
+    fixture.finish();
+  }
+}
+
 int main() {
   try {
     testSpeculativeCountsStayWithEachConcurrentRequest();
@@ -12333,6 +12865,16 @@ int main() {
     testHeldBackStartTakesNothingInUse();
     testLaneThatWouldYieldTakesNothingInUse();
     testPacedPassKeepsInServiceReplayPoint();
+    testPressurePassTakesTheExpertStoreBeforeWhatIsInUse();
+    testOnlyAShortHostTakesTheExpertStore();
+    testEngineLimitTakesTheExpertStoreBeforeWhatIsInUse();
+    testExpertGrowthTakesOnlyFreeRoom();
+    testExpertExchangeReturnsCacheToTheSystem();
+    testExpertExchangeTakesOnlyWhatLeavesAtOnce();
+    testExpertExchangePassesOverWhatNeedsACopy();
+    testShortPassWaitsForCopiesBeforeTheExpertStore();
+    testCaptureKvPastABoundaryTakesNothingInUse();
+    testReplayPointTakesTheExpertStoreBeforeWhatIsInUse();
     testReplayPointAdmittedInMarginBand();
     testEveryEndReleasesTheReplayPoint();
     testWaitingEndsReleaseTheReplayPoint();

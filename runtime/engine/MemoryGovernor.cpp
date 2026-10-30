@@ -168,7 +168,7 @@ uint64_t MemoryGovernor::hostHeadroomBytes(const std::optional<HostMemory> &host
 }
 
 std::optional<MemoryGovernor::Reservation>
-MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
+MemoryGovernor::tryReserve(uint64_t bytes, bool optional, metal::AllocationFailure &failure) {
   if (!bytes) {
     throw std::invalid_argument("memory reservation must be positive");
   }
@@ -185,20 +185,28 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   // Growth leaves the warning margin free above the host's spare reserve,
   // stops while macOS warns and, while a request waits for memory, waits for
   // the recovery margin once the host has run short, unless a request in
-  // service needs it (setServing).
+  // service needs it (setServing). Optional growth leaves the recovery
+  // margin free, whatever the mark, but takes from the host only the bytes
+  // beyond those the engine returned to the system for it (setGrowthCredit):
+  // with none beyond them, no margin holds it back on a measured host.
+  const bool serving = serving_ && !optional;
   const uint64_t hostRoom = hostHeadroomBytes(host, 0);
+  const uint64_t margin = optional ? kHostRecoveryMarginBytes : kHostWarningMarginBytes;
+  const uint64_t credited = optional ? std::min(bytes, growthCreditBytes_) : 0;
+  const uint64_t hostRequested = requested - credited;
   const bool hostRoomFits =
-      requested <= hostRoom && hostRoom - requested >= kHostWarningMarginBytes;
+      host && (credited == bytes || (hostRequested <= hostRoom && hostRoom - hostRequested >= margin));
   // A request that only the host headroom refuses waits for host memory
   // while the idle headroom may still clear the margin. Hold host pressure:
   // once a control pass finds the request waiting, the paced reclaim frees
-  // toward the recovery margin for it.
-  if (engineFits && !serving_ && !hostRoomFits)
+  // toward the recovery margin for it. Optional growth that the host
+  // refuses is done without, and asks no reclaim.
+  if (engineFits && !serving && !optional && !hostRoomFits)
     host_.constrained = true;
   const bool hostRefuses =
       pressure == MemoryPressure::Critical ||
-      (!serving_ && (systemPressure_ == MemoryPressure::Warning || !hostRoomFits ||
-                     growthHeld(host_)));
+      (!serving && (systemPressure_ == MemoryPressure::Warning || !hostRoomFits ||
+                    growthHeld(host_)));
   if (hostRefuses || !engineFits) {
     // The host's refusal lifts with its pressure, the limit's only once
     // memory is freed: a refusal they share is the host's.
@@ -214,10 +222,18 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
 }
 
 metal::AllocationAdmission MemoryGovernor::allocationAdmission() noexcept {
-  return [this](uint64_t bytes, const std::function<void()> &allocate)
+  return admission(false);
+}
+
+metal::AllocationAdmission MemoryGovernor::growthAdmission() noexcept {
+  return admission(true);
+}
+
+metal::AllocationAdmission MemoryGovernor::admission(bool optional) noexcept {
+  return [this, optional](uint64_t bytes, const std::function<void()> &allocate)
              -> metal::AllocationResult {
     metal::AllocationFailure failure;
-    auto reservation = tryReserve(bytes, failure);
+    auto reservation = tryReserve(bytes, optional, failure);
     if (!reservation)
       return failure;
     try {
@@ -232,6 +248,10 @@ metal::AllocationAdmission MemoryGovernor::allocationAdmission() noexcept {
 
 bool MemoryGovernor::setServing(bool serving) noexcept {
   return std::exchange(serving_, serving);
+}
+
+uint64_t MemoryGovernor::setGrowthCredit(uint64_t bytes) noexcept {
+  return std::exchange(growthCreditBytes_, bytes);
 }
 
 void MemoryGovernor::setRequestWaiting(bool waiting) noexcept {
@@ -329,7 +349,7 @@ std::optional<MemoryReclaimDirective> MemoryPressurePolicy::update(
     return std::nullopt;
   }
   if (snapshot.pressure == MemoryPressure::Critical)
-    return MemoryReclaimDirective{.critical = true};
+    return MemoryReclaimDirective{.critical = true, .hostShort = true};
   if (nowMilliseconds < nextReclaimMilliseconds_)
     return continued_.value_or(MemoryReclaimDirective{});
   continued_.reset();
@@ -354,11 +374,15 @@ std::optional<MemoryReclaimDirective> MemoryPressurePolicy::update(
   // headroom: while it lasts, every pass returns as much as a pass may,
   // still short of what is in use unless a request waits, and keeps the
   // resume point even for a waiting request, whose growth the warning
-  // refuses as well, so that what the pass frees would not reach it.
+  // refuses as well, so that what the pass frees would not reach it. Only a
+  // measured deficit has the pass take the expert store above its floor: the
+  // warning alone asks caches, and the experts a smaller store evicts are
+  // read from the SSD again at every step that routes them.
   const bool warning = snapshot.systemPressure == MemoryPressure::Warning;
   const uint64_t margin = requestWaiting ? kHostRecoveryMarginBytes : kHostWarningMarginBytes;
   const uint64_t deficit =
       snapshot.hostHeadroomBytes < margin ? margin - snapshot.hostHeadroomBytes : 0;
+  const bool hostShort = snapshot.hostMeasurementValid && deficit != 0;
   const uint64_t desired = warning ? kHostWarningMarginBytes : deficit;
   // The host samples every 500 ms. Allow counters to settle after a pass
   // with a target, but keep responding if another application continues
@@ -369,7 +393,8 @@ std::optional<MemoryReclaimDirective> MemoryPressurePolicy::update(
   return MemoryReclaimDirective{
       .targetBytes = std::min(desired, kHostWarningMarginBytes),
       .keepResumePoint = !requestWaiting || warning,
-      .upTo = requestWaiting ? ReclaimClass::InUse : ReclaimClass::Ordinary};
+      .upTo = requestWaiting ? ReclaimClass::InUse : ReclaimClass::Ordinary,
+      .hostShort = hostShort};
 }
 
 void MemoryPressurePolicy::reclaimed(const MemoryReclaimDirective &directive,
