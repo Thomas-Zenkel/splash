@@ -104,7 +104,7 @@ final class ChatStore {
 
     /// Sends `text` and `images` in the open conversation, or a new one, to the model `server`
     /// serves, and streams its reply into the conversation.
-    func send(_ text: String, images: [Data], to server: ChatTarget, countedTokens: Int? = nil) {
+    func send(_ text: String, images: [Data], to server: ChatTarget) {
         guard streaming == nil else { return }
         var conversation = current ?? Conversation()
         if conversation.title.isEmpty {
@@ -112,7 +112,7 @@ final class ChatStore {
             conversation.title = String(line.prefix(80))
         }
         conversation.messages.append(ChatMessage(role: .user, text: text, images: images))
-        stream(conversation, to: server, countedTokens: countedTokens)
+        stream(conversation, to: server)
     }
 
     /// Answers the open conversation's last message again, in place of the last answer.
@@ -127,7 +127,7 @@ final class ChatStore {
         reply?.cancel()
     }
 
-    private func stream(_ conversation: Conversation, to server: ChatTarget, countedTokens: Int? = nil) {
+    private func stream(_ conversation: Conversation, to server: ChatTarget) {
         var conversation = conversation
         let history = conversation.messages
         var answer = ChatMessage(role: .assistant, text: "", model: server.model)
@@ -141,16 +141,6 @@ final class ChatStore {
             var thinking: Date?
             var read: Double?
             do {
-                // Retries and callers outside the composer get the same check. The composer
-                // already counted this exact prompt, so it needn't tokenize it a second time.
-                if let limit = server.context, limit > 0 {
-                    let count: Int
-                    if let countedTokens { count = countedTokens }
-                    else { count = try await ChatClient.countTokens(history, with: server) }
-                    try Task.checkCancellation()
-                    let usage = ContextUsage(input: count, limit: limit)
-                    guard usage.fits else { throw ChatClient.Failure(errorDescription: usage.problem) }
-                }
                 for try await delta in ChatClient.stream(history, with: server) {
                     if !delta.reasoning.isEmpty, thinking == nil {
                         thinking = .now
@@ -175,8 +165,6 @@ final class ChatStore {
                 }
                 // Cancelled, the stream just ends; what it said stays.
                 if Task.isCancelled { answer.stopped = true }
-            } catch where Task.isCancelled {
-                answer.stopped = true
             } catch {
                 answer.error = error.localizedDescription
             }
@@ -252,8 +240,8 @@ enum ChatClient {
         let errorDescription: String?
     }
 
-    /// Counts the same formatted prompt as generation, including images and earlier reasoning,
-    /// without starting inference or waking a sleeping engine.
+    /// The tokens `messages` take as the model reads them, its template, images and earlier
+    /// thinking included, counted without inference and without waking a sleeping engine.
     static func countTokens(_ messages: [ChatMessage], with server: ChatTarget, session: URLSession = .shared) async throws -> Int {
         let request = try countRequest(messages, with: server)
         let (data, response) = try await session.data(for: request)
@@ -269,6 +257,7 @@ enum ChatClient {
         return count.input_tokens
     }
 
+    /// The request counting `messages`: the prompt `stream` sends, as it sends it.
     static func countRequest(_ messages: [ChatMessage], with server: ChatTarget) throws -> URLRequest {
         var request = URLRequest(url: server.url.appending(path: "v1/chat/completions/count_tokens"))
         request.httpMethod = "POST"
@@ -312,10 +301,7 @@ enum ChatClient {
         }
     }
 
-    /// The request for `messages`: images as data URLs, or a note in their place for a model that
-    /// cannot see them; earlier answers with what the model thought, empty ones left out; the
-    /// reasoning effort unless it is the model's default; and the prompt's progress and the usage
-    /// asked for.
+    /// The request for `messages`: the prompt, streamed, with its progress and the usage asked for.
     static func body(_ messages: [ChatMessage], effort: String, images: Bool) throws -> Data {
         var body = prompt(messages, effort: effort, images: images)
         body["stream"] = true
@@ -324,6 +310,9 @@ enum ChatClient {
         return try JSONSerialization.data(withJSONObject: body)
     }
 
+    /// The prompt of `messages`: images as data URLs, or a note in their place for a model that
+    /// cannot see them; earlier answers with what the model thought, empty ones left out; and the
+    /// reasoning effort unless it is the model's default.
     private static func prompt(_ messages: [ChatMessage], effort: String, images: Bool) -> [String: Any] {
         let wire: [[String: Any]] = messages.compactMap { message in
             switch message.role {

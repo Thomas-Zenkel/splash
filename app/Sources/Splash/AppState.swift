@@ -24,9 +24,8 @@ final class AppState {
     let installer: Installer
     let catalog: Catalog
     let chats: ChatStore
+    /// The count of the next prompt, which the composer's ring shows.
     let chatContext = ChatContext()
-    /// A send checking its prompt before it takes the draft.
-    private(set) var preparingToSend = false
     /// The message being written, kept while the window shows something else.
     let draft = Draft()
     /// The open conversation's page, kept while the window shows something else, so that the Chat
@@ -240,12 +239,8 @@ final class AppState {
         }
     }
 
-    /// Sends a message to the running model.
-    func send(_ text: String, images: [Data]) {
-        target.map { chats.send(text, images: images, to: $0) }
-    }
-
-    /// The next prompt shown by the composer's context indicator, with the draft included.
+    /// The next prompt, the open conversation and the draft, for the composer to count; nil while
+    /// a reply streams or there is nothing to count.
     var contextRequest: ChatContext.Request? {
         guard let target, let limit = target.context, limit > 0, chats.streaming == nil else { return nil }
         let history = chats.current?.messages ?? []
@@ -254,45 +249,44 @@ final class AppState {
         return ChatContext.Request(history: history, text: text, images: draft.images, target: target, started: server.since)
     }
 
-    var canSendDraft: Bool {
-        guard !draft.isEmpty, server.answers, chats.streaming == nil, !preparingToSend,
-              draft.images.isEmpty || server.acceptsImages else { return false }
-        guard let request = contextRequest, let usage = chatContext.usage(for: request) else { return true }
-        return usage.fits
+    /// The count the composer's ring shows: the next prompt's, or the last one of the open
+    /// conversation while the next is counted or a reply streams; none in an empty chat.
+    var contextUsage: ContextUsage? {
+        guard let target else { return nil }
+        let history = chats.current?.messages ?? []
+        guard !history.isEmpty || !draft.isEmpty else { return nil }
+        return chatContext.shown(history: history, target: target, started: server.since)
     }
 
-    /// Checks before clearing the composer. A changed draft, chat or model cancels the send;
-    /// insufficient room or a failed count leaves the user's text and attachments in place.
+    /// Whether the draft can go: a model answers, no reply streams, and the model's context can
+    /// hold the prompt, as far as it has been counted. A count not done, or failed, holds nothing
+    /// back: the server checks the prompt too, and says so if it is too long.
+    var canSendDraft: Bool {
+        guard !draft.isEmpty, server.answers, chats.streaming == nil,
+              draft.images.isEmpty || server.acceptsImages else { return false }
+        return overflow == nil
+    }
+
+    /// The count of the next prompt when the model's context cannot hold it; nil while it fits or
+    /// is not yet counted.
+    var overflow: ContextUsage? {
+        contextRequest.flatMap(chatContext.usage(for:)).flatMap { $0.fits ? nil : $0 }
+    }
+
+    /// Sends the draft to the running model, leaving the composer empty.
     func sendDraft() {
         guard canSendDraft, let target else { return }
-        let request = contextRequest
-        let selection = chats.selection
-        let text = draft.text
-        let images = draft.images
-        preparingToSend = true
-        Task {
-            defer { preparingToSend = false }
-            var countedTokens: Int?
-            if let request {
-                guard let usage = await chatContext.prepare(request), usage.fits else { return }
-                guard contextRequest == request else { return }
-                countedTokens = usage.input
-            }
-            guard self.target == target, chats.selection == selection, chats.streaming == nil,
-                  draft.text == text, draft.images == images else { return }
-            let message = draft.take()
-            chats.send(message.text, images: message.images, to: target, countedTokens: countedTokens)
-        }
+        let message = draft.take()
+        chats.send(message.text, images: message.images, to: target)
     }
 
     /// Asks the running model again for the open conversation's last answer.
     func retry() {
-        guard !preparingToSend else { return }
         target.map(chats.retry(with:))
     }
 
     private var target: ChatTarget? {
-        guard server.answers, let model = server.model else { return nil }
+        guard server.phase == .ready, let model = server.model else { return nil }
         return ChatTarget(url: server.settings.url, model: model, acceptsImages: server.acceptsImages, effort: effort,
                           context: server.context, apiKey: server.settings.apiKey)
     }

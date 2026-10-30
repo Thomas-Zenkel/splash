@@ -1,34 +1,47 @@
 import Foundation
 import Observation
 
-/// The space the next prompt leaves in the running model's context. Thinking and the answer
-/// share the remaining tokens; keep a useful minimum free rather than sending a prompt that
-/// leaves room for only a few words. This is an allowance, not a cap on the reply's length.
+/// How much of the running model's context the next prompt takes. Thinking and the reply share
+/// what it leaves: a prompt that leaves less than the reply allowance still goes, as a reply may be
+/// short, but one the context cannot hold does not.
 struct ContextUsage: Equatable, Sendable {
+    /// How full the context is: room for a reply, less than the allowance, or no room at all.
+    enum Level { case normal, tight, full }
+
     let input: Int
     let limit: Int
 
-    var reserved: Int { min(4096, max(1, limit / 8)) }
-    var available: Int { max(0, limit - reserved) }
-    var remaining: Int { max(0, limit - input) }
-    var fits: Bool { input <= available }
-    var nearLimit: Bool { Double(input) >= Double(available) * 0.8 }
-    var fraction: Double { min(1, max(0, Double(input) / Double(max(1, limit)))) }
+    /// The room a reply is meant to have: 4,096 tokens, or an eighth of a smaller context.
+    var allowance: Int { min(4096, limit / 8) }
+    var fits: Bool { input < limit }
+    var level: Level { !fits ? .full : input > limit - allowance ? .tight : .normal }
+    /// The share of the context the prompt takes, at most all of it.
+    var fraction: Double { min(1, Double(input) / Double(max(1, limit))) }
 
-    var explanation: String {
-        "\(input.formatted()) of \(limit.formatted()) tokens used, including chat formatting and images. "
-            + "At least \(reserved.formatted()) tokens are kept free for thinking and the reply."
+    /// The exact figures: 12,345 of 262,144 tokens · 5%.
+    var summary: String {
+        let share = (Double(input) / Double(max(1, limit))).formatted(.percent.precision(.fractionLength(0)))
+        return "\(input.formatted()) of \(limit.formatted()) tokens · \(share)"
     }
 
-    var problem: String {
-        "Not enough context for a reply. Shorten this message or start a new chat to leave "
-            + "\(reserved.formatted()) tokens for thinking and the reply."
+    /// What a prompt short of room means for the reply, nil while there is room.
+    var note: String? {
+        switch level {
+        case .normal: nil
+        case .tight: "\((limit - input).formatted()) tokens are left for thinking and the reply."
+        case .full: "Too long for the model’s context. Start a new chat, or shorten the message."
+        }
+    }
+
+    /// The figures and the note, as the composer's ring says them.
+    var explanation: String {
+        [summary, note].compactMap(\.self).joined(separator: "\n")
     }
 }
 
-/// Measures the exact prompt, after a short pause in typing. A result belongs to its whole input:
-/// history, draft, images, model, reasoning effort and context. Editing or switching chats cannot
-/// use an earlier result, even if an old HTTP request finishes after its cancellation.
+/// Counts the next prompt, the open conversation and the draft as the model reads them, after a
+/// pause in typing. A count belongs to its whole prompt: history, draft, images, model, reasoning
+/// effort and context; one finishing after the prompt changed is dropped.
 @MainActor @Observable
 final class ChatContext {
     struct Request: Equatable, Sendable {
@@ -46,70 +59,66 @@ final class ChatContext {
 
     typealias Counter = @Sendable (Request) async throws -> Int
 
-    private(set) var request: Request?
-    private(set) var usage: ContextUsage?
-    private(set) var failure: String?
+    /// The last prompt counted, and its count.
+    private(set) var counted: (request: Request, usage: ContextUsage)?
     @ObservationIgnored private let counter: Counter
-    @ObservationIgnored private var task: Task<ContextUsage?, Never>?
-    @ObservationIgnored private var revision = 0
+    @ObservationIgnored private let delay: Duration
+    /// The prompt being counted, or waiting for typing to pause.
+    @ObservationIgnored private var pending: Request?
+    @ObservationIgnored private var task: Task<Void, Never>?
 
-    init(counter: @escaping Counter = { try await ChatClient.countTokens($0.messages, with: $0.target) }) {
+    init(delay: Duration = .milliseconds(300),
+         counter: @escaping Counter = { try await ChatClient.countTokens($0.messages, with: $0.target) }) {
+        self.delay = delay
         self.counter = counter
     }
 
+    /// The count of exactly `request`, nil until it is counted.
     func usage(for request: Request) -> ContextUsage? {
-        self.request == request ? usage : nil
+        counted.flatMap { $0.request == request ? $0.usage : nil }
     }
 
-    func failure(for request: Request) -> String? {
-        self.request == request ? failure : nil
+    /// The count to show for a conversation of `history` with `target`: the last one, while the
+    /// next is counted, a reply streams or another reasoning effort is chosen, as long as the
+    /// conversation has only grown since by the draft counted and its reply, or had its last answer
+    /// asked again.
+    func shown(history: [ChatMessage], target: ChatTarget, started: Date?) -> ContextUsage? {
+        guard let counted, counted.request.target.sameModel(as: target), counted.request.started == started
+        else { return nil }
+        let base = counted.request.history
+        let grown = history.dropFirst(base.count)
+        // A new chat's count shows only on the chat its message started: other chats share its
+        // empty history. Message ids tell any other conversation apart.
+        let sent = history.starts(with: base) && grown.count <= 2 && (!base.isEmpty || grown.first.map {
+            $0.role == .user && $0.text == counted.request.text && $0.images == counted.request.images
+        } ?? true)
+        let askedAgain = base.last?.role == .assistant && history.count == base.count
+            && history.dropLast().elementsEqual(base.dropLast())
+        return sent || askedAgain ? counted.usage : nil
     }
 
+    /// Counts `request` once typing pauses, in place of the prompt counted before; nil counts
+    /// nothing. A count that fails leaves none: the server checks every prompt it is sent.
     func refresh(_ request: Request?) {
-        guard self.request != request else { return }
-        begin(request, delay: .milliseconds(300))
-    }
-
-    /// Send needn't wait for the typing delay. It checks immediately, or reuses a count of the
-    /// exact same prompt; the draft is taken only after this succeeds.
-    func prepare(_ request: Request) async -> ContextUsage? {
-        if let usage = usage(for: request) { return usage }
-        return await begin(request, delay: .zero)?.value
-    }
-
-    func retry(_ request: Request) {
-        begin(request, delay: .zero)
-    }
-
-    @discardableResult
-    private func begin(_ request: Request?, delay: Duration) -> Task<ContextUsage?, Never>? {
+        guard request != pending else { return }
         task?.cancel()
-        revision += 1
-        let revision = revision
-        self.request = request
-        usage = nil
-        failure = nil
         task = nil
-        guard let request, let limit = request.target.context, limit > 0 else { return nil }
-        let counter = counter
-        let task = Task { [weak self] () -> ContextUsage? in
-            do {
-                try await Task.sleep(for: delay)
-                let count = try await counter(request)
-                try Task.checkCancellation()
-                guard let self, self.revision == revision else { return nil }
-                let usage = ContextUsage(input: count, limit: limit)
-                self.usage = usage
-                self.task = nil
-                return usage
-            } catch {
-                guard !Task.isCancelled, let self, self.revision == revision else { return nil }
-                self.failure = error.localizedDescription
-                self.task = nil
-                return nil
-            }
+        pending = request
+        guard let request, usage(for: request) == nil, let limit = request.target.context, limit > 0 else { return }
+        let counter = counter, delay = delay
+        task = Task { [weak self] in
+            guard (try? await Task.sleep(for: delay)) != nil else { return }
+            let count = try? await counter(request)
+            guard let self, !Task.isCancelled, pending == request else { return }
+            counted = count.map { (request, ContextUsage(input: $0, limit: limit)) }
         }
-        self.task = task
-        return task
+    }
+}
+
+extension ChatTarget {
+    /// Whether `other` is the same model, served the same way, whatever reasoning effort it asks for.
+    func sameModel(as other: ChatTarget) -> Bool {
+        url == other.url && model == other.model && acceptsImages == other.acceptsImages && context == other.context
+            && apiKey == other.apiKey
     }
 }

@@ -47,7 +47,8 @@ final class Draft {
 }
 
 /// Where a message is written: the text and the images attached; under them what the Server runs,
-/// how much the model thinks, and Send, or Stop while a reply streams.
+/// how much of the model's context the next prompt takes, how much the model thinks, and Send, or
+/// Stop while a reply streams.
 struct Composer: View {
     @Environment(AppState.self) private var state
     @Environment(\.colorScheme) private var colorScheme
@@ -62,7 +63,7 @@ struct Composer: View {
                 Attachments(draft: draft)
             }
             ComposerField(text: $draft.text, height: $height, focusRequests: draft.focusRequests,
-                          placeholder: "Message Splash", submit: send, cancel: stop, acceptsImages: images,
+                          placeholder: "Message Splash", submit: state.sendDraft, cancel: stop, acceptsImages: images,
                           attach: draft.attach)
                 .frame(height: min(max(height, 22), 220))
             HStack(spacing: 6) {
@@ -75,14 +76,18 @@ struct Composer: View {
                 }
                 EngineSlot()
                 Spacer(minLength: 12)
+                if let usage = state.contextUsage {
+                    ContextRing(usage: usage)
+                        .transition(.opacity)
+                }
                 EffortMenu()
-                Button { if streaming { state.chats.stop() } else { send() } } label: {
+                Button { if streaming { state.chats.stop() } else { state.sendDraft() } } label: {
                     Image(systemName: streaming ? "stop.fill" : "arrow.up")
                         .font(.system(size: streaming ? 10 : 13, weight: streaming ? .bold : .semibold))
                         .contentTransition(.symbolEffect(.replace))
                 }
                 .buttonStyle(InkCircle())
-                .disabled(!streaming && !sendable)
+                .disabled(!streaming && !state.canSendDraft)
                 .keyboardShortcut(streaming ? KeyboardShortcut(".", modifiers: .command) : nil)
                 .help(streaming ? "Stop" : help)
                 .accessibilityLabel(streaming ? "Stop" : "Send")
@@ -91,9 +96,7 @@ struct Composer: View {
             .buttonStyle(.hover)
             // The first control's glyph on the text's edge.
             .padding(.leading, -6)
-            if state.server.answers, let limit = state.server.context, limit > 0 {
-                ContextIndicator(limit: limit)
-            }
+            .animation(Motion.settle, value: state.contextUsage == nil)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
@@ -104,6 +107,7 @@ struct Composer: View {
         .fileImporter(isPresented: $picking, allowedContentTypes: [.image], allowsMultipleSelection: true) { result in
             draft.attach(((try? result.get()) ?? []).compactMap(NSImage.init(contentsOf:)))
         }
+        // The ring counts the next prompt as it is written.
         .onChange(of: state.contextRequest, initial: true) { _, request in
             state.chatContext.refresh(request)
         }
@@ -114,23 +118,11 @@ struct Composer: View {
         state.chats.streaming != nil && state.chats.streaming == state.chats.current?.id
     }
 
-    private var sendable: Bool {
-        state.canSendDraft
-    }
-
     private var help: String {
         if !state.server.answers { return "Available once a model is running" }
         if !draft.images.isEmpty && !state.server.acceptsImages { return "This model can’t see images" }
-        if state.preparingToSend { return "Checking context…" }
-        if let request = state.contextRequest, let usage = state.chatContext.usage(for: request), !usage.fits {
-            return usage.problem
-        }
+        if let note = state.overflow?.note { return note }
         return "Send"
-    }
-
-    private func send() {
-        guard sendable else { return }
-        state.sendDraft()
     }
 
     /// Stops the open conversation's reply, the way Escape cancels; false when none streams.
@@ -141,64 +133,37 @@ struct Composer: View {
     }
 }
 
-/// The next prompt's exact size and the space left for a reply. Starting a new chat keeps the
-/// draft, so a long conversation can be left behind without losing the next question.
-private struct ContextIndicator: View {
-    @Environment(AppState.self) private var state
-    let limit: Int
+/// How much of the model's context the next prompt takes, as a ring filling clockwise: in the
+/// secondary color while it leaves room for a reply, orange once it leaves less than the reply
+/// allowance, red once the context cannot hold it. Its help gives the exact figures.
+private struct ContextRing: View {
+    let usage: ContextUsage
 
     var body: some View {
-        let request = state.contextRequest
-        let usage = request.flatMap { state.chatContext.usage(for: $0) }
-        let failure = request.flatMap { state.chatContext.failure(for: $0) }
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 8) {
-                if let usage {
-                    ZStack(alignment: .leading) {
-                        Capsule().fill(.quaternary)
-                        Capsule().fill(usage.fits ? (usage.nearLimit ? Color.orange : .accentColor) : .red)
-                            .frame(width: 52 * usage.fraction)
-                    }
-                        .frame(width: 52, height: 4)
-                        .accessibilityElement(children: .ignore)
-                        .accessibilityLabel("Context used")
-                        .accessibilityValue(usage.explanation)
-                    Text("\(Format.count(usage.input)) / \(ContextLength.figure(limit)) tokens")
-                        .monospacedDigit()
-                        .help(usage.explanation)
-                } else if request != nil {
-                    Text(failure == nil ? "Checking context…" : "Context check unavailable")
-                } else {
-                    Text("Context: \(ContextLength.title(limit))")
-                }
-                Spacer(minLength: 0)
-                if let usage, usage.nearLimit, state.chats.current != nil {
-                    Button("Start New Chat") {
-                        state.chats.newChat()
-                        state.draft.focus()
-                    }
-                    .buttonStyle(.hover)
-                    .help("Keeps this message and starts without earlier history. This chat stays saved.")
-                }
-                if let request, failure != nil {
-                    Button("Try Again") { state.chatContext.retry(request) }
-                        .buttonStyle(.hover)
-                }
-            }
-            if let usage, !usage.fits {
-                Text(usage.problem)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else if let failure {
-                Text("Couldn’t check context: \(failure)")
-                    .fixedSize(horizontal: false, vertical: true)
-            } else if let usage, usage.nearLimit {
-                Text("Context nearly full · \(usage.remaining.formatted()) tokens left for thinking and the reply.")
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+        ZStack {
+            Circle().stroke(.quaternary, lineWidth: 2)
+            Circle()
+                .trim(from: 0, to: usage.fraction)
+                .stroke(tint, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                .rotationEffect(.degrees(-90))
         }
-        .font(.caption)
-        .foregroundStyle(.secondary)
+        .frame(width: 14, height: 14)
+        // Room around the ring for the pointer to find its help.
+        .padding(5)
+        .contentShape(.rect)
+        .animation(Motion.settle, value: usage)
+        .help(usage.explanation)
+        .accessibilityElement()
+        .accessibilityLabel("Context")
+        .accessibilityValue(usage.explanation)
+    }
+
+    private var tint: AnyShapeStyle {
+        switch usage.level {
+        case .normal: AnyShapeStyle(.secondary)
+        case .tight: AnyShapeStyle(.orange)
+        case .full: AnyShapeStyle(.red)
+        }
     }
 }
 

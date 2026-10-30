@@ -18,6 +18,7 @@ from dev.tests.server_fixtures import (
     FakeTokenizer,
     HarnessTestCase,
     Plan,
+    chat_body,
     main_args,
     make_job,
     unprepared_hold,
@@ -462,9 +463,12 @@ class ServerRecoveryTests(HarnessTestCase):
             prepare.assert_not_called()
         self.wait_until(lambda: runtime.startup_calls == 1)
         self.assertEqual(runtime.requests, [])
-        self.assertEqual(
-            harness.request("POST", "/v1/messages/count_tokens", self.body())[0], 200
-        )
+        for path, body in (
+            ("/v1/messages/count_tokens", self.body()),
+            ("/v1/chat/completions/count_tokens", chat_body()),
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(harness.request("POST", path, body)[0], 200)
         self.assertEqual(harness.request("GET", "/v1/models")[0], 200)
 
     def test_successful_probe_clears_unanswered_status_and_engine_error(self):
@@ -498,16 +502,19 @@ class ServerRecoveryTests(HarnessTestCase):
             try:
                 self.assertTrue(plan.started.wait(1))
                 self.assertEqual(harness.server.requests.stats()["active"], 1)
-                status, _, payload = harness.request(
-                    "POST", "/v1/messages/count_tokens?beta=true", self.body()
-                )
-                self.assertEqual(status, 200)
-                self.assertEqual(json.loads(payload), {"input_tokens": 2})
-                self.assertEqual(len(runtime.requests), 1)
-                self.wait_until(
-                    lambda: harness.server.token_counts.stats()["active"] == 0
-                )
-                self.assertEqual(harness.server.requests.stats()["active"], 1)
+                for path, body in (
+                    ("/v1/messages/count_tokens?beta=true", self.body()),
+                    ("/v1/chat/completions/count_tokens", chat_body()),
+                ):
+                    with self.subTest(path=path):
+                        status, _, payload = harness.request("POST", path, body)
+                        self.assertEqual(status, 200)
+                        self.assertEqual(json.loads(payload), {"input_tokens": 2})
+                        self.assertEqual(len(runtime.requests), 1)
+                        self.wait_until(
+                            lambda: harness.server.token_counts.stats()["active"] == 0
+                        )
+                        self.assertEqual(harness.server.requests.stats()["active"], 1)
             finally:
                 plan.release.set()
             self.assertEqual(generation.result(1)[0], 200)

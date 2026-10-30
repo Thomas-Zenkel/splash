@@ -152,9 +152,7 @@ Both endpoints run without inference and share bounded preparation capacity with
 tools and reasoning options as Chat Completions and returns `{"input_tokens": N}`.
 The count includes the chat template and image embeddings, even when the prompt
 exceeds the serving context. It does not generate an answer or reserve output
-tokens. The desktop chat uses it to check the conversation and draft before
-sending, leaving up to 4,096 tokens (one eighth of smaller contexts) for thinking
-and the reply. A new chat keeps the draft and leaves the earlier history saved.
+tokens.
 
 ## Request limits and timeouts
 

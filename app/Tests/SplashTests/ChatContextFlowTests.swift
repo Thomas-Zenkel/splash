@@ -6,11 +6,13 @@ import Testing
 
 @testable import Splash
 
-/// Drives the real composer/state/process/HTTP path against a small server, without model weights.
+/// Drives the real state/process/HTTP path against a small server, without model weights: the
+/// composer counts the next prompt as it is written, and Send holds back only a prompt the model's
+/// 1,024-token context cannot hold.
 @MainActor
 @Suite(.serialized)
 struct ChatContextFlowTests {
-    @Test func aFullChatKeepsTheDraftAndANewChatCanSendIt() async throws {
+    @Test func aPromptTheContextCannotHoldStaysAndANewChatSendsIt() async throws {
         try await withServer { fixture in
             let state = fixture.state
             state.draft.text = """
@@ -20,64 +22,85 @@ struct ChatContextFlowTests {
                 we should implement next.
                 """
             state.draft.attach([try #require(NSImage(data: Showcase.picture))])
-            let images = state.draft.images
+            let text = state.draft.text, images = state.draft.images
+            let usage = try await count(state)
+            #expect(usage.level == .full && state.contextUsage == usage)
+            #expect(!state.canSendDraft && state.overflow == usage)
             state.sendDraft()
-            try await waitFor { !state.preparingToSend }
-            let input = try #require(state.contextRequest)
-            let usage = try #require(state.chatContext.usage(for: input))
-            #expect(!usage.fits && !state.canSendDraft)
-            #expect(state.draft.text == input.text && state.draft.images == images)
+            #expect(state.draft.text == text && state.draft.images == images)
             #expect(state.chats.current?.messages == fixture.history.messages)
-            #expect(try fixture.sentMessages().isEmpty)
+            #expect(try fixture.sent().isEmpty)
             await picture("chat-context-full", state: state)
-            await picture("chat-context-full-compact", state: state, width: 440)
 
+            // A new chat keeps the draft and leaves the long one saved.
             state.chats.newChat()
-            state.draft.focus()
-            let fresh = try #require(state.contextRequest)
-            #expect(fresh.history.isEmpty && fresh.text == input.text && fresh.images == images)
-            #expect(await state.chatContext.prepare(fresh)?.fits == true)
-            await picture("chat-context-ready", state: state)
+            #expect(state.overflow == nil)
+            #expect(try await count(state).level == .normal)
+            #expect(state.canSendDraft)
+            await picture("chat-context-room", state: state)
+            let counts = try fixture.counts()
             state.sendDraft()
-            try await waitFor { !state.preparingToSend && state.chats.streaming == nil }
             #expect(state.draft.isEmpty)
+            try await waitFor { state.chats.streaming == nil }
             #expect(state.chats.current?.messages.last?.text == "Answer")
-            let sent = try fixture.sentMessages()
+            let sent = try fixture.sent()
             #expect(sent.count == 1 && sent[0].count == 1)
             #expect(sent[0][0]["role"] as? String == "user")
+            // Sending doesn't count the prompt again.
+            #expect(try fixture.counts() == counts)
             #expect(state.chats.conversations.first { $0.id == fixture.history.id } == fixture.history)
         }
     }
 
-    @Test func editingDuringTheSendCheckCannotSendOrClearTheChangedDraft() async throws {
+    @Test func aPromptInsideTheReplyAllowanceStillGoes() async throws {
         try await withServer { fixture in
             let state = fixture.state
-            state.draft.text = "slow question"
+            state.draft.text = "Short?"
+            let usage = try await count(state)
+            #expect(usage.level == .tight && usage.note != nil)
+            #expect(state.canSendDraft)
+            await picture("chat-context-tight", state: state)
             state.sendDraft()
-            try await waitFor { FileManager.default.fileExists(atPath: fixture.root.appending(path: "counting").path) }
-            state.draft.text = "Changed question"
-            try await waitFor { !state.preparingToSend }
-            #expect(state.draft.text == "Changed question")
-            #expect(state.chats.current?.messages == fixture.history.messages)
-            #expect(try fixture.sentMessages().isEmpty)
+            #expect(state.draft.isEmpty)
+            try await waitFor { state.chats.streaming == nil }
+            #expect(state.chats.current?.messages.last?.text == "Answer")
+            #expect(try fixture.sent().count == 1)
         }
     }
 
-    @Test func aCountFailureKeepsTheDraftAndCanRecover() async throws {
+    /// A count that fails, or hasn't finished, holds the message back no more than none would.
+    @Test func aFailedOrSlowCountHoldsNothingBack() async throws {
         try await withServer { fixture in
             let state = fixture.state
             state.draft.text = "offline"
+            state.chatContext.refresh(state.contextRequest)
+            try await waitFor { (try? fixture.counts()) == 1 }
+            try await Task.sleep(for: .milliseconds(200))
+            #expect(state.contextRequest.flatMap(state.chatContext.usage(for:)) == nil)
+            #expect(state.canSendDraft)
             state.sendDraft()
-            try await waitFor { !state.preparingToSend }
-            let input = try #require(state.contextRequest)
-            #expect(state.chatContext.failure(for: input) == "Try again shortly")
-            #expect(state.draft.text == "offline")
-            #expect(try fixture.sentMessages().isEmpty)
-            state.draft.text = "Try now"
-            state.sendDraft()
-            try await waitFor { !state.preparingToSend && state.chats.streaming == nil }
+            #expect(state.draft.isEmpty && state.chats.streaming != nil)
+            try await waitFor { state.chats.streaming == nil }
             #expect(state.chats.current?.messages.last?.text == "Answer")
+
+            state.draft.text = "slow question"
+            state.chatContext.refresh(state.contextRequest)
+            try await waitFor { FileManager.default.fileExists(atPath: fixture.root.appending(path: "counting").path) }
+            #expect(state.canSendDraft)
+            state.sendDraft()
+            #expect(state.draft.isEmpty && state.chats.streaming != nil)
+            try await waitFor { state.chats.streaming == nil }
+            #expect(state.chats.current?.messages.last?.text == "Answer")
+            #expect(try fixture.sent().count == 2)
         }
+    }
+
+    /// The draft's prompt, counted as the composer counts it.
+    private func count(_ state: AppState) async throws -> ContextUsage {
+        let request = try #require(state.contextRequest)
+        state.chatContext.refresh(request)
+        try await waitFor { state.chatContext.usage(for: request) != nil }
+        return try #require(state.chatContext.usage(for: request))
     }
 
     private func withServer(_ test: (ContextFixture) async throws -> Void) async throws {
@@ -115,7 +138,7 @@ struct ChatContextFlowTests {
 @MainActor
 private final class ContextFixture {
     let root = FileManager.default.temporaryDirectory.appending(path: "splash-context-flow-\(UUID())")
-    let history = Conversation(title: "Saved chat", messages: [ChatMessage(role: .user, text: String(repeating: "h", count: 600)),
+    let history = Conversation(title: "Saved chat", messages: [ChatMessage(role: .user, text: String(repeating: "h", count: 800)),
                                                               ChatMessage(role: .assistant, text: "Saved answer")])
     let state: AppState
     let port: Int
@@ -158,12 +181,22 @@ private final class ContextFixture {
         state.chats.selection = history.id
     }
 
-    func sentMessages() throws -> [[[String: Any]]] {
-        let file = root.appending(path: "sent.jsonl")
-        guard FileManager.default.fileExists(atPath: file.path) else { return [] }
-        return try String(contentsOf: file, encoding: .utf8).split(separator: "\n").map {
+    /// The messages of each generation the server was asked for.
+    func sent() throws -> [[[String: Any]]] {
+        try lines("sent.jsonl").map {
             try #require(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [[String: Any]])
         }
+    }
+
+    /// The prompts the server was asked to count.
+    func counts() throws -> Int {
+        try lines("counted.jsonl").count
+    }
+
+    private func lines(_ name: String) throws -> [Substring] {
+        let file = root.appending(path: name)
+        guard FileManager.default.fileExists(atPath: file.path) else { return [] }
+        return try String(contentsOf: file, encoding: .utf8).split(separator: "\n")
     }
 
     func close() async {
@@ -204,12 +237,14 @@ private final class ContextFixture {
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             if self.path.endswith('/count_tokens'):
+                with (root / 'counted.jsonl').open('a') as output:
+                    output.write(json.dumps(body['messages']) + '\n')
                 text = body['messages'][-1]['content']
                 if text == 'offline':
                     return self.reply({'error': {'message': 'Try again shortly'}}, 503)
                 if text == 'slow question':
                     (root / 'counting').touch()
-                    time.sleep(0.3)
+                    time.sleep(5)
                 count = 100 + sum(size(m['content']) + len(m.get('reasoning_content', '').encode()) for m in body['messages'])
                 return self.reply({'input_tokens': count})
             with (root / 'sent.jsonl').open('a') as output:

@@ -6,29 +6,39 @@ import Testing
 
 @MainActor
 struct ChatContextTests {
-    private func request(_ text: String = "Hello") -> ChatContext.Request {
-        ChatContext.Request(history: [], text: text, images: [],
-                            target: ChatTarget(url: URL(string: "http://127.0.0.1:9")!, model: "a/b",
-                                               acceptsImages: true, effort: "high", context: 32768, apiKey: "secret"))
+    private let target = ChatTarget(url: URL(string: "http://127.0.0.1:9")!, model: "a/b", acceptsImages: true,
+                                    effort: "high", context: 32768, apiKey: "secret")
+
+    private func request(_ text: String = "Hello", history: [ChatMessage] = []) -> ChatContext.Request {
+        ChatContext.Request(history: history, text: text, images: [], target: target)
     }
 
-    @Test func keepsSpaceForThinkingAndTheReply() {
-        let full = ContextUsage(input: 28672, limit: 32768)
-        #expect(full.reserved == 4096 && full.fits && full.nearLimit)
-        #expect(!ContextUsage(input: 28673, limit: 32768).fits)
-        #expect(ContextUsage(input: 896, limit: 1024).fits)
-        #expect(!ContextUsage(input: 897, limit: 1024).fits)
-        #expect(ContextUsage(input: 1, limit: 1).available == 0)
-        let overflow = ContextUsage(input: 40000, limit: 32768)
-        #expect(overflow.remaining == 0 && overflow.fraction == 1 && !overflow.fits)
-        #expect(!ContextUsage(input: 100, limit: 32768).nearLimit)
+    /// The ring's three states: room for a reply, less than the reply allowance, no room at all.
+    @Test func theRingFillsAndWarnsAsThePromptGrows() {
+        let room = ContextUsage(input: 28672, limit: 32768)
+        #expect(room.allowance == 4096 && room.level == .normal && room.fits && room.note == nil)
+        #expect(room.summary == "\(28672.formatted()) of \(32768.formatted()) tokens · \(percent(0.875))")
+        #expect(room.fraction == 0.875 && room.explanation == room.summary)
+        let tight = ContextUsage(input: 28673, limit: 32768)
+        #expect(tight.level == .tight && tight.fits)
+        #expect(tight.note == "\(4095.formatted()) tokens are left for thinking and the reply.")
+        #expect(tight.explanation == "\(tight.summary)\n\(tight.note!)")
+        #expect(ContextUsage(input: 32767, limit: 32768).level == .tight)
+        let full = ContextUsage(input: 32768, limit: 32768)
+        #expect(full.level == .full && !full.fits && full.note?.hasPrefix("Too long") == true)
+        let over = ContextUsage(input: 40000, limit: 32768)
+        #expect(over.level == .full && over.fraction == 1 && over.summary.hasSuffix(percent(1.22)))
+        // A small context keeps an eighth of itself for the reply.
+        #expect(ContextUsage(input: 896, limit: 1024).level == .normal)
+        #expect(ContextUsage(input: 897, limit: 1024).level == .tight)
+        #expect(ContextUsage(input: 0, limit: 262_144).summary == "0 of \(262_144.formatted()) tokens · \(percent(0))")
     }
 
     @Test func countsTheSameImagesHistoryAndReasoningAsGeneration() throws {
         let history = [ChatMessage(role: .user, text: "你好", images: [Data([0x89, 0x50, 0x4E, 0x47])]),
                        ChatMessage(role: .assistant, text: "A cat", reasoning: "Whiskers"),
                        ChatMessage(role: .assistant, text: "", error: "Interrupted")]
-        let input = ChatContext.Request(history: history, text: "Sure?", images: [], target: request().target)
+        let input = request("Sure?", history: history)
         let count = try ChatClient.countRequest(input.messages, with: input.target)
         var generation = try #require(JSONSerialization.jsonObject(with: ChatClient.body(input.messages, effort: "high", images: true)) as? [String: Any])
         for key in ["stream", "stream_options", "return_progress"] { generation.removeValue(forKey: key) }
@@ -40,54 +50,108 @@ struct ChatContextTests {
         #expect(count.value(forHTTPHeaderField: "Authorization") == "Bearer secret")
     }
 
-    @Test func sendingSkipsTheTypingDelayAndReusesTheExactCount() async throws {
+    /// A count belongs to its whole prompt: another draft, model, image or start has none.
+    @Test func aCountBelongsToItsPrompt() async throws {
         let probe = CounterProbe()
-        let context = ChatContext(counter: { try await probe.count($0) })
+        let context = ChatContext(delay: .zero) { try await probe.count($0) }
         let input = request()
         context.refresh(input)
-        let usage = await context.prepare(input)
-        #expect(usage?.input == input.text.utf8.count)
-        #expect(await context.prepare(input) == usage)
+        try await waitFor { context.usage(for: input) != nil }
+        #expect(context.usage(for: input)?.input == input.text.utf8.count)
+        // The same prompt again is not counted again.
+        context.refresh(input)
         #expect(await probe.calls == 1)
-        // Counts of another draft or model cannot enable Send.
         #expect(context.usage(for: request("Different")) == nil)
-        var target = input.target
-        target.context = 1024
-        #expect(context.usage(for: .init(history: [], text: input.text, images: [], target: target)) == nil)
-        target = ChatTarget(url: input.target.url, model: "a/other", acceptsImages: true, effort: "high", context: 32768)
-        #expect(context.usage(for: .init(history: [], text: input.text, images: [], target: target)) == nil)
-        #expect(context.usage(for: .init(history: [], text: input.text, images: [Data([1])], target: input.target)) == nil)
-        #expect(context.usage(for: .init(history: [], text: input.text, images: [], target: input.target, started: .now)) == nil)
+        var smaller = target
+        smaller.context = 1024
+        #expect(context.usage(for: .init(history: [], text: input.text, images: [], target: smaller)) == nil)
+        let other = ChatTarget(url: target.url, model: "a/other", acceptsImages: true, effort: "high", context: 32768)
+        #expect(context.usage(for: .init(history: [], text: input.text, images: [], target: other)) == nil)
+        #expect(context.usage(for: .init(history: [], text: input.text, images: [Data([1])], target: target)) == nil)
+        #expect(context.usage(for: .init(history: [], text: input.text, images: [], target: target, started: .now)) == nil)
     }
 
-    @Test func anOldCheckCannotReplaceANewerDraftsCount() async throws {
+    @Test func anOldCountCannotReplaceANewerPromptsCount() async throws {
         let probe = SuspendedCounter()
-        let context = ChatContext(counter: { await probe.count($0.text) })
+        let context = ChatContext(delay: .zero) { await probe.count($0.text) }
         let old = request("old"), current = request("current")
-        let first = Task { await context.prepare(old) }
+        context.refresh(old)
         try await waitFor { await probe.started("old") }
-        let second = Task { await context.prepare(current) }
+        context.refresh(current)
         try await waitFor { await probe.started("current") }
         await probe.finish("current", with: 20)
-        #expect(await second.value?.input == 20)
-        // This counter deliberately ignores cancellation, as an already completed HTTP response
-        // may arrive meanwhile. Its result must still be discarded.
+        try await waitFor { context.usage(for: current) != nil }
+        // This counter ignores cancellation, as an HTTP response may arrive meanwhile: its count
+        // must still be dropped.
         await probe.finish("old", with: 99999)
-        #expect(await first.value == nil)
+        try await Task.sleep(for: .milliseconds(50))
         #expect(context.usage(for: current)?.input == 20)
-        context.refresh(nil)
-        #expect(context.usage == nil && context.request == nil && context.failure == nil)
+        #expect(context.usage(for: old) == nil)
     }
 
-    @Test func aFailedCheckCanBeRetried() async {
-        let probe = CounterProbe(failFirst: true)
-        let context = ChatContext(counter: { try await probe.count($0) })
-        let input = request()
-        #expect(await context.prepare(input) == nil)
-        #expect(context.failure(for: input) == "Offline")
-        #expect(context.failure(for: request("changed")) == nil)
-        #expect(await context.prepare(input)?.fits == true)
-        #expect(context.failure == nil)
+    /// Typing waits for a pause; a count that fails leaves none, not the last prompt's, and the
+    /// next edit counts again.
+    @Test func typingWaitsAndAFailedCountLeavesNone() async throws {
+        let probe = CounterProbe(failing: ["Hey?"])
+        let context = ChatContext(delay: .milliseconds(300)) { try await probe.count($0) }
+        let history = [ChatMessage(role: .user, text: "Hi"), ChatMessage(role: .assistant, text: "Hello.")]
+        context.refresh(request("H", history: history))
+        context.refresh(request("He", history: history))
+        let input = request("Hey", history: history)
+        context.refresh(input)
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(await probe.calls == 0)
+        try await waitFor { context.usage(for: input) != nil }
+        #expect(await probe.calls == 1)
+        #expect(context.shown(history: history, target: target, started: nil) != nil)
+        context.refresh(request("Hey?", history: history))
+        try await waitFor { context.counted == nil }
+        #expect(await probe.calls == 2)
+        #expect(context.shown(history: history, target: target, started: nil) == nil)
+        let next = request("Hey!", history: history)
+        context.refresh(next)
+        try await waitFor { context.usage(for: next) != nil }
+        #expect(await probe.calls == 3)
+    }
+
+    /// The ring keeps the last count while the next is counted, the reply streams, the last answer
+    /// is asked again or another reasoning effort is chosen, and drops it for another conversation
+    /// or model.
+    @Test func theRingKeepsTheLastCountOfItsConversation() async throws {
+        let context = ChatContext(delay: .zero) { $0.text.utf8.count + $0.history.count }
+        let history = [ChatMessage(role: .user, text: "Hi"), ChatMessage(role: .assistant, text: "Hello.")]
+        context.refresh(request("Next", history: history))
+        try await waitFor { context.counted != nil }
+        let usage = context.counted?.usage
+        #expect(context.shown(history: history, target: target, started: nil) == usage)
+        // The question sent and its reply streaming.
+        let sent = history + [ChatMessage(role: .user, text: "Next"), ChatMessage(role: .assistant, text: "Wo")]
+        #expect(context.shown(history: sent, target: target, started: nil) == usage)
+        #expect(context.shown(history: sent + [ChatMessage(role: .user, text: "More")], target: target, started: nil) == nil)
+        // The last answer asked again.
+        let again = Array(history.dropLast()) + [ChatMessage(role: .assistant, text: "")]
+        #expect(context.shown(history: again, target: target, started: nil) == usage)
+        #expect(context.shown(history: [ChatMessage(role: .user, text: "Other")], target: target, started: nil) == nil)
+        #expect(context.shown(history: history, target: target, started: .now) == nil)
+        let lighter = ChatTarget(url: target.url, model: target.model, acceptsImages: true, effort: "low",
+                                 context: 32768, apiKey: "secret")
+        #expect(context.shown(history: history, target: lighter, started: nil) == usage)
+        let model = ChatTarget(url: target.url, model: "a/other", acceptsImages: true, effort: "high",
+                               context: 32768, apiKey: "secret")
+        #expect(context.shown(history: history, target: model, started: nil) == nil)
+        var other = target
+        other.context = 1024
+        #expect(context.shown(history: history, target: other, started: nil) == nil)
+
+        // A new chat's count shows only on the chat its message started, not on another one of
+        // one exchange.
+        context.refresh(request("Summarize this"))
+        try await waitFor { context.counted?.request.history.isEmpty == true }
+        let fresh = context.counted?.usage
+        #expect(context.shown(history: history, target: target, started: nil) == nil)
+        let started = [ChatMessage(role: .user, text: "Summarize this"), ChatMessage(role: .assistant, text: "Wo")]
+        #expect(context.shown(history: started, target: target, started: nil) == fresh)
+        #expect(context.shown(history: [], target: target, started: nil) == fresh)
     }
 
     @Test func validatesCountResponsesAndSurfacesServerErrors() async throws {
@@ -116,21 +180,14 @@ struct ChatContextTests {
         }
     }
 
-    @Test func callersOutsideTheComposerCannotGenerateAnOversizedPrompt() async throws {
-        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-context-\(UUID())")
-        defer { try? FileManager.default.removeItem(at: folder) }
-        let store = ChatStore(folder: folder)
-        // The invalid local port would fail differently if generation were attempted.
-        store.send("Keep this question", images: [], to: request().target, countedTokens: 32768)
-        try await waitFor { @MainActor in store.streaming == nil }
-        #expect(store.current?.messages.first?.text == "Keep this question")
-        #expect(store.current?.messages.last?.error == ContextUsage(input: 32768, limit: 32768).problem)
+    private func percent(_ share: Double) -> String {
+        share.formatted(.percent.precision(.fractionLength(0)))
     }
 
     private func waitFor(_ condition: () async -> Bool) async throws {
         let deadline = ContinuousClock.now + .seconds(3)
         while !(await condition()) {
-            try #require(ContinuousClock.now < deadline, "Context check did not finish")
+            try #require(ContinuousClock.now < deadline, "The count did not finish")
             try await Task.sleep(for: .milliseconds(5))
         }
     }
@@ -138,11 +195,12 @@ struct ChatContextTests {
 
 private actor CounterProbe {
     private(set) var calls = 0
-    let failFirst: Bool
-    init(failFirst: Bool = false) { self.failFirst = failFirst }
+    /// The drafts whose count fails.
+    let failing: Set<String>
+    init(failing: Set<String> = []) { self.failing = failing }
     func count(_ request: ChatContext.Request) throws -> Int {
         calls += 1
-        if failFirst && calls == 1 { throw ChatClient.Failure(errorDescription: "Offline") }
+        if failing.contains(request.text) { throw ChatClient.Failure(errorDescription: "Offline") }
         return request.text.utf8.count
     }
 }
