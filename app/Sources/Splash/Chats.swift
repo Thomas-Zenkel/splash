@@ -2,7 +2,7 @@ import Foundation
 import Observation
 
 /// A message of a conversation, as the app keeps it.
-struct ChatMessage: Codable, Identifiable, Equatable {
+struct ChatMessage: Codable, Identifiable, Equatable, Sendable {
     enum Role: String, Codable { case user, assistant }
 
     var id = UUID()
@@ -36,7 +36,7 @@ struct Conversation: Codable, Identifiable, Equatable {
 
 /// The model a message goes to: the server's address, the model it serves and whether it sees
 /// images, and the reasoning effort to ask for.
-struct ChatTarget {
+struct ChatTarget: Equatable, Sendable {
     let url: URL
     let model: String
     let acceptsImages: Bool
@@ -104,7 +104,7 @@ final class ChatStore {
 
     /// Sends `text` and `images` in the open conversation, or a new one, to the model `server`
     /// serves, and streams its reply into the conversation.
-    func send(_ text: String, images: [Data], to server: ChatTarget) {
+    func send(_ text: String, images: [Data], to server: ChatTarget, countedTokens: Int? = nil) {
         guard streaming == nil else { return }
         var conversation = current ?? Conversation()
         if conversation.title.isEmpty {
@@ -112,7 +112,7 @@ final class ChatStore {
             conversation.title = String(line.prefix(80))
         }
         conversation.messages.append(ChatMessage(role: .user, text: text, images: images))
-        stream(conversation, to: server)
+        stream(conversation, to: server, countedTokens: countedTokens)
     }
 
     /// Answers the open conversation's last message again, in place of the last answer.
@@ -127,7 +127,7 @@ final class ChatStore {
         reply?.cancel()
     }
 
-    private func stream(_ conversation: Conversation, to server: ChatTarget) {
+    private func stream(_ conversation: Conversation, to server: ChatTarget, countedTokens: Int? = nil) {
         var conversation = conversation
         let history = conversation.messages
         var answer = ChatMessage(role: .assistant, text: "", model: server.model)
@@ -141,6 +141,16 @@ final class ChatStore {
             var thinking: Date?
             var read: Double?
             do {
+                // Retries and callers outside the composer get the same check. The composer
+                // already counted this exact prompt, so it needn't tokenize it a second time.
+                if let limit = server.context, limit > 0 {
+                    let count: Int
+                    if let countedTokens { count = countedTokens }
+                    else { count = try await ChatClient.countTokens(history, with: server) }
+                    try Task.checkCancellation()
+                    let usage = ContextUsage(input: count, limit: limit)
+                    guard usage.fits else { throw ChatClient.Failure(errorDescription: usage.problem) }
+                }
                 for try await delta in ChatClient.stream(history, with: server) {
                     if !delta.reasoning.isEmpty, thinking == nil {
                         thinking = .now
@@ -165,6 +175,8 @@ final class ChatStore {
                 }
                 // Cancelled, the stream just ends; what it said stays.
                 if Task.isCancelled { answer.stopped = true }
+            } catch where Task.isCancelled {
+                answer.stopped = true
             } catch {
                 answer.error = error.localizedDescription
             }
@@ -240,6 +252,33 @@ enum ChatClient {
         let errorDescription: String?
     }
 
+    /// Counts the same formatted prompt as generation, including images and earlier reasoning,
+    /// without starting inference or waking a sleeping engine.
+    static func countTokens(_ messages: [ChatMessage], with server: ChatTarget, session: URLSession = .shared) async throws -> Int {
+        let request = try countRequest(messages, with: server)
+        let (data, response) = try await session.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else {
+            throw Failure(errorDescription: message(of: data, for: messages, server: server)
+                ?? HTTPURLResponse.localizedString(forStatusCode: status))
+        }
+        struct Count: Decodable { let input_tokens: Int }
+        guard let count = try? JSONDecoder().decode(Count.self, from: data), count.input_tokens >= 0 else {
+            throw Failure(errorDescription: "The model returned an invalid token count.")
+        }
+        return count.input_tokens
+    }
+
+    static func countRequest(_ messages: [ChatMessage], with server: ChatTarget) throws -> URLRequest {
+        var request = URLRequest(url: server.url.appending(path: "v1/chat/completions/count_tokens"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let key = server.apiKey { request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
+        request.httpBody = try JSONSerialization.data(withJSONObject: prompt(messages, effort: server.effort, images: server.acceptsImages))
+        request.timeoutInterval = 30
+        return request
+    }
+
     static func stream(_ messages: [ChatMessage], with server: ChatTarget) -> AsyncThrowingStream<Delta, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
@@ -278,6 +317,14 @@ enum ChatClient {
     /// reasoning effort unless it is the model's default; and the prompt's progress and the usage
     /// asked for.
     static func body(_ messages: [ChatMessage], effort: String, images: Bool) throws -> Data {
+        var body = prompt(messages, effort: effort, images: images)
+        body["stream"] = true
+        body["stream_options"] = ["include_usage": true]
+        body["return_progress"] = true
+        return try JSONSerialization.data(withJSONObject: body)
+    }
+
+    private static func prompt(_ messages: [ChatMessage], effort: String, images: Bool) -> [String: Any] {
         let wire: [[String: Any]] = messages.compactMap { message in
             switch message.role {
             case .user where !message.images.isEmpty && images:
@@ -296,10 +343,9 @@ enum ChatClient {
                 return ["role": "assistant", "content": message.text, "reasoning_content": message.reasoning]
             }
         }
-        var body: [String: Any] = ["messages": wire, "stream": true, "stream_options": ["include_usage": true],
-                                   "return_progress": true]
+        var body: [String: Any] = ["messages": wire]
         if !effort.isEmpty { body["reasoning_effort"] = effort }
-        return try JSONSerialization.data(withJSONObject: body)
+        return body
     }
 
     /// The event a line of the event stream carries, nil for a line that carries none (a

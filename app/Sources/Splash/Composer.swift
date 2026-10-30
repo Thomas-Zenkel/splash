@@ -91,6 +91,9 @@ struct Composer: View {
             .buttonStyle(.hover)
             // The first control's glyph on the text's edge.
             .padding(.leading, -6)
+            if state.server.answers, let limit = state.server.context, limit > 0 {
+                ContextIndicator(limit: limit)
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
@@ -101,6 +104,9 @@ struct Composer: View {
         .fileImporter(isPresented: $picking, allowedContentTypes: [.image], allowsMultipleSelection: true) { result in
             draft.attach(((try? result.get()) ?? []).compactMap(NSImage.init(contentsOf:)))
         }
+        .onChange(of: state.contextRequest, initial: true) { _, request in
+            state.chatContext.refresh(request)
+        }
     }
 
     /// Whether the open conversation's reply streams.
@@ -109,20 +115,22 @@ struct Composer: View {
     }
 
     private var sendable: Bool {
-        !draft.isEmpty && state.server.answers && state.chats.streaming == nil
-            && (draft.images.isEmpty || state.server.acceptsImages)
+        state.canSendDraft
     }
 
     private var help: String {
         if !state.server.answers { return "Available once a model is running" }
         if !draft.images.isEmpty && !state.server.acceptsImages { return "This model can’t see images" }
+        if state.preparingToSend { return "Checking context…" }
+        if let request = state.contextRequest, let usage = state.chatContext.usage(for: request), !usage.fits {
+            return usage.problem
+        }
         return "Send"
     }
 
     private func send() {
         guard sendable else { return }
-        let message = draft.take()
-        state.send(message.text, images: message.images)
+        state.sendDraft()
     }
 
     /// Stops the open conversation's reply, the way Escape cancels; false when none streams.
@@ -130,6 +138,67 @@ struct Composer: View {
         guard streaming else { return false }
         state.chats.stop()
         return true
+    }
+}
+
+/// The next prompt's exact size and the space left for a reply. Starting a new chat keeps the
+/// draft, so a long conversation can be left behind without losing the next question.
+private struct ContextIndicator: View {
+    @Environment(AppState.self) private var state
+    let limit: Int
+
+    var body: some View {
+        let request = state.contextRequest
+        let usage = request.flatMap { state.chatContext.usage(for: $0) }
+        let failure = request.flatMap { state.chatContext.failure(for: $0) }
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                if let usage {
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(.quaternary)
+                        Capsule().fill(usage.fits ? (usage.nearLimit ? Color.orange : .accentColor) : .red)
+                            .frame(width: 52 * usage.fraction)
+                    }
+                        .frame(width: 52, height: 4)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("Context used")
+                        .accessibilityValue(usage.explanation)
+                    Text("\(Format.count(usage.input)) / \(ContextLength.figure(limit)) tokens")
+                        .monospacedDigit()
+                        .help(usage.explanation)
+                } else if request != nil {
+                    Text(failure == nil ? "Checking context…" : "Context check unavailable")
+                } else {
+                    Text("Context: \(ContextLength.title(limit))")
+                }
+                Spacer(minLength: 0)
+                if let usage, usage.nearLimit, state.chats.current != nil {
+                    Button("Start New Chat") {
+                        state.chats.newChat()
+                        state.draft.focus()
+                    }
+                    .buttonStyle(.hover)
+                    .help("Keeps this message and starts without earlier history. This chat stays saved.")
+                }
+                if let request, failure != nil {
+                    Button("Try Again") { state.chatContext.retry(request) }
+                        .buttonStyle(.hover)
+                }
+            }
+            if let usage, !usage.fits {
+                Text(usage.problem)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if let failure {
+                Text("Couldn’t check context: \(failure)")
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if let usage, usage.nearLimit {
+                Text("Context nearly full · \(usage.remaining.formatted()) tokens left for thinking and the reply.")
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
     }
 }
 

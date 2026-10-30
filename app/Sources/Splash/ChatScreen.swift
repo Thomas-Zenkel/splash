@@ -152,7 +152,7 @@ private struct ConversationView: View {
     /// `conversation` as the page shows it, its reply streaming and Ask Again as the Server allows.
     private func page(_ conversation: Conversation) -> TranscriptPage {
         let server = state.server
-        let askAgain = TranscriptPage.AskAgain(enabled: server.answers && state.chats.streaming == nil,
+        let askAgain = TranscriptPage.AskAgain(enabled: server.answers && state.chats.streaming == nil && !state.preparingToSend,
                                                help: "Ask \(server.model.map(state.displayName(of:)) ?? "the model") Again")
         return TranscriptPage(conversation, live: state.chats.live, asleep: server.asleep, askAgain: askAgain,
                               name: state.displayName(of:))
