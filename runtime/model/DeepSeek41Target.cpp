@@ -30,9 +30,6 @@ constexpr uint32_t kLanes = ExecutionLimits::maximumBatchWidth;
 // read and write inside the chunk's buffers.
 constexpr uint32_t kLayerTile = 256;
 static_assert(kPrefillRows % kLayerTile == 0, "a prefill chunk is whole tiles");
-// The most bytes of an indexer's scores of a tile's rows at once, each row's
-// of every group: as many rows as fit.
-constexpr uint64_t kIndexScoreBytes = 64ull << 20;
 constexpr uint32_t kLatent = LATENT_ATTENTION_DIM;
 
 template <class T> T *contents(const metal::MetalBuffer &buffer) { return static_cast<T *>(buffer.contents()); }
@@ -131,8 +128,10 @@ void layoutScratch(const DeepSeek41Layout &layout, const ops::ManifoldHyperShape
     s.indexQueries = allocate(tile * indexWidth * 4, "deepseek41/index-q");
     s.indexRotated = allocate(tile * indexWidth * 2, "deepseek41/index-q-rotated");
     s.indexWeights = allocate(uint64_t{tile} * d.indexerHeads * 4, "deepseek41/index-weights");
-    s.indexScores = allocate(kIndexScoreBytes, "deepseek41/index-scores");
-    s.blockScores = allocate(kIndexScoreBytes / d.candidateBlockGroups, "deepseek41/block-scores");
+    // An indexer's scores and their blocks of a piece of a tile's rows at
+    // once (ops::LatentIndex::pieceRows).
+    s.indexScores = allocate(ops::LatentIndex::kScoreBytes, "deepseek41/index-scores");
+    s.blockScores = allocate(ops::LatentIndex::blockBytes(d.candidateBlockGroups, tile), "deepseek41/block-scores");
     s.keyIndices = allocate(tile * keyStride * 4, "deepseek41/keys");
     s.keyCounts = allocate(uint64_t{tile} * 4, "deepseek41/key-counts");
     s.scores = allocate(tile * heads * keyStride * 4, "deepseek41/scores");
@@ -392,8 +391,7 @@ void DeepSeek41Target::addIndexer(metal::CommandGraph &graph, const Scratch &s, 
   const uint32_t heads = d_.indexerHeads, dim = d_.indexerHeadDimension, topK = d_.indexerTopGroups;
   const uint32_t block = d_.candidateBlockGroups, keptStride = d_.candidateTopBlocks;
   const uint32_t blocks = (groups + block - 1) / block;
-  const uint32_t piece =
-      std::clamp<uint32_t>(static_cast<uint32_t>(kIndexScoreBytes / (uint64_t{groups} * 4)), 1, count);
+  const uint32_t piece = ops::LatentIndex::pieceRows(groups, count);
   const float scale = 1.0F / std::sqrt(float(dim)) / std::sqrt(float(heads));
   for (uint32_t at = 0; at < count; at += piece) {
     const uint32_t m = std::min(piece, count - at), row = first + at;

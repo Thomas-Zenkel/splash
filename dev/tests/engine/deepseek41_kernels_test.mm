@@ -33,7 +33,8 @@
 //   of them equal, the lower group among equal scores, ascending, fewer where
 //   fewer are above -inf) and the candidate blocks: each block's highest
 //   score, the last reached block forced, the top blocks, and a later layer's
-//   scores kept to them;
+//   scores kept to them, also at the model's shape past 65,536 groups in the
+//   block scratch of a piece of the indexer's rows;
 // - DSpark's Markov step (kernels/decode/dspark.metal): each lane's token,
 //   the argmax of its logits plus its Markov bias, the lower id among ties,
 //   its confidence and its draft distribution;
@@ -1084,12 +1085,13 @@ void selectTest(MetalBackend &backend) {
   check(same, "top-512 selection of 20000 scores with many equal ones: the reference's groups, ascending");
 }
 
-void candidateTest(MetalBackend &backend) {
-  // Blocks of 8 groups; keep the top 16 blocks; rows reaching 0, 9, 1000 and
-  // every group.
-  constexpr uint32_t groups = 1500, stride = 1536, block = 8, keep = 16, ratio = 2;
-  constexpr uint32_t blocks = (groups + block - 1) / block;
-  const std::vector<uint32_t> positions{0, 19, 2001, 2999};
+// The candidate blocks of rows at `positions` of `groups` groups of `ratio`
+// tokens: each row's highest score of each block of `block` groups, its top
+// `keep` blocks and its scores kept to them, the block scores in the scratch
+// of pieces of up to `tile` rows (ops::LatentIndex::blockBytes).
+void candidateTest(MetalBackend &backend, uint32_t groups, uint32_t stride, uint32_t block, uint32_t keep,
+                   uint32_t ratio, const std::vector<uint32_t> &positions, uint32_t tile) {
+  const uint32_t blocks = (groups + block - 1) / block;
   const uint32_t rows = uint32_t(positions.size());
   std::mt19937 rng(47);
   std::vector<float> scores(size_t(rows) * stride);
@@ -1098,7 +1100,7 @@ void candidateTest(MetalBackend &backend) {
     for (uint32_t g = std::min(groups, (positions[r] + 1) / ratio); g < stride; ++g)
       scores[size_t(r) * stride + g] = -INFINITY;
   MetalBuffer scoreBuffer = upload(backend, scores), positionBuffer = upload(backend, positions);
-  MetalBuffer blockScores = scratch(backend, uint64_t{rows} * blocks * sizeof(float));
+  MetalBuffer blockScores = scratch(backend, ops::LatentIndex::blockBytes(block, tile));
   MetalBuffer kept = scratch(backend, uint64_t{rows} * keep * sizeof(uint32_t));
   CommandGraph graph;
   ops::LatentIndex::addBlocks(graph, scoreBuffer, positionBuffer, blockScores, groups, stride, block, ratio, rows);
@@ -1120,15 +1122,18 @@ void candidateTest(MetalBackend &backend) {
       blocksRight = blocksRight && gotBlocks[size_t(r) * blocks + b] == wantBlocks[size_t(r) * blocks + b];
     const std::vector<uint32_t> want = topReference(wantBlocks, blocks, blocks, keep, r);
     keptRight = keptRight && std::equal(want.begin(), want.end(), gotKept.begin() + size_t(r) * keep);
+    std::vector<bool> inKept(blocks);
+    for (const uint32_t b : want)
+      if (b != LATENT_INDEX_NONE) inKept[b] = true;
     for (uint32_t g = 0; g < groups; ++g) {
-      const bool inKept = std::find(want.begin(), want.end(), g / block) != want.end();
-      const float expected = inKept ? scores[size_t(r) * stride + g] : -INFINITY;
+      const float expected = inKept[g / block] ? scores[size_t(r) * stride + g] : -INFINITY;
       maskRight = maskRight && gotScores[size_t(r) * stride + g] == expected;
     }
   }
-  check(blocksRight, "candidate blocks: each block's highest score, the last reached block +inf");
-  check(keptRight, "candidate blocks: the top 16 blocks, the lower among equal scores");
-  check(maskRight, "candidate blocks: a later layer's scores kept to the kept blocks");
+  const std::string at = "candidate blocks of " + std::to_string(groups) + " groups: ";
+  check(blocksRight, at + "each block's highest score, the last reached block +inf");
+  check(keptRight, at + "the top " + std::to_string(keep) + " blocks, the lower among equal scores");
+  check(maskRight, at + "a later layer's scores kept to the kept blocks");
 }
 
 // The reference's engram_hashes of a sequence, with tables of DeepSeek's
@@ -1441,7 +1446,16 @@ int main(int argc, const char *argv[]) {
       pagedLatentTest(backend, 5);
       pagedLatentTest(backend, 24);
       selectTest(backend);
-      candidateTest(backend);
+      // Blocks of 8 groups; keep the top 16 blocks; rows reaching 0, 9, 1000
+      // and every group.
+      candidateTest(backend, 1500, 1536, 8, 16, 2, {0, 19, 2001, 2999}, 4);
+      // DeepSeek-V4.1-Flash's candidate layer (blocks of 8 groups of a token,
+      // the top 2048) at a fresh 65,793-token prompt's last chunk: the first
+      // piece of its first tile of 256 rows, as many as the indexer's scores
+      // fit, whose 8,225 blocks a row take more than an eighth of their bytes.
+      std::vector<uint32_t> piece(ops::LatentIndex::pieceRows(65'793, 256));
+      std::iota(piece.begin(), piece.end(), 65'536u);
+      candidateTest(backend, 65'793, 65'793, 8, 2048, 1, piece, 256);
       engramHashTest();
       for (uint32_t rows : {1u, 5u}) engramGateTest(backend, rows);
       // DeepSeek-V4.1-Flash's rotations, at positions up to past a million.

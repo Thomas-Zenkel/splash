@@ -2,6 +2,7 @@
 
 #include "ops/BufferExtent.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
@@ -96,6 +97,19 @@ void LatentIndex::addMask(metal::CommandGraph &graph, metal::MetalBuffer scores,
   graph.add("latent_index_mask", {std::move(scores), std::move(kept)},
             LatentBlockParams{rows, groups, stride, block, count, 1, listStride},
             {rows, (groups + LATENT_INDEX_THREADS - 1) / LATENT_INDEX_THREADS, 1}, {LATENT_INDEX_THREADS, 1, 1});
+}
+
+uint32_t LatentIndex::pieceRows(uint32_t groups, uint32_t rows) {
+  if (!groups || !rows) throw std::invalid_argument("invalid latent index piece");
+  return static_cast<uint32_t>(std::clamp<uint64_t>(kScoreBytes / (uint64_t{groups} * sizeof(float)), 1, rows));
+}
+
+uint64_t LatentIndex::blockBytes(uint32_t block, uint32_t rows) {
+  if (!block || !rows) throw std::invalid_argument("invalid latent block scratch");
+  // A piece's m rows of g groups hold m * g <= kScoreBytes / 4 scores, and
+  // m * ceil(g / block) <= (m * g + m * (block - 1)) / block blocks: under
+  // a block's share of the scores plus one a row.
+  return kScoreBytes / block + uint64_t{rows} * sizeof(float);
 }
 
 } // namespace splash::ops

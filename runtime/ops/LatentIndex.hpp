@@ -63,6 +63,15 @@ struct LatentIndex final {
   // [listStride], addSelect's) names.
   static void addMask(metal::CommandGraph &graph, metal::MetalBuffer scores, metal::MetalBuffer kept,
                       uint32_t groups, uint32_t stride, uint32_t block, uint32_t listStride, uint32_t rows);
+
+  // An indexer scores `rows` rows of `groups` groups in pieces of pieceRows
+  // rows: as many as their scores of every group fit kScoreBytes, at least
+  // one. A piece's blocks of `block` groups (addBlocks), of pieces of up to
+  // `rows` rows, fit blockBytes: a block's share of the scores, and a float
+  // a row for its last block, which may be partial.
+  static constexpr uint64_t kScoreBytes = 64ull << 20;
+  [[nodiscard]] static uint32_t pieceRows(uint32_t groups, uint32_t rows);
+  [[nodiscard]] static uint64_t blockBytes(uint32_t block, uint32_t rows);
 };
 
 } // namespace splash::ops
