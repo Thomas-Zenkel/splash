@@ -187,8 +187,9 @@ class StreamingToolCallProjector:
     the call's close follows (value_ends), so a value may hold the tags in
     any other order. The arguments' close or the call's close ends the call,
     and the </tool_call> after an arguments' close (Qwen's </function>) may
-    be left out. Names lose the space around them; a call that names no
-    function is dropped, other text inside a call is dropped, and a repeated
+    be left out. Names lose the space around them; an opening that names no
+    function, or a name too long to be one, opens no call and reads as the
+    text the model wrote, other text inside a call is dropped, and a repeated
     parameter keeps its first value, which may have streamed. A value whose
     schema gives it no type, or the type string alone, is its text and
     streams as it is written; any other converts at its end by the types its
@@ -275,13 +276,17 @@ class StreamingToolCallProjector:
             )
 
     def _begin_call(self, name, events):
+        if not name.strip(NAME_SPACE):
+            # Nothing of a call has streamed yet: the opening, and the text
+            # after it, are content.
+            self.state = "content"
+            self._emit_content(self.syntax.call_open + name, events)
+            return
         self.state = "arguments"
         self.argument_fragments = []
         self.parameter_count = 0
         self.parameter_names = set()
         name = name.strip(NAME_SPACE)
-        if not name:
-            return
         if not self.streamed_count:
             # Whitespace before the first text only framed the calls.
             self.content_fragments.clear()
@@ -501,8 +506,10 @@ class StreamingToolCallProjector:
         events = []
         if not incomplete:
             if self.state == "name":
-                name = self.pending if len(self.pending) <= MAX_NAME_LENGTH else ""
-                self.pending = ""
+                # A name too long to be one stays text, as the content reads it.
+                name = ""
+                if len(self.pending) <= MAX_NAME_LENGTH:
+                    name, self.pending = self.pending, ""
                 self._begin_call(name, events)
             if self.state == "value":
                 self.pending = ""
