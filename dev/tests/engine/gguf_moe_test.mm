@@ -896,21 +896,25 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
               label + ": row " + std::to_string(r) + " routes expert " + std::to_string(got) + " at rank " +
                   std::to_string(rank) + ", fp64 ranks " + std::to_string(want));
     }
-    // fp32 weights: a softmax weight moves by at most twice the largest score
-    // error of the routes (relative), a sigmoid by its argument's error, and
-    // a sigmoid over the sum of the top k's sigmoids by twice it; a
-    // sqrt-softplus weight by its interval over the score's bounds
-    // (relative), and over the sum of the top k's by twice it.
+    // fp32 weights of the routes taken: their experts, which may be others
+    // than the fp64 top k where keys tie within their bounds, and weigh
+    // apart under a biased router, whose weights leave out the bias. A
+    // softmax weight moves by at most twice the largest score error of the
+    // routes (relative), a sigmoid by its argument's error, and a sigmoid
+    // over the sum of the top k's sigmoids by twice it; a sqrt-softplus
+    // weight by its interval over the score's bounds (relative), and over
+    // the sum of the top k's by twice it.
     const auto sigmoid = [](double value) { return 1.0 / (1.0 + std::exp(-value)); };
     const auto weight = [&](uint32_t rank) {
-      const double s = score[order[rank]];
+      const double s = score[selected[r * kRoutes + rank]];
       if (kBiasedRouter) return sqrtSoftplus(s);
       return kShape.router == splash::ops::MoeRouter::Softmax ? std::exp(s - score[order[0]]) : sigmoid(s);
     };
     double denominator = 0, scoreError = 0;
     for (uint32_t rank = 0; rank < kTopK; ++rank) {
+      const uint32_t expert = selected[r * kRoutes + rank];
       denominator += weight(rank);
-      scoreError = std::max(scoreError, kBiasedRouter ? keyBound[order[rank]] / weight(rank) : bound[order[rank]]);
+      scoreError = std::max(scoreError, kBiasedRouter ? keyBound[expert] / weight(rank) : bound[expert]);
     }
     for (uint32_t rank = 0; rank < kTopK; ++rank) {
       const double want = weight(rank) / denominator * kShape.routeScale;
