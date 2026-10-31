@@ -42,6 +42,7 @@ using splash::metal::BufferReach;
 using splash::metal::BufferStorage;
 using splash::metal::BytesBinding;
 using splash::metal::Command;
+using splash::metal::CommandGraph;
 using splash::metal::CommandTicket;
 using splash::metal::CommandTiming;
 using splash::metal::ComputeDispatch;
@@ -1177,6 +1178,141 @@ void buffersReachedThroughTables(const std::string &metallibPath) {
             "released buffers stayed counted or in the residency sets");
     std::cout << "PASS buffers reached through tables rounds=" << kRounds
               << " regrown=" << regrown << " lapsed_round=" << lapsedRound << '\n';
+}
+
+// Records the resources compute encoders make resident for their dispatches
+// (useResources:count:usage:): each call's count and usage.
+class EncoderUses final {
+public:
+    struct Use {
+        NSUInteger count;
+        MTLResourceUsage usage;
+    };
+
+    EncoderUses() {
+        id<MTLCommandBuffer> command = [[MTLCreateSystemDefaultDevice() newCommandQueue] commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+        replacement_.emplace(encoder, @selector(useResources:count:usage:), reinterpret_cast<IMP>(recordUse));
+        [encoder endEncoding];
+        original = replacement_->original;
+        uses.clear();
+    }
+
+    static inline std::vector<Use> uses;
+
+private:
+    using UseResources = void (*)(id, SEL, const __unsafe_unretained id<MTLResource> *, NSUInteger,
+                                  MTLResourceUsage);
+    static inline IMP original = nullptr;
+
+    static void recordUse(id encoder, SEL selector, const __unsafe_unretained id<MTLResource> *resources,
+                          NSUInteger count, MTLResourceUsage usage) {
+        uses.push_back({count, usage});
+        reinterpret_cast<UseResources>(original)(encoder, selector, resources, count, usage);
+    }
+
+    std::optional<MethodReplacement> replacement_;
+};
+
+// Dispatches reach Bound buffers through the table of their addresses the
+// backend writes at encode time (AddressTable, CommandGraph::addresses): a
+// dispatch writes through a table of views what the next ones read back
+// through it. Each encoder makes a table's buffers resident once per usage,
+// for writing where the dispatch writes, again in the encoder after an
+// event step, and the command queue's residency set holds none of them. A
+// buffer released and restored between commands is reached at its new memory
+// by the same table; a table that reaches released memory, lists no buffer
+// or more than setBytes passes, or takes another binding's entry is refused.
+void addressTables(const std::string &metallibPath) {
+    QueueSets sets;
+    EncoderUses recorded;
+    MetalBackend backend(metallibPath);
+    constexpr uint32_t kBuffers = 4, kWords = 4096;
+    constexpr uint64_t kBytes = uint64_t{kWords} * sizeof(uint32_t), kOffset = 256;
+    std::vector<MetalBuffer> buffers;
+    auto table = std::make_shared<std::vector<MetalBuffer>>();
+    for (uint32_t index = 0; index < kBuffers; ++index) {
+        buffers.push_back(sharedBuffer(backend, kBytes + kOffset));
+        table->push_back(backend.view(buffers.back(), index % 2 ? kOffset : 0, kBytes));
+    }
+    MetalBuffer mismatches = sharedBuffer(backend, sizeof(uint32_t));
+    struct TableParams {
+        uint32_t words;
+        uint32_t seed;
+    };
+    const auto commandOf = [&](CommandGraph &graph, uint32_t seed) {
+        const TableParams params{kWords, seed};
+        graph.add("address_table_write_u32", {}, params, {kWords / 256, kBuffers, 1}, {256, 1, 1});
+        graph.addresses(table, true);
+        for (int checks = 0; checks < 2; ++checks) {
+            graph.add("address_table_check_u32", {mismatches}, params, {kWords / 256, kBuffers, 1}, {256, 1, 1});
+            graph.addresses(table);
+        }
+    };
+    // Runs the command of round `round`, with an event step before the last
+    // check when `split`, and checks what it wrote and read.
+    const auto run = [&](uint32_t round, bool split) {
+        const uint32_t seed = 0x9e3779b9u * (round + 1);
+        *static_cast<uint32_t *>(mismatches.contents()) = 0;
+        recorded.uses.clear();
+        CommandGraph graph;
+        commandOf(graph, seed);
+        const EventStep step{2, backend.newSharedEvent(), 1, EventStep::Kind::Signal};
+        (void)backend.submitCommandAsync(Command{graph.dispatches(), split ? std::span(&step, 1)
+                                                                           : std::span<const EventStep>()})
+            .wait();
+        require(*static_cast<uint32_t *>(mismatches.contents()) == 0,
+                "round " + std::to_string(round) + " read other data through its table than it wrote");
+        for (uint32_t index = 0; index < kBuffers; ++index) {
+            const auto *contents = static_cast<const uint32_t *>((*table)[index].contents());
+            for (uint32_t word = 0; word < kWords; ++word)
+                if (contents[word] != (seed ^ (index * 131071u + word)))
+                    fail("round " + std::to_string(round) + ": the CPU read other data than the kernels wrote");
+        }
+        const MTLResourceUsage read = MTLResourceUsageRead, write = MTLResourceUsageRead | MTLResourceUsageWrite;
+        const std::vector<MTLResourceUsage> usages =
+            split ? std::vector{write, read, read} : std::vector{write, read};
+        require(recorded.uses.size() == usages.size(), "round " + std::to_string(round) +
+                    ": its encoders did not make the table resident once per usage each");
+        for (size_t use = 0; use < usages.size(); ++use)
+            require(recorded.uses[use].count == kBuffers && recorded.uses[use].usage == usages[use],
+                    "round " + std::to_string(round) + ": an encoder made other buffers resident, or for "
+                    "another use, than its table's");
+    };
+    {
+        CommandGraph graph;
+        commandOf(graph, 0);
+        require(graph.dispatches()[0].addresses.index == 1 && graph.dispatches()[1].addresses.index == 2 &&
+                    graph.dispatches()[0].addresses.writes && !graph.dispatches()[1].addresses.writes,
+                "a table does not follow its dispatch's parameters");
+    }
+    run(0, false);
+    run(1, true);
+    require(sets.added.size() == 1 && sets.added.front().allAllocations.count == 0,
+            "the command queue's residency set holds buffers a table reaches");
+    backend.releaseMemory(buffers[1]);
+    {
+        CommandGraph graph;
+        commandOf(graph, 0);
+        rejects([&] { (void)backend.submitCommandAsync(graph.dispatches()); }, "reaches released memory at address 1",
+                "a table that reaches released memory was accepted");
+    }
+    backend.restoreMemory(buffers[1]);
+    run(2, false);
+    CommandGraph empty;
+    rejects([&] { empty.addresses(table); }, "needs a dispatch", "a table without a dispatch was accepted");
+    const TableParams params{kWords, 0};
+    empty.add("address_table_write_u32", {}, params, {1, 1, 1}, {256, 1, 1});
+    rejects([&] { empty.addresses(std::make_shared<std::vector<MetalBuffer>>()); }, "needs a buffer",
+            "a table of no buffer was accepted");
+    ComputeDispatch dispatch = empty.dispatches()[0];
+    dispatch.addresses = {1, std::make_shared<std::vector<MetalBuffer>>(513, (*table)[0])};
+    rejects([&] { (void)backend.submit(dispatch); }, "a table holds 1 to 512",
+            "a table of more addresses than setBytes passes was accepted");
+    dispatch.addresses = {0, table};
+    rejects([&] { (void)backend.submit(dispatch); }, "duplicate compute binding index",
+            "a table on its dispatch's parameters' entry was accepted");
+    std::cout << "PASS address tables\n";
 }
 
 // Bindings of consecutive entries reach Metal as one run, each buffer at its
@@ -2444,6 +2580,7 @@ int main(int argc, const char *argv[]) {
             residencyReturnsRemovedBuffers(argv[1]);
             queueHoldsAddressedBuffers(argv[1]);
             buffersReachedThroughTables(argv[1]);
+            addressTables(argv[1]);
             run(argv[1]);
         } catch (const std::exception &error) {
             std::cerr << "FAIL: unexpected exception: " << error.what()

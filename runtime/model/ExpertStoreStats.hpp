@@ -12,7 +12,7 @@
 namespace splash::model {
 
 struct ExpertStoreStats final {
-  uint64_t arenaBytes = 0;
+  uint64_t arenaBytes = 0; // every chunk of every size
   uint64_t stagingBytes = 0;
   uint64_t slots = 0;
   uint64_t experts = 0;  // every block's routed experts

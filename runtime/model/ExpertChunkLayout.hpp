@@ -1,0 +1,135 @@
+#pragma once
+
+// How a size of an expert store lays its slots out in chunks (model::
+// ExpertStore, ops::ExpertChunks): the rule alone, so that it is checked
+// without a GPU.
+//
+// A streamed size's floor chunk, chunk 0, holds its floor: kExpertFloorShare
+// of its slots. The slots above the floor lie in elastic chunks of about
+// kExpertElasticChunkBytes each (ExpertStoreOptions::elasticChunkBytes), the
+// last of the rest. The store keeps every chunk while it serves; an idle
+// release releases all of them. A size of one block keeps every expert, in
+// its floor chunk alone. Chunks are few because each chunk an encoder makes
+// resident costs GPU time: about 0.065% of a streamed decode cycle per chunk
+// on an M5 Max.
+
+#include "metal/abi/MoE.h"
+#include "model/WeightLayout.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <numeric>
+#include <stdexcept>
+#include <string>
+
+namespace splash::model {
+
+// The share of a streamed size's slots its floor chunk holds.
+inline constexpr double kExpertFloorShare = 0.85;
+// About the most bytes an elastic chunk takes by default, unless the size
+// needs larger ones to fit the expert kernels' table (MOE_EXPERT_MAX_CHUNKS).
+inline constexpr uint64_t kExpertElasticChunkBytes = 1ULL << 30;
+
+// A slot's bytes of each plane of a size's experts: gate's, up's and down's
+// plane0, plane1 and meta, each plane in a region of its own in a chunk.
+using ExpertSlotPlanes = std::array<std::array<uint64_t, 3>, 3>;
+
+// Where a size's `slots` slots lie: the floor chunk, chunk 0, holds the first
+// floorSlots of them, and each elastic chunk after it chunkSlots, the last
+// the rest; `chunks` chunks in all. A size without an elastic chunk has
+// floorSlots = chunkSlots = slots. Every chunk but the last holds a multiple
+// of the fewest slots whose every plane fills whole regions
+// (kWeightFileAlignment), so that only the last chunk's regions pad and the
+// chunks take the bytes of one chunk of all the slots.
+struct ExpertChunkLayout final {
+  uint32_t slots = 0;
+  uint32_t floorSlots = 0;
+  uint32_t chunkSlots = 0;
+  uint32_t chunks = 0;
+
+  // The slots chunk `chunk` (below `chunks`) holds.
+  [[nodiscard]] uint32_t held(uint32_t chunk) const noexcept {
+    if (chunk == 0) return floorSlots;
+    const uint64_t first = floorSlots + uint64_t{chunk - 1} * chunkSlots;
+    return static_cast<uint32_t>(std::min<uint64_t>(chunkSlots, slots - first));
+  }
+};
+
+namespace detail {
+
+// The fewest slots whose every plane fills whole regions, and their bytes.
+struct ExpertSlotGroup final {
+  uint64_t slots = 1;
+  uint64_t bytes = 0;
+};
+
+[[nodiscard]] inline ExpertSlotGroup expertSlotGroup(const ExpertSlotPlanes &planes) noexcept {
+  ExpertSlotGroup group;
+  uint64_t slotBytes = 0;
+  for (const std::array<uint64_t, 3> &projection : planes)
+    for (const uint64_t plane : projection) {
+      if (plane) group.slots = std::lcm(group.slots, kWeightFileAlignment / std::gcd(plane, kWeightFileAlignment));
+      slotBytes += plane;
+    }
+  group.bytes = group.slots * slotBytes;
+  return group;
+}
+
+[[nodiscard]] inline std::invalid_argument tooManyExpertChunks(uint32_t slots) {
+  return std::invalid_argument("a size of " + std::to_string(slots) + " expert slots takes more than " +
+                               std::to_string(MOE_EXPERT_MAX_CHUNKS) + " of the device's largest buffers");
+}
+
+} // namespace detail
+
+// The chunks of a streamed size of `slots` slots, each of `planes`' bytes,
+// in buffers of at most `largest` bytes. The floor is kExpertFloorShare of
+// the slots rounded down to a multiple of the fewest that fill whole
+// regions, but at least `minimum` (a block's experts) rounded up to one and
+// at least one such group; at most the slots; and at most what a buffer of
+// `largest` bytes holds, which comes first. An elastic chunk holds a multiple
+// of those slots of about `elasticBytes` (kExpertElasticChunkBytes), or more
+// where the slots above the floor would take more than
+// MOE_EXPERT_MAX_CHUNKS - 1 of them, at most what a buffer of `largest` bytes
+// holds, and at most the slots above the floor. Throws std::invalid_argument
+// when chunks of at most `largest` bytes would take more than
+// MOE_EXPERT_MAX_CHUNKS of them.
+[[nodiscard]] inline ExpertChunkLayout streamedExpertChunkLayout(const ExpertSlotPlanes &planes, uint32_t slots,
+                                                                 uint32_t minimum, uint64_t largest,
+                                                                 uint64_t elasticBytes) {
+  if (!slots || minimum > slots) throw std::invalid_argument("invalid streamed expert size");
+  const detail::ExpertSlotGroup group = detail::expertSlotGroup(planes);
+  const auto alignUp = [&](uint64_t value) { return (value + group.slots - 1) / group.slots * group.slots; };
+  const uint64_t largestSlots = largest / group.bytes * group.slots;
+  const uint64_t share = static_cast<uint64_t>(kExpertFloorShare * double(slots)) / group.slots * group.slots;
+  const uint64_t floorSlots =
+      std::min<uint64_t>({std::max({share, alignUp(minimum), group.slots}), slots, largestSlots});
+  if (!floorSlots) throw detail::tooManyExpertChunks(slots);
+  const uint64_t rest = slots - floorSlots;
+  if (!rest) return {slots, slots, slots, 1};
+  const uint64_t fewest = alignUp((rest + MOE_EXPERT_MAX_CHUNKS - 2) / (MOE_EXPERT_MAX_CHUNKS - 1));
+  const uint64_t chunkSlots =
+      std::min(std::max(fewest, elasticBytes / group.bytes * group.slots), largestSlots);
+  if (chunkSlots < fewest) throw detail::tooManyExpertChunks(slots);
+  const uint64_t elastic = std::min(chunkSlots, rest);
+  return {slots, static_cast<uint32_t>(floorSlots), static_cast<uint32_t>(elastic),
+          static_cast<uint32_t>(1 + (rest + elastic - 1) / elastic)};
+}
+
+// The one chunk of a size of one block, which keeps every one of its `slots`
+// experts, each of `planes`' bytes, in its floor. Throws
+// std::invalid_argument when they take more than `largest` bytes.
+[[nodiscard]] inline ExpertChunkLayout wholeExpertChunkLayout(const ExpertSlotPlanes &planes, uint32_t slots,
+                                                              uint64_t largest) {
+  if (!slots) throw std::invalid_argument("invalid expert size");
+  uint64_t bytes = 0;
+  for (const std::array<uint64_t, 3> &projection : planes)
+    for (const uint64_t plane : projection) bytes += alignWeightOffset(uint64_t{slots} * plane);
+  if (bytes > largest)
+    throw std::invalid_argument("a size of one block's " + std::to_string(slots) + " experts takes " +
+                                std::to_string(bytes) + " bytes, more than the device's largest buffer");
+  return {slots, slots, slots, 1};
+}
+
+} // namespace splash::model

@@ -144,7 +144,7 @@ void appendStreamedTable(std::ostringstream &out, const std::optional<model::Spa
       << ",\"poisoned\":" << boolean(table->poisoned) << ",\"failure\":" << json::quote(table->failure) << '}';
 }
 
-// Streamed routed experts' store (--expert-memory), or null: its arena,
+// Streamed routed experts' store (--expert-memory), or null: its chunks,
 // staging and slots, the experts resident in them, per use (prefill,
 // decode) its loads: the distinct
 // experts they routed, those not resident (read) and of them those read
