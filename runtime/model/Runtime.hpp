@@ -16,6 +16,7 @@ public:
   ~Runtime() override;
   void checkHealth() override;
   [[nodiscard]] uint32_t statesToActivate() const noexcept override;
+  [[nodiscard]] uint64_t idleBufferBytes(uint32_t evictedStates) const noexcept override;
   [[nodiscard]] uint32_t prefillGroupRows(bool spills) const noexcept override;
   [[nodiscard]] uint32_t prefillPasses() const noexcept override;
 
@@ -55,6 +56,10 @@ public:
   [[nodiscard]] ModelMemoryAdmission growSpilledReads() override;
   [[nodiscard]] uint64_t reclaimIdleState(bool keepLane,
                                           IdleMemory scope) noexcept override;
+  [[nodiscard]] uint64_t releaseExpertChunk() override;
+  [[nodiscard]] uint64_t releaseExpertsToFloor() override;
+  [[nodiscard]] uint64_t expertGrowthBytes() const override;
+  [[nodiscard]] ModelMemoryAdmission growExperts() override;
   [[nodiscard]] std::optional<std::string>
   provideMask(uint64_t requestId, std::span<const uint32_t> words) override;
   void end(uint64_t requestId) override;

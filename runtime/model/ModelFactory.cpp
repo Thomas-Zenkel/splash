@@ -94,7 +94,8 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   if (result.descriptor.draft.dflash())
     draft.emplace(backend, images, root / "draft", result.descriptor.draft);
   // The weights that stream from their files read on the engine's readers.
-  const ExpertStoreOptions experts{.memoryBytes = options.expertMemoryBytes, .readers = options.readers};
+  const ExpertStoreOptions experts{
+      .memoryBytes = options.expertMemoryBytes, .floorBytes = options.expertFloorBytes, .readers = options.readers};
   result.target = std::visit(
       [&](const auto &layout) -> TargetWeights {
         const std::filesystem::path directory = root / "target";

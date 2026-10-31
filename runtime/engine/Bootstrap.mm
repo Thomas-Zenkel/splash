@@ -371,6 +371,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
     config.nativeLoop.engine.spill = resources->spillConfig();
     config.nativeLoop.weights = &resources->releasableMemory();
     config.nativeLoop.weightAdmission = resources->memoryGovernor().allocationAdmission();
+    config.nativeLoop.growthAdmission = resources->memoryGovernor().growthAdmission();
     config.nativeLoop.engineFailed = [owner = resources.get()] { owner->engineFailed(); };
     // The parser and engine consume the same resolved ceiling. In automatic
     // mode it cannot be known until resource planning has measured the device.

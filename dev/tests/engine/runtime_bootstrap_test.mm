@@ -222,7 +222,8 @@ private:
     return {.engine = test::engineConfig({.maxContext = 1024}),
             .metrics = &metrics_,
             .weights = &weights_,
-            .weightAdmission = test::admitAll};
+            .weightAdmission = test::admitAll,
+            .growthAdmission = test::admitAll};
   }
 
   test::TestKvStorage backing_;

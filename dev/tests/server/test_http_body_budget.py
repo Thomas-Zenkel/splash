@@ -75,6 +75,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
         self.wait_bytes(harness, 0)
         for path in (
             "/v1/chat/completions",
+            "/v1/chat/completions/count_tokens",
             "/v1/messages?beta=true",
             "/v1/responses",
             "/tokenize",
@@ -152,6 +153,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
         self.wait_bytes(harness, 256)
         for path in (
             "/v1/chat/completions",
+            "/v1/chat/completions/count_tokens",
             "/v1/messages",
             "/v1/responses",
             "/tokenize",

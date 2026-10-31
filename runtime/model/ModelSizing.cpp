@@ -50,7 +50,7 @@ StreamableWeights targetWeights(const Layout &layout, const Plan &plan, gguf::Pl
       result.tableBytes = loadedBytes(plan({.streamExperts = streams.streamExperts})) - result.loadedBytes;
       const SparseRowStoreOptions rows = streamedTableRows(layout);
       result.tableRowBytes = image.streamedRows->rowBytes;
-      result.tableFloorBytes = SparseRowStore::workingBytes(image.streamedRows->rowBytes, rows.prefetchRows,
+      result.tableMinimumBytes = SparseRowStore::workingBytes(image.streamedRows->rowBytes, rows.prefetchRows,
                                                             rows.stageRows) +
                                SparseRowStore::cacheBytesFor(1, image.streamedRows->rowBytes);
     }
@@ -60,7 +60,7 @@ StreamableWeights targetWeights(const Layout &layout, const Plan &plan, gguf::Pl
     StreamedBlocks blocks;
     blocks.blocks = gguf::streamedExperts(
         std::span(streamed).subspan(layout.leadingDenseLayers, layout.layers - layout.leadingDenseLayers));
-    result.expertFloorBytes = ExpertStore::minimumBytes(blocks, layout.moeBlockShape());
+    result.expertMinimumBytes = ExpertStore::minimumBytes(blocks, layout.moeBlockShape());
   }
   return result;
 }
@@ -82,8 +82,8 @@ void addEngramTables(StreamableWeights &weights, const GgufFile &target, const D
   const SparseRowStoreOptions rows = streamedTableRows(layout);
   weights.tableBytes = bytes;
   weights.tableRowBytes = tables.table.rowBytes;
-  weights.tableFloorBytes = SparseRowStore::workingBytes(tables.table.rowBytes, rows.prefetchRows, rows.stageRows) +
-                            SparseRowStore::cacheBytesFor(1, tables.table.rowBytes);
+  weights.tableMinimumBytes = SparseRowStore::workingBytes(tables.table.rowBytes, rows.prefetchRows, rows.stageRows) +
+                              SparseRowStore::cacheBytesFor(1, tables.table.rowBytes);
 }
 
 // The bytes of the images of DSpark's GGUF in `directory`, its experts

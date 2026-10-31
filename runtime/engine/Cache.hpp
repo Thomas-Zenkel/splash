@@ -302,6 +302,14 @@ enum class ReclaimTiming : uint8_t { CanWait, Immediate };
 // resumes from and is in use.
 enum class StateClass : uint8_t { Checkpoint, Ordinary, InUse };
 
+// What the exchange for the expert store may take of the cache now
+// (Cache::exchangeable): the bytes of the extents it releases, and the RAM
+// copies of states it frees, whose buffers return to the model's pool.
+struct CacheExchange final {
+  uint64_t extentBytes = 0;
+  uint32_t states = 0;
+};
+
 // What one step of room for a state's buffers gave: a recycled state's
 // buffers, which the reservation takes as they are, or the bytes of a
 // released extent, which the reservation has to allocate and which may be
@@ -606,12 +614,13 @@ public:
   // Releases every empty extent, but one with keepRunway, and returns the
   // bytes released.
   [[nodiscard]] uint64_t releaseEmptyExtents(bool keepRunway);
-  // Evicts every unpinned entry, in reclaimOne()'s order, and releases every
-  // empty extent, the runway too. Only then does it move pages, those that
-  // requests and pins still hold, so that nothing is copied and then evicted.
-  // Makes progress when anything goes, and reports the bytes of the extents
-  // released.
-  [[nodiscard]] CacheReclaimResult evictAll();
+  // Evicts every unpinned entry of a class up to upTo, in reclaimOne()'s
+  // order, and releases every empty extent, the runway too. Only up to
+  // InUse, once nothing else can go, does it then move pages, those that
+  // requests and pins still hold, so that nothing is copied and then
+  // evicted. Makes progress when anything goes, and reports the bytes of the
+  // extents released.
+  [[nodiscard]] CacheReclaimResult evictAll(ReclaimClass upTo = ReclaimClass::InUse);
   // Bytes of pages whose demotion is in flight; they return when the copies
   // land.
   [[nodiscard]] uint64_t pendingBytes() const noexcept;
@@ -695,6 +704,33 @@ public:
   // leave free: every allocated page of the form no request holds, but with
   // Ordinary not the idle KV that states in use restore through.
   [[nodiscard]] uint32_t reusablePages(ReclaimClass upTo, kv::PageForm form = kv::PageForm::Full) const;
+  // One step of the cache's side of the exchange for the expert store
+  // (Engine::reclaimForExperts): what reclaimOne(ReleaseExtents, Ordinary,
+  // true, true) takes, in its order, but only what leaves at once, starting
+  // no copy to the SSD cache. A state goes through a disk copy it has, or is
+  // dropped when the tier takes no write of it; one that needs a write
+  // stays, and so do the newer ones of its class
+  // (StateCache::Unwritten::Stay). A KV leaf goes through its disk copy, or
+  // is erased when no state needs it or the tier takes no write; one that
+  // needs a demotion stays, and the chain above it
+  // (ReclaimTiming::Immediate).
+  [[nodiscard]] CacheReclaimResult reclaimForExchange();
+  // What reclaimForExchange(), repeated until it makes no progress, takes
+  // between commands: the RAM copies of states it frees
+  // (StateCache::freedWithoutWrites), and the bytes of the extents it
+  // releases, of each form every allocated extent but the runway and those
+  // the pages that stay fill, which compaction gathers (compactExtent). The
+  // pages that stay are those requests hold and every resident page on the
+  // chains it leaves: those of the states in use, of the RAM copies of
+  // states it leaves, and, while the tier takes writes, of each block a
+  // state needs that has no copy on the SSD yet. Exact unless the tier takes
+  // KV writes but no write of the states it drops: the KV that only those
+  // states needed then counts as staying, and goes. Nothing while a
+  // transfer or the state write is in flight: until it lands, a transfer
+  // holds its pages in their extents, and a persist write holds the RAM copy
+  // it reads out of every order, the resume point's among them. The
+  // exchange waits for it.
+  [[nodiscard]] CacheExchange exchangeable() const;
   // One step of room for the buffers of a state, which a command will
   // capture (Model::reserveState) or which is taken from its lane after the
   // command that ended at it (Model::snapshot), taking nothing of a class
@@ -703,10 +739,12 @@ public:
   // the ordinary class, in its order, but only what frees memory now
   // (ReclaimTiming::Immediate), since the reservation follows at once: an
   // extent of free pages, a checkpoint, KV no state restores through, then
-  // the oldest of ordinary states and KV leaves. One in use goes on to the
-  // oldest state in use, last. KV frees memory only as an extent it empties,
-  // released before the call returns, so KV goes only while evicting it can
-  // empty one (extentWithinReach); otherwise the oldest ordinary state goes.
+  // the oldest of ordinary states and KV leaves. A state in use takes no
+  // more here: the oldest state in use goes only through
+  // reclaimInUseState(), once this finds nothing. KV frees memory only as an
+  // extent it empties, released before the call returns, so KV goes only
+  // while evicting it can empty one (extentWithinReach); otherwise the
+  // oldest ordinary state goes.
   // Only a state in use drops a victim whose write must wait for the write
   // in flight: refused, it could reach the disk tier only through that write
   // slot, once its command ends. Other states leave such a victim and move
@@ -722,6 +760,12 @@ public:
   // no use to a reservation: extents and KV stay, and room comes from states
   // alone.
   [[nodiscard]] StateRoom reclaimOneState(StateClass state, bool growth);
+  // The last step of room for the prompt's replay point, which the engine
+  // takes once reclaimOneState(InUse) finds nothing and the expert store gives
+  // no chunk above its floor: recycles the oldest unpinned state in use, whose
+  // buffers go to the model's pool. One whose write must wait for the write in
+  // flight stays, and nothing goes.
+  [[nodiscard]] StateRoom reclaimInUseState();
   // Recycles one unpinned state, preferring checkpoints, for a lane that
   // takes the state's buffers, as a lane's state does while the host
   // refuses growth, taking nothing of a class above upTo. For running work
@@ -847,15 +891,24 @@ private:
   // once it spills (pendingPages), where those pages and the free ones cover
   // the shortfall. Without spilling this is transfersInFlight().
   [[nodiscard]] bool returnsInFlight(const Shortfall &shortfall) const noexcept;
-  // One eviction step: what it takes, as reclaimOne's arguments say, and
-  // the allocation that was refused, if it is taken for one rather than for
-  // a pass.
+  // One eviction step: what it takes, as reclaimOne's arguments say, the
+  // allocation that was refused, if it is taken for one rather than for a
+  // pass, what becomes of a state without a disk copy
+  // (StateCache::Unwritten), and how long the caller can wait for KV memory
+  // (ReclaimTiming). An exchange (reclaimForExchange) starts no write and
+  // waits for none.
   struct EvictionStep final {
     CacheReclaimMode mode;
     ReclaimClass upTo;
     bool keepResumePoint = false;
     std::optional<Shortfall> refused;
+    StateCache::Unwritten unwritten = StateCache::Unwritten::Wait;
+    ReclaimTiming timing = ReclaimTiming::CanWait;
   };
+  // The step of reclaimOne and reclaimForExchange: with ReleaseExtents an
+  // extent of free pages first, else one eviction followed by the extent it
+  // emptied; otherwise the eviction alone.
+  [[nodiscard]] CacheReclaimResult reclaimStep(const EvictionStep &step, bool keepRunway);
   // One eviction: checkpoints first, then the ordinary class's
   // reclaimOldest, then, up to InUse, that of what is in use, as reclaimOne
   // describes. ReusePages skips the checkpoints and scans for pages. What is

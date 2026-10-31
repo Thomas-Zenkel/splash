@@ -248,8 +248,8 @@ void testStreamableWeightsAreWhatLoads(const RuntimeResourcesConfig &config) {
   const std::filesystem::path &root = config.modelRoot;
   const model::StreamableWeights weights =
       model::streamableWeights(root, config.model, {.streamExperts = true, .streamTable = true});
-  require(weights.expertBytes > weights.expertFloorBytes && weights.expertFloorBytes && !weights.tableBytes &&
-              !weights.tableFloorBytes && !weights.tableRowBytes && weights.tableRefusal.empty(),
+  require(weights.expertBytes > weights.expertMinimumBytes && weights.expertMinimumBytes && !weights.tableBytes &&
+              !weights.tableMinimumBytes && !weights.tableRowBytes && weights.tableRefusal.empty(),
           "the streamable weights of a MoE without a table are not its experts'");
   const auto allocated = [](const model::LoadedModel &loaded) {
     return loaded.targetActualAllocatedBytes() + loaded.draft.actualAllocatedBytes +
@@ -268,9 +268,9 @@ void testStreamableWeightsAreWhatLoads(const RuntimeResourcesConfig &config) {
   // Streamed experts read on a pool of SSD readers, as the engine's do.
   const auto readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
   const model::LoadedModel streamed = model::loadModel(
-      backend, root, config.model, {.expertMemoryBytes = weights.expertFloorBytes, .readers = readers});
+      backend, root, config.model, {.expertMemoryBytes = weights.expertMinimumBytes, .readers = readers});
   require(streamed.expertStore() && streamed.expertStore()->stats().slots == kMoeExperts &&
-              allocated(streamed) <= weights.loadedBytes + weights.expertFloorBytes,
+              allocated(streamed) <= weights.loadedBytes + weights.expertMinimumBytes,
           "the smallest store did not hold a layer's experts within its bytes");
   require(arenas(whole, {.experts = true}) == arenas(streamed, model::StreamedParts::loaded(streamed)) &&
               arenas(streamed, {}) == arenas(whole, model::StreamedParts::loaded(whole)) &&
@@ -279,7 +279,7 @@ void testStreamableWeightsAreWhatLoads(const RuntimeResourcesConfig &config) {
   rejects([&] {
     static_cast<void>(
         model::loadModel(backend, root, config.model,
-                         {.expertMemoryBytes = weights.expertFloorBytes - 1, .readers = readers}));
+                         {.expertMemoryBytes = weights.expertMinimumBytes - 1, .readers = readers}));
   }, "holds fewer slots", "a store a byte below the smallest loaded");
 }
 
@@ -291,8 +291,10 @@ void testStreamableWeightsAreWhatLoads(const RuntimeResourcesConfig &config) {
 // count only the second. The automatic SSD cache gives its state staging up
 // where it alone would stream them. Off loads them whatever the budget, a
 // budget without room for their arenas stops the start with its breakdown,
-// and a size below the smallest store is refused by name before anything
-// loads.
+// a size loads them whole where the plan holds them, as auto does, and
+// otherwise streams them through the store auto would, whose floor is that
+// size, in two loads, and a size below the smallest store is refused by name
+// before anything loads.
 void testAutomaticExpertMemory(RuntimeResourcesConfig config) {
   const model::StreamableWeights weights =
       model::streamableWeights(config.modelRoot, config.model, {.streamExperts = true});
@@ -354,18 +356,29 @@ void testAutomaticExpertMemory(RuntimeResourcesConfig config) {
             "a start without room for its arenas was refused without its breakdown");
   }
   config.maximumMemoryBytes = 0;
-  config.expertMemory = {StreamedSetting::Mode::Size, weights.expertFloorBytes};
+  config.expertMemory = {StreamedSetting::Mode::Size, weights.expertMinimumBytes};
+  const StreamedStart sizedWhole = startStreamed(config);
+  require(!sizedWhole.experts && sizedWhole.loads == 1 &&
+              sizedWhole.log.find("--expert-memory ignored: memory holds every routed expert") != std::string::npos,
+          "an explicit size streamed the experts memory holds whole");
+  config.maximumMemoryBytes = whole.minimumRequired - 1;
   const StreamedStart floor = startStreamed(config);
-  require(floor.experts && floor.experts->slots == kMoeExperts && floor.loads == 1,
-          "an explicit store did not load once at its size");
-  config.expertMemory = {StreamedSetting::Mode::Size, weights.expertFloorBytes - 1};
+  require(floor.experts && floor.experts->slots > kMoeExperts && floor.loads == 2 &&
+              floor.experts->floorBytes < floor.experts->capBytes && floor.experts->chunks > 1 &&
+              floor.log.find("gives chunks back down to its floor, the " +
+                             std::to_string(weights.expertMinimumBytes >> 20) + " MiB --expert-memory sets") !=
+                  std::string::npos,
+          "an explicit size did not stream the experts memory cannot hold through the store auto would above "
+          "that floor, loaded at the floor first");
+  config.maximumMemoryBytes = 0;
+  config.expertMemory = {StreamedSetting::Mode::Size, weights.expertMinimumBytes - 1};
   try {
     static_cast<void>(RuntimeResources::create(config, 0));
-    throw std::runtime_error("a store below its floor was accepted");
+    throw std::runtime_error("a size below the smallest store was accepted");
   } catch (const RuntimeResourcesError &error) {
     require(error.stage() == RuntimeResourceStage::Configuration &&
                 std::string_view(error.what()).find("is less than its smallest store") != std::string_view::npos,
-            "a store below its floor was not refused by name before loading");
+            "a size below the smallest store was not refused by name before loading");
   }
 }
 
@@ -401,8 +414,10 @@ void testVerifyRows(const char *metallibPath, RuntimeResourcesConfig moe) {
   const std::string_view budgeted = "Decode cycles verify the rows the verify budget chooses (--verify-rows auto, as "
                                     "moe-test is a MoE target): greedy and seeded outputs can differ from run to run.";
   requireStart(moe, budgeted, true, "a MoE target with resident experts did not budget its rows");
+  // A budget a byte short of the one that holds every expert streams them.
+  moe.maximumMemoryBytes = startStreamed(moe).minimumRequired - 1;
   moe.expertMemory = {StreamedSetting::Mode::Size,
-                      model::streamableWeights(moe.modelRoot, moe.model, {.streamExperts = true}).expertFloorBytes};
+                      model::streamableWeights(moe.modelRoot, moe.model, {.streamExperts = true}).expertMinimumBytes};
   requireStart(moe, budgeted, true, "a MoE target whose experts stream did not budget its rows");
   moe.verifyRows = model::VerifyRows::All;
   requireStart(moe, "Decode cycles verify every row of the draft's block (--verify-rows all).", false,

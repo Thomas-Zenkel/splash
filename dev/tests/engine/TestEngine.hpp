@@ -38,7 +38,7 @@ public:
     return restored_ < kImages;
   }
   void release() override { restored_ = 0; }
-  bool restore(const metal::AllocationAdmission &admit) override {
+  bool restore(const metal::AllocationAdmission &admit, const metal::AllocationAdmission &) override {
     if (failRestore)
       throw std::runtime_error("weights restore test");
     require(released(), "held weights were restored");

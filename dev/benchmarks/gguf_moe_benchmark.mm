@@ -96,11 +96,12 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
           ? backend.allocateBuffer(uint64_t{E} * sizeof(float), BufferStorage::Shared, "selection-bias")
           : MetalBuffer{};
   if (selectionBias) std::memset(selectionBias.contents(), 0, uint64_t{E} * sizeof(float));
-  const BlockMoeWeights gguf{routerSegment, sharedGateSegment, selectionBias,
-                             {planes(gateUpFormat, E * I, H), planes(sharedFormat, shape.sharedSlices * I, H)},
-                             {planes(gateUpFormat, E * I, H), planes(sharedFormat, shape.sharedSlices * I, H)},
-                             {planes(downFormat, E * H, I), planes(sharedFormat, shape.sharedSlices * H, I)},
-                             splash::model::residentExpertSlots(backend, E), E};
+  BlockMoeWeights gguf{routerSegment, sharedGateSegment, selectionBias,
+                       {planes(gateUpFormat, E * I, H), planes(sharedFormat, shape.sharedSlices * I, H)},
+                       {planes(gateUpFormat, E * I, H), planes(sharedFormat, shape.sharedSlices * I, H)},
+                       {planes(downFormat, E * H, I), planes(sharedFormat, shape.sharedSlices * H, I)},
+                       splash::model::residentExpertSlots(backend, E), E};
+  gguf.chunks = splash::ops::residentExpertChunks(gguf);
   // Rows whose expert e scores 4 x[e]: the first E inputs rank the experts, the row's routes at 1 - 0.05 rank and the
   // others below 0.05.
   const auto input = [&](uint32_t rows, Routing routing) {

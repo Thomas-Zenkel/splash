@@ -339,7 +339,7 @@ RuntimeResourcesError planRefusal(const StreamedMemoryResult &result, uint64_t h
     return RuntimeResourcesError(RuntimeResourceStage::Configuration, result.error);
   std::string floors = "model weights with the runtime reserves, one lane's state, the KV runway";
   if (streamable.expertBytes || streamable.tableBytes)
-    floors += ", the streamed stores at their floors";
+    floors += ", the streamed stores at their smallest or at the floor --expert-memory sets";
   if (model.capabilities.sparseKv)
     floors += ", the floors of KV on the SSD cache";
   return RuntimeResourcesError(RuntimeResourceStage::MemoryPlanning,
@@ -373,7 +373,8 @@ std::string_view streamedOnlyIn(const StreamedMemoryPlan &plan, const StreamedMe
 }
 
 // What streams of the loaded model, and how an automatic part's store was
-// sized.
+// sized; for the routed experts' store, its cap and chunks, and the floor it
+// gives memory back down to and where that came from.
 void reportStreamedStores(const model::LoadedModel &loaded, const model::StreamableWeights &streamable,
                           const StreamedSetting &experts, const StreamedSetting &table) {
   const auto automatic = [](const StreamedSetting &setting, std::string_view option) {
@@ -394,12 +395,33 @@ void reportStreamedStores(const model::LoadedModel &loaded, const model::Streama
   }
   if (const model::ExpertStore *store = loaded.expertStore()) {
     const model::ExpertStoreStats stats = store->stats();
+    const bool sized = experts.mode == StreamedSetting::Mode::Size;
+    // The floor --expert-memory sets, and beside it the store's own where
+    // whole slots and chunks round it.
+    const std::string floor =
+        sized ? "the " + std::to_string(experts.bytes / kMiB) + " MiB --expert-memory sets" +
+                    (stats.floorBytes / kMiB != experts.bytes / kMiB
+                         ? " (" + std::to_string(stats.floorBytes / kMiB) + " MiB in whole slots and chunks)"
+                         : std::string())
+              : std::to_string(stats.floorBytes / kMiB) + " MiB, " +
+                    std::to_string(static_cast<int>(model::kExpertFloorShare * 100)) + "% of its slots";
+    const std::string shrinks =
+        stats.floorBytes < stats.capBytes
+            ? "; while memory is short it gives chunks back down to its floor, " + floor
+            : "; it gives none back, its floor, " + floor + ", being all of it";
     logLine("Routed experts stream from their files: ", stats.slots, " slots for ", stats.experts, " experts (",
-            stats.slots * 100 / std::max<uint64_t>(stats.experts, 1), "%) in ", stats.arenaBytes / kMiB, " MiB",
-            automatic(experts, "--expert-memory"), ".");
+            stats.slots * 100 / std::max<uint64_t>(stats.experts, 1), "%) in ", stats.arenaBytes / kMiB,
+            " MiB, a store of ", stats.capBytes / kMiB, " MiB in ", stats.capChunks, " chunks",
+            sized ? ", all that the floors, its own among them, leave it beside the KV kept resident"
+                  : automatic(experts, "--expert-memory"),
+            shrinks, ".");
   } else if (streamable.expertBytes && experts.mode == StreamedSetting::Mode::Auto) {
     logLine("Routed experts load with their layers: memory holds their ", streamable.expertBytes / kMiB,
             " MiB (--expert-memory auto).");
+  } else if (streamable.expertBytes && experts.mode == StreamedSetting::Mode::Size &&
+             experts.bytes < streamable.expertBytes) {
+    logLine("--expert-memory ignored: memory holds every routed expert (", streamable.expertBytes / kMiB,
+            " MiB) beside the KV kept resident, which load with their layers.");
   }
 }
 
@@ -757,8 +779,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
          .windowTokens = config.model.capabilities.maximumContextTokens,
          .requestedContextTokens = requestedContextTokens,
          .relaunchContextTokens = relaunchContext,
-         .experts = {streamable.expertBytes, streamable.expertFloorBytes, experts, false},
-         .table = {streamable.tableBytes, streamable.tableFloorBytes, table, streamable.tableStreamsOnly},
+         .experts = {streamable.expertBytes, streamable.expertMinimumBytes, experts},
+         .table = {streamable.tableBytes, streamable.tableMinimumBytes, table, streamable.tableStreamsOnly},
          .hotCacheBytes = config.sparseKvMemory,
          .sparseKv = config.model.capabilities.sparseKv,
          .tierWritable = stagingBytes && kvFileOpen,
@@ -797,13 +819,16 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     diskOff(reason);
     return without;
   };
-  // The stores the plan gives the parts, except that automatic experts the
-  // plan streams load at their floor while `floors`: until the loaded model
-  // gives the arenas, which take from all that the experts stream through.
+  // The stores the plan gives the parts, except that routed experts the
+  // plan streams load through a store of the least the floors charge them
+  // while `floors`, their smallest store or the floor --expert-memory sets:
+  // until the loaded model gives the arenas, which take from all that the
+  // experts stream through.
   const auto storesOf = [&](const StreamedMemoryPlan &plan, bool floors) {
-    const bool experts = floors && plan.expertBytes && config.expertMemory.mode == StreamedSetting::Mode::Auto;
+    const uint64_t least = plan.expertFloorBytes ? plan.expertFloorBytes : streamable.expertMinimumBytes;
     return model::ModelLoadOptions{.streamedTableBytes = plan.tableBytes,
-                                   .expertMemoryBytes = experts ? streamable.expertFloorBytes : plan.expertBytes,
+                                   .expertMemoryBytes = floors && plan.expertBytes ? least : plan.expertBytes,
+                                   .expertFloorBytes = plan.expertFloorBytes,
                                    .readers = readers};
   };
   model::ModelLoadOptions loadOptions;
@@ -830,9 +855,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                          "routed experts", "load with their layers");
     // Refuse a model that cannot fit before loading its weights: beside them
     // the plan needs at least the runtime reserves, one lane's state, the
-    // KV runway, the streamed stores at their floors, the floors of KV on the
-    // SSD cache and any SSD cache state staging; the plan after the load
-    // adds the arenas.
+    // KV runway, the streamed stores at their smallest or at the floor
+    // --expert-memory sets, the floors of KV on the SSD cache and any SSD
+    // cache state staging; the plan after the load adds the arenas.
     const StreamedMemoryResult planned = storesPlan(false);
     if (!planned.plan)
       throw planRefusal(planned, hardBudgetBytes, streamable, config.model);
@@ -917,8 +942,11 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // spills. Floors that the spill plan refuses refuse it with the engine
   // plan's breakdown.
   const auto planWith = [&](uint64_t stagingBytes, uint64_t aneFfnBytes) -> EngineMemoryPlanResult {
+    // The routed experts' store counts at its cap, as it loaded: the
+    // context and the KV the plan holds beside it never rest on what the
+    // store gives back, which only adds room.
     const auto asLoaded = [](uint64_t storeBytes) {
-      return storeBytes ? StreamedSetting{StreamedSetting::Mode::Size, storeBytes}
+      return storeBytes ? StreamedSetting{StreamedSetting::Mode::Loaded, storeBytes}
                         : StreamedSetting{StreamedSetting::Mode::Off, 0};
     };
     const StreamedMemoryResult streamed = streamedPlan(
@@ -957,20 +985,27 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // The plan with the loaded model's arenas sizes the stores, and the start
   // loads again where it gives a part another store: it loads once where the
   // plan without the arenas already loads each part so, as for a model with
-  // no part to stream, and twice otherwise, as where the routed experts
-  // stream. Floors that the arenas take beyond the budget stop the start
-  // with the engine plan's breakdown (requirePlan, below).
+  // no part to stream or routed experts whose floor --expert-memory sets as
+  // all the plan gives them, and twice otherwise, as where the routed
+  // experts stream. Floors that the arenas take beyond the budget stop the
+  // start with the engine plan's breakdown (requirePlan, below).
   const StreamedMemoryResult planned = storesPlan(true);
   if (!planned.plan && !planned.requiredBytes)
     throw planRefusal(planned, hardBudgetBytes, streamable, config.model);
   if (planned.plan) {
     const model::ModelLoadOptions next = storesOf(*planned.plan, false);
     if (next.expertMemoryBytes != loadOptions.expertMemoryBytes ||
+        next.expertFloorBytes != loadOptions.expertFloorBytes ||
         next.streamedTableBytes != loadOptions.streamedTableBytes) {
       loadOptions = next;
       load(true);
     }
   }
+  // The PLE row cache takes all of its host memory now, before the checks
+  // of the host that the start and the expert store's growth make, which
+  // see it whole from here on rather than as rows fill it.
+  if (model::SparseRowStore *table = loaded.streamedTable())
+    table->commit();
   reportStreamedStores(loaded, streamable, config.expertMemory, config.pleMemory);
   reportVerifyRows(loaded, config.verifyRows);
   // The model's side of the split (startAneFfn).
@@ -1293,6 +1328,7 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       blockCache_.get(),
       historyStream_.get(),
       verifyRows_,
+      memoryGovernor_->growthAdmission(),
   };
 }
 

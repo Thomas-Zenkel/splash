@@ -8,9 +8,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string_view>
+#include <vector>
 
 namespace splash::ops {
 
@@ -104,17 +107,112 @@ struct MoeShape final {
   bool operator==(const MoeShape &) const = default;
 };
 
-// A GGUF expert projection: the routed experts in one segment of slots * N
-// rows, routed expert e's planes from tile slot(e) * N / QUANT_TILE_ROWS on
-// (moe_gguf_segment in kernels/common/moe_expert_slab.h, slot(e) from the
-// block's slot table), or from each plane's base plus slot(e) *
-// BlockMoeWeights::routedSlotBytes on, and the shared expert's segment, whose format may
-// differ, of its sharedSlices slices' N rows each in their order (the rows
-// of slice s of a shared gate or up, rows s * N on; the column window s of a
-// shared down, which a planner lays out so: gguf::TensorRows::windows).
+// A GGUF expert projection: the routed experts' format and size, slots * N
+// rows of K inputs, whose planes the block's chunks hold (ExpertChunks; a
+// resident block's routed planes are its one chunk's, an expert store's
+// those of its slots, each of which keeps an expert's planes together), and
+// the shared expert's segment, whose format may differ, of its sharedSlices
+// slices' N rows each in their order (the rows of slice s of a shared gate or
+// up, rows s * N on; the column window s of a shared down, which a planner
+// lays out so: gguf::TensorRows::windows).
 struct BlockExpertProjection final {
   QuantizedSegment routed;
   QuantizedSegment shared;
+};
+
+// Where a block's routed experts are: the floor chunk, chunk 0, of
+// floorSlots slots, and elastic chunks of chunkSlots slots each after it (the
+// last may hold fewer), MOE_EXPERT_CHUNK_ADDRESSES views per chunk in the
+// order of the expert kernels' address table (metal/abi/MoE.h), which the
+// expert passes and loads reach through their addresses
+// (metal::AddressTable). Slot s < floorSlots is local slot s of chunk 0; any
+// other is local slot (s - floorSlots) % chunkSlots of chunk
+// 1 + (s - floorSlots) / chunkSlots. A local slot l's planes start at row
+// l * N of its chunk's regions; or, in chunks of slotBytes() bytes a slot,
+// which keep each slot's planes together (an expert store's), each view
+// starts at its plane in the chunk's first slot, and slot l's plane
+// l * slotBytes() bytes after it. The blocks of a store size (in such
+// chunks, those of a layout of formats) share the chunks' views and how many
+// of them are live: a store gives its last chunks back while memory is short
+// and takes them again, between commands (keep), and every copy's list names
+// the live chunks alone, one list per count of them, so that the dispatches
+// of a command share one address table, which never names memory given back.
+// The chunks are checked view by view once, where `of` makes them, for the
+// slots, floor and chunk slots and routed formats and sizes it records, which
+// stay those of every chunk; a block's expert passes then only require its
+// own slots and segments to be those (checkedFor). A default value is empty.
+class ExpertChunks final {
+public:
+  ExpertChunks() = default;
+  // The chunks `planes`, a floor chunk of floorSlots slots and elastic
+  // chunks of chunkSlots slots each, which hold `slots` slots of the routed
+  // segments gate, up and down: each planes of a GGUF_FMT_* format, slots * N
+  // rows of K inputs. Throws unless there are 1 to MOE_EXPERT_MAX_CHUNKS
+  // chunks, together `slots` slots or more, and each view of a chunk holds
+  // its slots' planes (the floor chunk min(floorSlots, slots) slots, each
+  // elastic chunk chunkSlots of them but the last that holds slots, which
+  // holds the rest) as requireSegmentPlanes counts a segment of their rows,
+  // or, with slotBytes, its last slot's plane from (held - 1) * slotBytes on,
+  // as it counts a segment of an expert's rows. A format without plane1 has
+  // its meta view in plane1's entry.
+  [[nodiscard]] static ExpertChunks of(std::vector<metal::MetalBuffer> planes, uint32_t floorSlots,
+                                       uint32_t chunkSlots, uint32_t slots, const QuantizedSegment &gate,
+                                       const QuantizedSegment &up, const QuantizedSegment &down,
+                                       uint32_t slotBytes = 0);
+
+  // The live chunks' views, MOE_EXPERT_CHUNK_ADDRESSES per chunk in the
+  // expert kernels' order; null for a default value.
+  [[nodiscard]] const std::shared_ptr<const std::vector<metal::MetalBuffer>> &planes() const noexcept {
+    static const std::shared_ptr<const std::vector<metal::MetalBuffer>> none;
+    return live_ ? live_->planes[live_->count.load(std::memory_order_acquire) - 1] : none;
+  }
+  [[nodiscard]] uint32_t floorSlots() const noexcept { return floorSlots_; }
+  [[nodiscard]] uint32_t chunkSlots() const noexcept { return chunkSlots_; }
+  // The bytes from a slot's planes to the next slot's, 0 for views of a
+  // region's slots of the projection's rows in turn.
+  [[nodiscard]] uint32_t slotBytes() const noexcept { return slotBytes_; }
+  [[nodiscard]] bool empty() const noexcept { return !live_; }
+  // Every chunk, and the first of them that are live, all of them until
+  // keep() keeps fewer.
+  [[nodiscard]] uint32_t chunks() const noexcept { return live_ ? static_cast<uint32_t>(live_->planes.size()) : 0; }
+  [[nodiscard]] uint32_t liveChunks() const noexcept {
+    return live_ ? live_->count.load(std::memory_order_acquire) : 0;
+  }
+  // Every copy's planes() names the first `chunks` chunks alone (1 to
+  // chunks()) for the commands encoded from now on: a store keeps fewer
+  // between commands, once no slot of its blocks lies past them, before it
+  // gives the memory of the others back, and more once it took theirs again.
+  // Throws std::invalid_argument for another count.
+  void keep(uint32_t chunks);
+  // Whether `of` checked them, at their floor and chunk slots, for `slots`
+  // slots of routed segments of gate's, up's and down's formats and sizes.
+  [[nodiscard]] bool checkedFor(uint32_t slots, const QuantizedSegment &gate, const QuantizedSegment &up,
+                                const QuantizedSegment &down) const noexcept;
+
+private:
+  // A routed segment's format and size, which a check of the views reads.
+  struct Routed final {
+    uint32_t formatId = 0;
+    uint32_t outputSize = 0;
+    uint32_t inputSize = 0;
+    bool operator==(const Routed &) const = default;
+  };
+  [[nodiscard]] static Routed routedOf(const QuantizedSegment &segment) noexcept {
+    return {segment.formatId, segment.outputSize, segment.inputSize};
+  }
+
+  // The views of the first k chunks (planes[k - 1]), and k of the live
+  // chunks, which every copy shares.
+  struct Live final {
+    std::vector<std::shared_ptr<const std::vector<metal::MetalBuffer>>> planes;
+    std::atomic<uint32_t> count = 0;
+  };
+  std::shared_ptr<Live> live_;
+  uint32_t floorSlots_ = 0;
+  uint32_t chunkSlots_ = 0;
+  uint32_t slots_ = 0;
+  uint32_t slotBytes_ = 0;
+  std::array<Routed, 3> routed_{}; // gate, up, down
 };
 
 struct MoeScratch;
@@ -128,15 +226,11 @@ enum class MoePhase : uint8_t { Prefill, Decode };
 // F32 or BF16, which llama.cpp keeps unquantized, or a quantized tensor's
 // native rows) and the shared expert's scalar gate F32 values, and both run
 // in fp32; a block without the gate (!MoeShape::sharedGate) leaves it empty.
-// The routed segments hold `slots` experts, routed expert e in slot
-// slotTable[e] (one uint32 per expert): every expert and the identity
-// table when they are all resident, or an expert store's slots and the
-// block's table there when they stream (`stream`, the block's index in it
-// `streamBlock`). A plane holds its slots' experts in turn, or, with
-// routedSlotBytes, each slot's expert that many bytes after the slot
-// before's: an expert store's slots of one size, which keep every plane of
-// an expert together, the segments views of them from each plane's place in
-// a slot on.
+// The chunks hold `slots` experts, routed expert e in slot slotTable[e] (one
+// uint32 per expert): every expert, in one chunk of the routed segments'
+// planes, and the identity table when they are all resident
+// (residentExpertChunks), or an expert store's slots and the block's table
+// there when they stream (`stream`, the block's index in it `streamBlock`).
 struct BlockMoeWeights final {
   QuantizedSegment router;           // [experts][hidden]
   QuantizedSegment sharedScalarGate; // [1][hidden]
@@ -147,10 +241,16 @@ struct BlockMoeWeights final {
   BlockExpertProjection down;
   metal::MetalBuffer slotTable;
   uint32_t slots = 0;
-  uint32_t routedSlotBytes = 0;
   const MoeExpertStream *stream = nullptr;
   uint32_t streamBlock = 0;
+  ExpertChunks chunks = {};
 };
+
+// The one chunk of a block whose routed segments hold all its `slots`
+// experts, slot e expert e: its floor chunk, of floorSlots = chunkSlots =
+// slots, gate's, up's and down's plane0, plane1Slot() and meta, which
+// ExpertChunks::of checks.
+[[nodiscard]] ExpertChunks residentExpertChunks(const BlockMoeWeights &weights);
 
 // One MoE step of a block a load serves: its plan, and its buffers once the
 // grouping wrote their tiles (MoeScratch::tileDescriptors and tileCount).
@@ -407,11 +507,13 @@ struct MoE final {
   // A streamed experts' load (MoeExpertStream::addLoad): the gate, up and
   // down projections of up to `jobs` experts, job j's projection z's native
   // rows in `staging` from sources[3j + z] (bytes) on, repacked into the
-  // planes of slot slots[j] of `arena` as `params` lays them out. The host
-  // step before it writes the sources, the slots and the grid
-  // (expertLoadGroups threadgroups, the jobs it staged, 3) into `grid`.
+  // planes of slot slots[j] of `chunks` as `params` lays them out (its
+  // floor_slots and chunk_slots the chunks'). The host step before it writes
+  // the sources, the slots and the grid (expertLoadGroups threadgroups, the
+  // jobs it staged, 3) into `grid`. Any slot may be written, so the dispatch
+  // reaches every chunk.
   static void addExpertLoad(metal::CommandGraph &graph, const metal::MetalBuffer &staging,
-                            const metal::MetalBuffer &arena, const metal::MetalBuffer &slots,
+                            const ExpertChunks &chunks, const metal::MetalBuffer &slots,
                             const metal::MetalBuffer &sources, const MoeExpertLoadParams &params, uint32_t jobs,
                             const metal::IndirectGrid &grid);
   // The threadgroups that repack one job's largest projection.

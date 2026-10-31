@@ -2,7 +2,7 @@ import Foundation
 import Observation
 
 /// A message of a conversation, as the app keeps it.
-struct ChatMessage: Codable, Identifiable, Equatable {
+struct ChatMessage: Codable, Identifiable, Equatable, Sendable {
     enum Role: String, Codable { case user, assistant }
 
     var id = UUID()
@@ -36,7 +36,7 @@ struct Conversation: Codable, Identifiable, Equatable {
 
 /// The model a message goes to: the server's address, the model it serves and whether it sees
 /// images, and the reasoning effort to ask for.
-struct ChatTarget {
+struct ChatTarget: Equatable, Sendable {
     let url: URL
     let model: String
     let acceptsImages: Bool
@@ -240,6 +240,34 @@ enum ChatClient {
         let errorDescription: String?
     }
 
+    /// The tokens `messages` take as the model reads them, its template, images and earlier
+    /// thinking included, counted without inference and without waking a sleeping engine.
+    static func countTokens(_ messages: [ChatMessage], with server: ChatTarget, session: URLSession = .shared) async throws -> Int {
+        let request = try countRequest(messages, with: server)
+        let (data, response) = try await session.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else {
+            throw Failure(errorDescription: message(of: data, for: messages, server: server)
+                ?? HTTPURLResponse.localizedString(forStatusCode: status))
+        }
+        struct Count: Decodable { let input_tokens: Int }
+        guard let count = try? JSONDecoder().decode(Count.self, from: data), count.input_tokens >= 0 else {
+            throw Failure(errorDescription: "The model returned an invalid token count.")
+        }
+        return count.input_tokens
+    }
+
+    /// The request counting `messages`: the prompt `stream` sends, as it sends it.
+    static func countRequest(_ messages: [ChatMessage], with server: ChatTarget) throws -> URLRequest {
+        var request = URLRequest(url: server.url.appending(path: "v1/chat/completions/count_tokens"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let key = server.apiKey { request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
+        request.httpBody = try JSONSerialization.data(withJSONObject: prompt(messages, effort: server.effort, images: server.acceptsImages))
+        request.timeoutInterval = 30
+        return request
+    }
+
     static func stream(_ messages: [ChatMessage], with server: ChatTarget) -> AsyncThrowingStream<Delta, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
@@ -273,11 +301,19 @@ enum ChatClient {
         }
     }
 
-    /// The request for `messages`: images as data URLs, or a note in their place for a model that
-    /// cannot see them; earlier answers with what the model thought, empty ones left out; the
-    /// reasoning effort unless it is the model's default; and the prompt's progress and the usage
-    /// asked for.
+    /// The request for `messages`: the prompt, streamed, with its progress and the usage asked for.
     static func body(_ messages: [ChatMessage], effort: String, images: Bool) throws -> Data {
+        var body = prompt(messages, effort: effort, images: images)
+        body["stream"] = true
+        body["stream_options"] = ["include_usage": true]
+        body["return_progress"] = true
+        return try JSONSerialization.data(withJSONObject: body)
+    }
+
+    /// The prompt of `messages`: images as data URLs, or a note in their place for a model that
+    /// cannot see them; earlier answers with what the model thought, empty ones left out; and the
+    /// reasoning effort unless it is the model's default.
+    private static func prompt(_ messages: [ChatMessage], effort: String, images: Bool) -> [String: Any] {
         let wire: [[String: Any]] = messages.compactMap { message in
             switch message.role {
             case .user where !message.images.isEmpty && images:
@@ -296,10 +332,9 @@ enum ChatClient {
                 return ["role": "assistant", "content": message.text, "reasoning_content": message.reasoning]
             }
         }
-        var body: [String: Any] = ["messages": wire, "stream": true, "stream_options": ["include_usage": true],
-                                   "return_progress": true]
+        var body: [String: Any] = ["messages": wire]
         if !effort.isEmpty { body["reasoning_effort"] = effort }
-        return try JSONSerialization.data(withJSONObject: body)
+        return body
     }
 
     /// The event a line of the event stream carries, nil for a line that carries none (a

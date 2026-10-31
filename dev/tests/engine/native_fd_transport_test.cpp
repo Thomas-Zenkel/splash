@@ -88,7 +88,7 @@ struct Harness final {
       {.engine = test::engineConfig(),
        .metrics = &metrics,
        .weights = &weights,
-       .weightAdmission = test::admitAll},
+       .weightAdmission = test::admitAll, .growthAdmission = test::admitAll},
       metal::kResidencyKeepAliveSeconds, resources, executor, transport.outputSink(),
       [this] { return status(); }, protocol::ProtocolLimits{}};
 };
@@ -119,7 +119,7 @@ struct PersistentHarness final {
       {.engine = test::engineConfig(),
        .metrics = &metrics,
        .weights = &weights,
-       .weightAdmission = test::admitAll},
+       .weightAdmission = test::admitAll, .growthAdmission = test::admitAll},
       metal::kResidencyKeepAliveSeconds, resources, executor, transport.outputSink(),
       test::readyStatusJson, protocol::ProtocolLimits{}};
 };
@@ -352,7 +352,7 @@ void testLoopWakesForAnEngineDeadline() {
       {.engine = test::engineConfig(),
        .metrics = &metrics,
        .weights = &weights,
-       .weightAdmission = test::admitAll},
+       .weightAdmission = test::admitAll, .growthAdmission = test::admitAll},
       metal::kResidencyKeepAliveSeconds, resources, executor,
       [&](std::span<const uint8_t> bytes) {
         for (const auto &event : protocol::peer::decodeEvents(bytes)) {

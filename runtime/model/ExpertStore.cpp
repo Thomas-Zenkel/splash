@@ -1,6 +1,9 @@
 #include "model/ExpertStore.hpp"
+#include "AwakeClock.hpp"
+#include "StderrLine.hpp"
 
 #include "metal/abi/MoE.h"
+#include "model/ExpertChunkLayout.hpp"
 #include "model/GgufImageLayout.hpp"
 #include "model/GgufPreparation.hpp"
 #include "model/Model.hpp"
@@ -14,6 +17,7 @@
 #include <atomic>
 #include <cstring>
 #include <exception>
+#include <iomanip>
 #include <mutex>
 #include <span>
 #include <stdexcept>
@@ -103,6 +107,11 @@ SlotLayout slotLayout(const ExpertLayout &layout) noexcept {
   return slot;
 }
 
+// The bytes of a chunk of `slots` slots of `slotBytes` each, in turn. The
+// store's chunks take the bytes of one chunk of all its slots
+// (ExpertChunkLayout).
+uint64_t chunkBytes(uint64_t slotBytes, uint64_t slots) noexcept { return alignWeightOffset(slots * slotBytes); }
+
 // Places of experts in the staging: place p's rows of projection z from
 // at(p, z) on, in width[z] bytes, projection after projection, place after
 // place. A place is a page wider than its expert's rows widened to whole
@@ -128,8 +137,10 @@ struct Places final {
 
 // What a store's blocks alone decide (the store and ExpertStore::
 // fixedBytes): each block's layout, the layouts, the native bytes of each
-// projection of a place, the most of any layout's expert, and the bytes of
-// the widest expert's slot.
+// projection of a place, the most of any layout's expert, and the bytes of a
+// slot, the widest expert's in whole kWeightFileAlignment units: a chunk of
+// any number of slots fills its region whole, so the store's floor and
+// elastic chunks part its slots at any slot (ExpertChunkLayout).
 struct Geometry final {
   std::vector<uint32_t> layoutOf;
   std::vector<ExpertLayout> layouts;
@@ -148,7 +159,7 @@ Geometry geometryOf(const StreamedBlocks &streamed, ops::MoeShape shape) {
   }
   for (const ExpertLayout &layout : g.layouts) {
     for (size_t z = 0; z < 3; ++z) g.nativeBytes[z] = std::max(g.nativeBytes[z], layout[z].nativeBytes());
-    g.slotBytes = std::max(g.slotBytes, slotLayout(layout).bytes);
+    g.slotBytes = std::max(g.slotBytes, alignWeightOffset(slotLayout(layout).bytes));
   }
   return g;
 }
@@ -172,11 +183,11 @@ uint64_t fixedBytesOf(const Geometry &g, uint32_t blocks, ops::MoeShape shape) {
          split;
 }
 
-// The smallest store (ExpertStore::minimumBytes): its fixed bytes and an
-// arena of a block's experts in slots of the widest expert's size, which for
+// The smallest store (ExpertStore::minimumBytes): its fixed bytes and a
+// chunk of a block's experts in slots of the widest expert's size, which for
 // a store of one block are all of its experts.
 uint64_t minimumBytesOf(const Geometry &g, uint32_t blocks, ops::MoeShape shape) {
-  return fixedBytesOf(g, blocks, shape) + uint64_t{shape.experts} * g.slotBytes;
+  return fixedBytesOf(g, blocks, shape) + chunkBytes(g.slotBytes, shape.experts);
 }
 
 } // namespace
@@ -206,26 +217,43 @@ struct ExpertStore::Impl {
     std::vector<Group> groups;
     std::vector<Piece> pieces;
   };
-  // The experts of some consecutive blocks, of any layouts, in the slots of
-  // one arena (of every block, unless that would exceed the largest buffer),
-  // each slot as wide as the widest of their experts: a pool of several
-  // blocks streams, its slots recycled across them in its order
-  // (SlotRecycler); one of one block holds every one of its experts.
-  struct Pool final {
+  // The experts of every block, in slots as wide as the widest of them
+  // (Geometry::slotBytes): their slots, a streamed store's recycled in its
+  // order (SlotRecycler), in its floor chunk and elastic chunks
+  // (streamedExpertChunkLayout), or a store of one block's in its floor chunk
+  // alone (wholeExpertChunkLayout), each a buffer of its own slots in turn.
+  // The first liveChunks() of them are live and the recycler holds their
+  // slots; the others are released.
+  struct Size final {
     uint32_t blocks = 0;
-    uint64_t slotBytes = 0;
+    // Whether it holds the experts of several blocks.
     bool streams = false;
+    // Its slots at the cap, which its blocks' segments, owners and slot
+    // tables count, and where its chunks hold them.
     uint32_t slots = 0;
-    metal::MetalBuffer arena;
+    ExpertChunkLayout chunkLayout;
+    // The chunks' buffers; and per layout (Geometry::layouts) its routed
+    // segments, of the slots in its formats and no planes (bind), and the
+    // chunks' regions as the expert kernels reach them, views of each chunk
+    // from each of its planes' places in a slot on, checked for those
+    // segments, which the layout's blocks share.
+    std::vector<metal::MetalBuffer> buffers;
+    std::vector<std::array<ops::QuantizedSegment, 3>> routed;
+    std::vector<ops::ExpertChunks> chunks;
     // Which slot a load's missing expert takes.
     SlotRecycler recycling{0};
     std::vector<uint32_t> ownerBlock, ownerExpert; // kNoSlot when free
+
+    // The live chunks, which every layout's views name alone.
+    [[nodiscard]] uint32_t liveChunks() const noexcept { return chunks.front().liveChunks(); }
+    void keep(uint32_t live) {
+      for (ops::ExpertChunks &views : chunks) views.keep(live);
+    }
   };
   struct Block final {
-    uint32_t pool = 0;
     // Its experts' layout (Geometry::layouts), and the repack of its staged
-    // rows into its pool's slots: projection z's plane i from
-    // load.projections[z].planes[i] of a slot on (slotLayout).
+    // rows into the slots: projection z's plane i from its place in a slot on
+    // (slotLayout), in its layout's views of the chunks.
     uint32_t layout = 0;
     MoeExpertLoadParams load{};
     uint32_t loadGroups = 0;
@@ -275,7 +303,8 @@ struct ExpertStore::Impl {
   [[nodiscard]] uint32_t roundPlaces(ops::MoePhase phase, uint64_t routable) const noexcept {
     return phase == ops::MoePhase::Decode && routable <= places.count ? places.count : places.count / 2;
   }
-  [[nodiscard]] bool streams(uint32_t block) const noexcept { return pools[blocks[block].pool].streams; }
+  // Whether the blocks' experts stream: those of a store of several blocks.
+  [[nodiscard]] bool streams() const noexcept { return size.streams; }
   // What a decode load's host step reports its round trip to.
   static std::function<void(const metal::HostStepTiming &)> timedDecode(std::shared_ptr<Impl> impl) {
     return [impl = std::move(impl)](const metal::HostStepTiming &timing) {
@@ -318,9 +347,38 @@ struct ExpertStore::Impl {
   void readBlockAhead(uint32_t block, ops::MoePhase phase);
   void countAhead(size_t group, size_t from, size_t to);
   void retireAhead();
-  void evict(Pool &pool, uint32_t slot);
+  void evict(uint32_t slot);
   void abandon();
   void fill();
+  // Whether the store may give chunks back now: it holds its memory, no
+  // command is in flight, no load failed, and no routed expert waits to be
+  // staged. A command that failed after a load's last round staged leaves
+  // nothing the store knows of, but a failed command ends the engine before
+  // any shrink (ExpertStore.hpp): these guards are a defence.
+  [[nodiscard]] bool mayShrink() const {
+    return !released && failure.empty() && pending.empty() && !backend.commandInFlight();
+  }
+  // Gives the live chunks from `live` on back (releaseAboveFloor,
+  // releaseToFloor); returns their bytes.
+  uint64_t shrink(uint32_t live);
+  // Takes the next chunk back under `admit`, its slots free.
+  [[nodiscard]] metal::AllocationResult grow(const metal::AllocationAdmission &admit);
+  // The expert in slot `from` moves to the free slot `to`: its planes, its
+  // owner, and its block's slot and table entry.
+  void move(uint32_t from, uint32_t to);
+  // Before the slots from `boundary` on are given back: no block names them,
+  // every table entry is the block's slot of the expert (0 for one not
+  // resident), no slot from it on has an owner, and the recycler holds the
+  // slots below it alone. Throws std::logic_error otherwise.
+  void requireBelow(uint32_t boundary) const;
+  // No repack names a slot: a load's host step that does not run (one
+  // before it threw, or the command before it failed) leaves the repack
+  // after it no job, rather than the last round's, whose slots a shrink may
+  // have moved or given back; and no slot is staged, as no load is under way.
+  void forgetRepack();
+  // The live chunks' count, bytes and slots in the counters, none while the
+  // store is released.
+  void countLive();
   void publish();
 
   metal::MetalBackend &backend;
@@ -330,7 +388,7 @@ struct ExpertStore::Impl {
   // What holds the sources open, and their checks (StreamedBlocks).
   std::shared_ptr<const void> files;
   std::vector<std::function<void()>> checks;
-  std::vector<Pool> pools;
+  Size size;
   std::vector<Block> blocks;
   // The staging's places, and which of them the round being staged holds.
   Places places;
@@ -365,11 +423,11 @@ struct ExpertStore::Impl {
     std::vector<uint32_t> experts;
     ExpertStoreStats::Use *use = nullptr;
   } plan;
-  uint64_t arenaTotal = 0;
 
-  // A load and release() or restore(), which never overlap (no command is in
-  // flight while the store releases or restores its memory), hand the state
-  // below between their threads under `mutex`. stats() reads `published`, a
+  // A load and release(), restore(), releaseAboveFloor() or growTowardCap(),
+  // which never overlap (no command is in flight while the store gives its
+  // memory back or takes it again), hand the state below and the size's
+  // slots between their threads under `mutex`. stats() reads `published`, a
   // copy of the counters each of them leaves under statsMutex, and released()
   // the engine thread's own flag: neither waits for a load's reads.
   mutable std::mutex mutex;
@@ -416,16 +474,16 @@ struct ExpertStore::Impl {
 };
 
 // The expert in a slot, if any, is no longer resident.
-void ExpertStore::Impl::evict(Pool &pool, uint32_t slot) {
-  const uint32_t owner = pool.ownerBlock[slot];
+void ExpertStore::Impl::evict(uint32_t slot) {
+  const uint32_t owner = size.ownerBlock[slot];
   if (owner == kNoSlot) return;
-  const uint32_t expert = pool.ownerExpert[slot];
+  const uint32_t expert = size.ownerExpert[slot];
   blocks[owner].slot[expert] = kNoSlot;
-  // A table entry of no resident expert names slot 0, which is inside the
-  // arena: the kernels read only routed experts' entries, which a load set,
-  // so it is never used.
+  // A table entry of no resident expert names slot 0, which is inside chunk
+  // 0, the floor chunk: the kernels read only routed experts' entries, which
+  // a load set, so it is never used.
   static_cast<uint32_t *>(tables.contents())[uint64_t{owner} * shape.experts + expert] = 0;
-  pool.ownerBlock[slot] = pool.ownerExpert[slot] = kNoSlot;
+  size.ownerBlock[slot] = size.ownerExpert[slot] = kNoSlot;
   --counters.resident;
 }
 
@@ -435,7 +493,6 @@ void ExpertStore::Impl::evict(Pool &pool, uint32_t slot) {
 void ExpertStore::Impl::route(uint32_t index, std::span<const std::span<const MoeTileDescriptor>> parts,
                               ops::MoePhase phase, uint32_t rows, ExpertStoreStats::Use &use) {
   Block &block = blocks[index];
-  Pool &pool = pools[block.pool];
   const bool chunk = longChunk(phase, rows);
   ++serial;
   pendingBlock = index;
@@ -447,7 +504,7 @@ void ExpertStore::Impl::route(uint32_t index, std::span<const std::span<const Mo
       routedIn[expert] = serial;
       ++use.routed;
       if (const uint32_t slot = block.slot[expert]; slot != kNoSlot) {
-        pool.recycling.touch(slot, serial, chunk);
+        size.recycling.touch(slot, serial, chunk);
         continue;
       }
       pending.push_back({expert, kNoSlot});
@@ -456,10 +513,10 @@ void ExpertStore::Impl::route(uint32_t index, std::span<const std::span<const Mo
   std::ranges::sort(pending);
   uint32_t *table = static_cast<uint32_t *>(tables.contents()) + uint64_t{index} * shape.experts;
   for (auto &[expert, slot] : pending) {
-    slot = pool.recycling.claim(uint64_t{index} << 32 | expert, serial, chunk);
-    evict(pool, slot);
-    pool.ownerBlock[slot] = index;
-    pool.ownerExpert[slot] = expert;
+    slot = size.recycling.claim(uint64_t{index} << 32 | expert, serial, chunk);
+    evict(slot);
+    size.ownerBlock[slot] = index;
+    size.ownerExpert[slot] = expert;
     block.slot[expert] = slot;
     table[expert] = slot;
     waiting[expert] = 1;
@@ -905,7 +962,6 @@ void ExpertStore::Impl::abandon() {
   if (demand) readers->stop(*std::exchange(demand, nullptr));
   if (pendingBlock == kNoSlot) return;
   Block &block = blocks[pendingBlock];
-  Pool &pool = pools[block.pool];
   uint32_t *table = static_cast<uint32_t *>(tables.contents()) + uint64_t{pendingBlock} * shape.experts;
   for (const std::vector<std::pair<uint32_t, uint32_t>> *list : {&pending, &staged})
     for (const auto &[expert, slot] : *list) {
@@ -913,8 +969,8 @@ void ExpertStore::Impl::abandon() {
       if (slot == kNoSlot || block.slot[expert] != slot) continue;
       block.slot[expert] = kNoSlot;
       table[expert] = 0;
-      pool.ownerBlock[slot] = pool.ownerExpert[slot] = kNoSlot;
-      pool.recycling.free(slot);
+      size.ownerBlock[slot] = size.ownerExpert[slot] = kNoSlot;
+      size.recycling.free(slot);
       --counters.resident;
     }
   pending.clear();
@@ -922,13 +978,13 @@ void ExpertStore::Impl::abandon() {
   pendingBlock = kNoSlot;
 }
 
-// Reads every expert of a pool of one block into its slot, expert e into
-// slot e, through the staging, as many a command as it places.
+// Reads every expert of a store of one block into its slot, expert e into
+// slot e, through the staging, as many a command as it places; its last
+// repack's jobs are forgotten once it ran.
 void ExpertStore::Impl::fill() {
   for (uint32_t index = 0; index < blocks.size(); ++index) {
-    if (streams(index)) continue;
+    if (streams()) continue;
     Block &block = blocks[index];
-    Pool &pool = pools[block.pool];
     std::array<uint64_t, 3> nativeBytes;
     for (size_t z = 0; z < 3; ++z) nativeBytes[z] = layoutOf(index)[z].nativeBytes();
     const uint64_t count = std::min<uint64_t>(shape.experts, staging.sizeBytes() / Places(nativeBytes, 1).bytes());
@@ -948,8 +1004,8 @@ void ExpertStore::Impl::fill() {
         const uint32_t slot = expert + k;
         jobSlots[k] = slot;
         for (uint32_t z = 0; z < 3; ++z) jobSources[3 * k + z] = expertAt(group, k, z);
-        pool.ownerBlock[slot] = index;
-        pool.ownerExpert[slot] = slot;
+        size.ownerBlock[slot] = index;
+        size.ownerExpert[slot] = slot;
         block.slot[slot] = slot;
         table[slot] = slot;
       }
@@ -958,12 +1014,117 @@ void ExpertStore::Impl::fill() {
       threadgroups[1] = experts;
       threadgroups[2] = 3;
       metal::CommandGraph graph;
-      ops::MoE::addExpertLoad(graph, staging, pool.arena, jobs, sources, block.load, experts,
+      ops::MoE::addExpertLoad(graph, staging, size.chunks[block.layout], jobs, sources, block.load, experts,
                               metal::IndirectGrid{grid, 0});
       static_cast<void>(backend.submitCommandAsync(graph.command()).wait());
     }
     counters.resident += shape.experts;
   }
+  forgetRepack();
+}
+
+// The experts of the chunks that go that fit move below them, after the
+// recycler evicted those its order recycles first until they fit
+// (SlotRecycler::compact), in one compaction, so that each moves once; once
+// the slot tables are checked, no address table names those chunks from the
+// next command on, and their memory goes, the last first. The slots claimed
+// by a load in flight could move under it, so no command is in flight, and
+// every command before succeeded (ExpertStore.hpp): no load is unfinished.
+// Logs a line with what moved and what the store holds after.
+uint64_t ExpertStore::Impl::shrink(uint32_t live) {
+  const AwakeClock::time_point started = AwakeClock::now();
+  const uint32_t chunks = size.liveChunks();
+  const uint32_t boundary = size.chunkLayout.first(live);
+  uint32_t evicted = 0, moved = 0;
+  size.recycling.compact(
+      boundary,
+      [&](uint32_t slot) {
+        evict(slot);
+        ++evicted;
+      },
+      [&](uint32_t from, uint32_t to) {
+        move(from, to);
+        ++moved;
+      });
+  requireBelow(boundary);
+  forgetRepack();
+  size.keep(live);
+  uint64_t bytes = 0;
+  for (uint32_t chunk = chunks; chunk-- > live;) {
+    backend.releaseMemory(size.buffers[chunk]);
+    bytes += size.buffers[chunk].sizeBytes();
+  }
+  counters.shrinks += chunks - live;
+  countLive();
+  publish();
+  const double took = millisecondsSince(started);
+  logLine("Expert store gave back ", chunks - live == 1 ? "a chunk" : std::to_string(chunks - live) + " chunks",
+          " of ", bytes >> 20, " MiB while memory is short, in ", std::fixed, std::setprecision(1), took,
+          " ms: ", moved, " experts moved below ", chunks - live == 1 ? "it" : "them", " and ", evicted,
+          " evicted; ", counters.chunks, " of ", counters.capChunks, " chunks hold ", counters.slots, " slots.");
+  return bytes;
+}
+
+metal::AllocationResult ExpertStore::Impl::grow(const metal::AllocationAdmission &admit) {
+  const uint32_t chunk = size.liveChunks();
+  const metal::MetalBuffer &buffer = size.buffers[chunk];
+  if (const metal::AllocationResult admitted = admit(buffer.sizeBytes(), [&] { backend.restoreMemory(buffer); });
+      !admitted)
+    return admitted;
+  size.recycling.resize(size.chunkLayout.first(chunk + 1));
+  size.keep(chunk + 1);
+  return {};
+}
+
+void ExpertStore::Impl::move(uint32_t from, uint32_t to) {
+  // A slot's planes are one run of its chunk, the slot's bytes.
+  const uint64_t bytes = geometry.slotBytes;
+  const uint32_t fromChunk = size.chunkLayout.chunkOf(from), toChunk = size.chunkLayout.chunkOf(to);
+  const uint64_t fromLocal = from - size.chunkLayout.first(fromChunk), toLocal = to - size.chunkLayout.first(toChunk);
+  std::memcpy(static_cast<uint8_t *>(size.buffers[toChunk].contents()) + toLocal * bytes,
+              static_cast<const uint8_t *>(size.buffers[fromChunk].contents()) + fromLocal * bytes, bytes);
+  const uint32_t owner = std::exchange(size.ownerBlock[from], kNoSlot);
+  const uint32_t expert = std::exchange(size.ownerExpert[from], kNoSlot);
+  size.ownerBlock[to] = owner;
+  size.ownerExpert[to] = expert;
+  if (owner == kNoSlot) return;
+  blocks[owner].slot[expert] = to;
+  static_cast<uint32_t *>(tables.contents())[uint64_t{owner} * shape.experts + expert] = to;
+}
+
+void ExpertStore::Impl::requireBelow(uint32_t boundary) const {
+  const auto *table = static_cast<const uint32_t *>(tables.contents());
+  for (uint32_t block = 0; block < blocks.size(); ++block) {
+    for (uint32_t expert = 0; expert < shape.experts; ++expert) {
+      const uint32_t slot = blocks[block].slot[expert];
+      if ((slot != kNoSlot && slot >= boundary) ||
+          table[uint64_t{block} * shape.experts + expert] != (slot == kNoSlot ? 0 : slot))
+        throw std::logic_error("block " + std::to_string(block) + "'s expert " + std::to_string(expert) +
+                               " is in slot " + std::to_string(slot) + " past the expert slots kept, " +
+                               std::to_string(boundary) + ", or its slot table names another");
+    }
+  }
+  for (uint32_t slot = boundary; slot < size.slots; ++slot)
+    if (size.ownerBlock[slot] != kNoSlot)
+      throw std::logic_error("expert slot " + std::to_string(slot) + " past the slots kept, " +
+                             std::to_string(boundary) + ", holds an expert");
+  if (size.recycling.size() != boundary)
+    throw std::logic_error("the expert recycler holds " + std::to_string(size.recycling.size()) +
+                           " slots, not the " + std::to_string(boundary) + " kept");
+}
+
+void ExpertStore::Impl::forgetRepack() {
+  static_cast<uint32_t *>(grid.contents())[1] = 0;
+  staged.clear();
+}
+
+void ExpertStore::Impl::countLive() {
+  counters.chunks = counters.arenaBytes = counters.slots = 0;
+  if (released) return;
+  const uint32_t live = size.liveChunks();
+  counters.chunks = live;
+  for (uint32_t chunk = 0; chunk < live; ++chunk) counters.arenaBytes += size.buffers[chunk].sizeBytes();
+  counters.slots = size.chunkLayout.first(live);
 }
 
 // Leaves a copy of the counters and the failure for stats().
@@ -1061,95 +1222,107 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
                            .experts = std::move(streamed.blocks[block]),
                            .slot = std::vector<uint32_t>(shape.experts, kNoSlot)});
   const uint32_t blocks = static_cast<uint32_t>(impl.blocks.size());
-  if (const uint64_t minimum = minimumBytesOf(geometry, blocks, shape); options.memoryBytes < minimum)
+  const uint64_t minimum = minimumBytesOf(geometry, blocks, shape);
+  if (options.memoryBytes < minimum)
     throw std::invalid_argument("expert memory of " + std::to_string(options.memoryBytes >> 20) +
                                 " MiB holds fewer slots than the smallest store (" + std::to_string(minimum >> 20) +
                                 " MiB): a block's experts in slots of the widest expert's size, beside the staging "
                                 "and tables");
+  if (options.floorBytes && (options.floorBytes < minimum || options.floorBytes > options.memoryBytes))
+    throw std::invalid_argument("an expert floor of " + std::to_string(options.floorBytes >> 20) +
+                                " MiB lies outside the smallest store and the store's " +
+                                std::to_string(options.memoryBytes >> 20) + " MiB");
   if (geometry.slotBytes > UINT32_MAX) throw std::invalid_argument("an expert takes more than 4 GiB");
   const uint64_t fixed = fixedBytesOf(geometry, blocks, shape);
-  const uint64_t arenaBudget = options.memoryBytes > fixed ? options.memoryBytes - fixed : 0;
   const uint64_t largest = options.bufferBytes && options.bufferBytes < backend.capabilities().maxBufferLengthBytes
                                ? options.bufferBytes
                                : backend.capabilities().maxBufferLengthBytes;
-  // Every pool of several blocks holds the same share of their experts, but
-  // at least a block's (a prefill chunk may route them all) and at most all
-  // of them; a pool of one block all of its: the largest share the arenas
-  // hold.
-  const auto slotsAt = [&](const Impl::Pool &pool, double share) {
-    const uint64_t all = uint64_t{pool.blocks} * shape.experts;
-    if (!pool.streams) return all;
+  Impl::Size &size = impl.size;
+  size.blocks = blocks;
+  size.streams = blocks > 1;
+  // A streamed store holds a share of its blocks' experts, but at least a
+  // block's (a prefill chunk may route them all) and at most all of them; a
+  // store of one block all of its: the largest share its chunks hold at the
+  // cap, and as its floor the largest share the floor's bytes hold (or
+  // kExpertFloorShare of its slots). The minimum above holds a block's
+  // experts.
+  const auto slotsAt = [&](double share) {
+    const uint64_t all = uint64_t{blocks} * shape.experts;
+    if (!size.streams) return all;
     return std::clamp<uint64_t>(static_cast<uint64_t>(share * double(all)), shape.experts, all);
   };
-  const auto bytesAt = [&](double share) {
-    uint64_t bytes = 0;
-    for (const Impl::Pool &pool : impl.pools) bytes += slotsAt(pool, share) * pool.slotBytes;
-    return bytes;
-  };
-  // The blocks in `parts` pools of consecutive blocks: one, and one more
-  // while a pool's arena takes more than the largest buffer. A pool's slots
-  // are as wide as the widest of its blocks' experts.
-  uint32_t parts = 1;
-  double low = 0.0;
-  for (;;) {
-    impl.pools.assign(parts, {});
-    for (uint32_t part = 0; part < parts; ++part) {
-      Impl::Pool &pool = impl.pools[part];
-      const uint32_t from = static_cast<uint32_t>(uint64_t{blocks} * part / parts),
-                     to = static_cast<uint32_t>(uint64_t{blocks} * (part + 1) / parts);
-      for (uint32_t block = from; block < to; ++block) {
-        impl.blocks[block].pool = part;
-        pool.slotBytes = std::max(pool.slotBytes, slotLayout(impl.layoutOf(block)).bytes);
-      }
-      pool.blocks = to - from;
-      pool.streams = pool.blocks > 1;
-    }
-    // Arenas the blocks split into hold a block's experts each.
-    if (bytesAt(0.0) > arenaBudget)
-      throw std::invalid_argument("expert memory of " + std::to_string(options.memoryBytes >> 20) +
-                                  " MiB holds fewer slots (" + std::to_string(bytesAt(0.0) >> 20) +
-                                  " MiB) than a block's experts in each arena, beside the staging and tables (" +
-                                  std::to_string(fixed >> 20) + " MiB)");
-    double high = 1.0;
-    low = 0.0;
-    if (bytesAt(high) <= arenaBudget) low = high;
+  const auto bytesAt = [&](double share) { return chunkBytes(geometry.slotBytes, slotsAt(share)); };
+  // The largest share whose slots the memory beside the fixed bytes holds.
+  const auto shareOf = [&](uint64_t memoryBytes) {
+    const uint64_t budget = memoryBytes > fixed ? memoryBytes - fixed : 0;
+    double low = 0.0, high = 1.0;
+    if (bytesAt(high) <= budget) low = high;
     for (int step = 0; step < 64 && low < high; ++step) {
       const double middle = (low + high) / 2;
-      (bytesAt(middle) <= arenaBudget ? low : high) = middle;
+      (bytesAt(middle) <= budget ? low : high) = middle;
     }
-    const auto over = std::ranges::find_if(
-        impl.pools, [&](const Impl::Pool &pool) { return slotsAt(pool, low) * pool.slotBytes > largest; });
-    if (over == impl.pools.end()) break;
-    if (over->blocks == 1) throw std::invalid_argument("a block's experts take more than the device's largest buffer");
-    ++parts;
+    return low;
+  };
+  const double capShare = shareOf(options.memoryBytes);
+  const double floorShare = options.floorBytes ? shareOf(options.floorBytes) : 0.0;
+  size.slots = static_cast<uint32_t>(slotsAt(capShare));
+  const uint32_t floorSlots = static_cast<uint32_t>(options.floorBytes ? slotsAt(floorShare)
+                                                                       : kExpertFloorShare * double(size.slots));
+  // Each chunk holds its slots in turn, a slot every plane of an expert as
+  // its layout places them (slotLayout).
+  ExpertSlotPlanes slotPlanes{};
+  slotPlanes[0][0] = geometry.slotBytes;
+  size.chunkLayout = size.streams ? streamedExpertChunkLayout(slotPlanes, size.slots, floorSlots, shape.experts,
+                                                              largest, options.elasticChunkBytes)
+                                  : wholeExpertChunkLayout(slotPlanes, size.slots, largest);
+  const ExpertChunkLayout &chunks = size.chunkLayout;
+  for (uint32_t chunk = 0; chunk < chunks.chunks; ++chunk) {
+    const uint64_t bytes = chunkBytes(geometry.slotBytes, chunks.held(chunk));
+    size.buffers.push_back(
+        backend.allocateBuffer(bytes, metal::BufferStorage::Shared, "experts/arena-" + std::to_string(chunk)));
+    impl.counters.capBytes += bytes;
+    if (chunk < chunks.floorChunks) impl.counters.floorBytes += bytes;
   }
-  for (uint32_t index = 0; index < impl.pools.size(); ++index) {
-    Impl::Pool &pool = impl.pools[index];
-    pool.slots = static_cast<uint32_t>(slotsAt(pool, low));
-    const uint64_t bytes = uint64_t{pool.slots} * pool.slotBytes;
-    pool.arena = backend.allocateBuffer(bytes, metal::BufferStorage::Shared, "experts/arena-" + std::to_string(index));
-    impl.arenaTotal += bytes;
-    pool.recycling = SlotRecycler(pool.slots);
-    pool.ownerBlock.assign(pool.slots, kNoSlot);
-    pool.ownerExpert.assign(pool.slots, kNoSlot);
+  // Each layout's routed segments and its views of the chunks, in the expert
+  // kernels' order (ops::ExpertChunks), each from its plane's place in a slot
+  // to the chunk's end: plane1's is meta's for a format without one.
+  for (const ExpertLayout &layout : geometry.layouts) {
+    const SlotLayout slot = slotLayout(layout);
+    std::array<ops::QuantizedSegment, 3> &routed = size.routed.emplace_back();
+    std::vector<metal::MetalBuffer> planes;
+    for (size_t z = 0; z < 3; ++z)
+      routed[z] = ops::QuantizedSegment::planes(layout[z].format, static_cast<uint32_t>(size.slots * layout[z].rows),
+                                                static_cast<uint32_t>(layout[z].columns), {}, {}, {});
+    for (const metal::MetalBuffer &buffer : size.buffers)
+      for (size_t z = 0; z < 3; ++z) {
+        const auto view = [&](size_t plane) {
+          return backend.view(buffer, slot.offsets[z][plane], buffer.sizeBytes() - slot.offsets[z][plane]);
+        };
+        const metal::MetalBuffer meta = view(2);
+        planes.push_back(view(0));
+        planes.push_back(layout[z].planes[1] ? view(1) : meta);
+        planes.push_back(meta);
+      }
+    size.chunks.push_back(ops::ExpertChunks::of(std::move(planes), chunks.floorSlots, chunks.chunkSlots, size.slots,
+                                                routed[0], routed[1], routed[2],
+                                                static_cast<uint32_t>(geometry.slotBytes)));
   }
-  // Each block's repack into its pool's slots, its planes where its layout
-  // keeps them in a slot.
-  for (uint32_t index = 0; index < blocks; ++index) {
-    Impl::Block &block = impl.blocks[index];
-    const SlotLayout slot = slotLayout(impl.layoutOf(index));
-    const uint64_t stride = impl.pools[block.pool].slotBytes;
+  // Each block's repack of its staged rows into the slots, its planes where
+  // its layout keeps them in a slot, slots a slot's bytes apart.
+  for (Impl::Block &block : impl.blocks) {
     for (size_t z = 0; z < 3; ++z) {
-      const ProjectionLayout &projection = impl.layoutOf(index)[z];
+      const ProjectionLayout &projection = geometry.layouts[block.layout][z];
       block.load.projections[z] = {projection.format,
                                    static_cast<uint32_t>(projection.rows),
                                    static_cast<uint32_t>(projection.columns),
                                    static_cast<uint32_t>(projection.rowBytes),
-                                   {slot.offsets[z][0], slot.offsets[z][1], slot.offsets[z][2]},
-                                   {stride, stride, stride}};
+                                   {geometry.slotBytes, geometry.slotBytes, geometry.slotBytes}};
     }
     block.loadGroups = ops::MoE::expertLoadGroups(block.load);
   }
+  size.recycling = SlotRecycler(size.slots);
+  size.ownerBlock.assign(size.slots, kNoSlot);
+  size.ownerExpert.assign(size.slots, kNoSlot);
   impl.places = stagingOf(geometry, shape);
   impl.taken.assign(impl.places.count, 0);
   impl.staging = backend.allocateBuffer(impl.places.bytes(), metal::BufferStorage::Shared, "experts/staging");
@@ -1181,12 +1354,12 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
   std::memset(impl.grid.contents(), 0, 4 * sizeof(uint32_t));
   impl.routedIn.assign(shape.experts, 0);
   impl.waiting.assign(shape.experts, 0);
-  impl.counters.arenaBytes = impl.arenaTotal;
+  impl.counters.capBytes += fixed;
+  impl.counters.floorBytes += fixed;
   impl.counters.stagingBytes = impl.staging.sizeBytes();
-  for (const Impl::Pool &pool : impl.pools) {
-    impl.counters.slots += pool.slots;
-    impl.counters.experts += uint64_t{pool.blocks} * shape.experts;
-  }
+  impl.counters.capChunks = size.chunkLayout.chunks;
+  impl.counters.experts = uint64_t{blocks} * shape.experts;
+  impl.countLive();
   impl.fill();
   impl.publish();
 }
@@ -1199,28 +1372,20 @@ void ExpertStore::bind(uint32_t block, ops::BlockMoeWeights &weights) {
   streamed.router = weights.router;
   streamed.scalarGate = weights.sharedScalarGate;
   streamed.selectionBias = weights.selectionBias;
-  const Impl::Pool &pool = impl.pools[streamed.pool];
-  const uint64_t arenaBytes = uint64_t{pool.slots} * pool.slotBytes;
-  ops::BlockExpertProjection *const projections[] = {&weights.gate, &weights.up, &weights.down};
-  for (size_t z = 0; z < 3; ++z) {
-    const ProjectionLayout &projection = impl.layoutOf(block)[z];
-    // A plane from its place in the first slot to the arena's end, which the
-    // kernels read slot by slot.
-    const auto plane = [&](size_t index) {
-      const uint64_t at = streamed.load.projections[z].planes[index];
-      return projection.planes[index] ? impl.backend.view(pool.arena, at, arenaBytes - at) : metal::MetalBuffer{};
-    };
-    projections[z]->routed =
-        ops::QuantizedSegment::planes(projection.format, static_cast<uint32_t>(pool.slots * projection.rows),
-                                      static_cast<uint32_t>(projection.columns), plane(0), plane(1), plane(2));
-  }
+  const Impl::Size &size = impl.size;
+  // The routed segments give the slots' format and size in the block's
+  // layout; their planes are its layout's views of the chunks.
+  const std::array<ops::QuantizedSegment, 3> &routed = size.routed[streamed.layout];
+  weights.gate.routed = routed[0];
+  weights.up.routed = routed[1];
+  weights.down.routed = routed[2];
+  weights.chunks = size.chunks[streamed.layout];
   weights.slotTable = impl.backend.view(impl.tables, uint64_t{block} * impl.shape.experts * sizeof(uint32_t),
                                         uint64_t{impl.shape.experts} * sizeof(uint32_t));
-  weights.slots = pool.slots;
-  weights.routedSlotBytes = static_cast<uint32_t>(pool.slotBytes);
-  // The experts of a pool of one block stay in their slots: nothing loads
+  weights.slots = size.slots;
+  // The experts of a store of one block stay in their slots: nothing loads
   // them.
-  weights.stream = impl.streams(block) ? this : nullptr;
+  weights.stream = impl.streams() ? this : nullptr;
   weights.streamBlock = block;
 }
 
@@ -1228,10 +1393,9 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
                           uint32_t block) const {
   const Impl &impl = *impl_;
   const Impl::Block &loaded = impl.blocks.at(block);
-  const Impl::Pool &pool = impl.pools[loaded.pool];
   const ops::MoeShape shape = impl.shape;
   if (parts.empty()) throw std::invalid_argument("an expert load serves no step");
-  if (!impl.streams(block)) throw std::invalid_argument("a block of a pool of one block does not load");
+  if (!impl.streams()) throw std::invalid_argument("a block of a store of one block does not load");
   const ops::MoePhase phase = parts.front().plan->phase();
   uint32_t rows = 0;
   std::vector<Impl::PartTiles> tiles;
@@ -1247,7 +1411,7 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
   // A decode step's load predicts the next block's routes, when its experts
   // stream: that block's routing of this block's input.
   const bool predicted =
-      phase == ops::MoePhase::Decode && block + 1 < impl.blocks.size() && impl.streams(block + 1);
+      phase == ops::MoePhase::Decode && block + 1 < impl.blocks.size() && impl.streams();
   if (predicted) {
     if (parts.size() != 1) throw std::invalid_argument("a decode load serves one step");
     const Impl::Block &next = impl.blocks[block + 1];
@@ -1275,7 +1439,7 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
           impl->load(block, phase, rows, predicted, tiles, round, rounds, verifyRows);
         },
         timed, gpu, startAhead);
-    ops::MoE::addExpertLoad(graph, impl.staging, pool.arena, impl.jobs, impl.sources, loaded.load,
+    ops::MoE::addExpertLoad(graph, impl.staging, impl.size.chunks[loaded.layout], impl.jobs, impl.sources, loaded.load,
                             static_cast<uint32_t>(std::min<uint64_t>(routable, impl.places.count)),
                             metal::IndirectGrid{impl.grid, 0});
   }
@@ -1284,7 +1448,7 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
   // into the whole staging, while the GPU runs this block's experts and the
   // next block's mixing, as many as the next load would otherwise read
   // with the GPU waiting.
-  if (impl.longChunk(phase, rows) && block + 1 < impl.blocks.size() && impl.streams(block + 1))
+  if (impl.longChunk(phase, rows) && block + 1 < impl.blocks.size() && impl.streams())
     graph.host([impl = impl_, block, phase] { impl->readBlockAhead(block + 1, phase); }, timed,
                metal::HostStepGpu::Idle, startAhead);
 }
@@ -1292,13 +1456,13 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
 bool ExpertStore::addSplitLoadStart(metal::CommandGraph &graph, const ops::MoeLoadPart &part, uint32_t block,
                                     ops::MoeSplitTiles &tiles) const {
   const Impl &impl = *impl_;
-  if (part.plan->phase() != ops::MoePhase::Decode || !impl.streams(block) ||
+  if (part.plan->phase() != ops::MoePhase::Decode || !impl.streams() ||
       impl.routable(part.plan->rows()) > impl.places.count || part.plan->maximumTiles() > impl.splitCapacity)
     return false;
   const ops::MoeShape shape = impl.shape;
   const uint32_t rows = part.plan->rows();
   // The next block's routes of this block's input, as addLoad predicts them.
-  const bool predicted = block + 1 < impl.blocks.size() && impl.streams(block + 1);
+  const bool predicted = block + 1 < impl.blocks.size() && impl.streams();
   if (predicted) {
     const Impl::Block &next = impl.blocks[block + 1];
     ops::MoE::addRoutes(graph, part.buffers->input, next.router, next.scalarGate, impl.predictionScores,
@@ -1317,15 +1481,14 @@ void ExpertStore::addSplitLoadFinish(metal::CommandGraph &graph, const ops::MoeL
                                      uint32_t block) const {
   const Impl &impl = *impl_;
   const Impl::Block &loaded = impl.blocks.at(block);
-  const Impl::Pool &pool = impl.pools[loaded.pool];
   const uint32_t rows = part.plan->rows();
-  const bool predicted = block + 1 < impl.blocks.size() && impl.streams(block + 1);
+  const bool predicted = block + 1 < impl.blocks.size() && impl.streams();
   graph.host(
       [impl = impl_, block, rows, predicted, verifyRows = part.buffers->verifyRows] {
         impl->splitFinish(block, rows, predicted, verifyRows);
       },
       Impl::timedDecode(impl_), metal::HostStepGpu::Awake, [impl = impl_] { impl->startAhead(); });
-  ops::MoE::addExpertLoad(graph, impl.staging, pool.arena, impl.jobs, impl.sources, loaded.load,
+  ops::MoE::addExpertLoad(graph, impl.staging, impl.size.chunks[loaded.layout], impl.jobs, impl.sources, loaded.load,
                           static_cast<uint32_t>(std::min<uint64_t>(impl.routable(rows), impl.places.count)),
                           metal::IndirectGrid{impl.grid, 0});
 }
@@ -1352,37 +1515,44 @@ void ExpertStore::release() {
   Impl &impl = *impl_;
   if (impl.released) return;
   // A read-ahead in flight writes into the memory released below: its
-  // readers end the pieces they took, and it is forgotten.
+  // readers end the pieces they took, and it is forgotten; so do the reads of
+  // a split load whose finish did not run (its command failed).
   impl.retireAhead();
+  if (impl.demand) impl.readers->stop(*std::exchange(impl.demand, nullptr));
   impl.ahead.block = impl.plan.block = kNoSlot;
   for (Impl::Block &block : impl.blocks) std::ranges::fill(block.slot, kNoSlot);
   std::memset(impl.tables.contents(), 0, impl.tables.sizeBytes());
-  for (Impl::Pool &pool : impl.pools) {
-    impl.backend.releaseMemory(pool.arena);
-    std::ranges::fill(pool.ownerBlock, kNoSlot);
-    std::ranges::fill(pool.ownerExpert, kNoSlot);
-    pool.recycling.reset();
-  }
+  // The chunks past the live ones were given back already.
+  Impl::Size &size = impl.size;
+  for (uint32_t chunk = 0; chunk < size.liveChunks(); ++chunk) impl.backend.releaseMemory(size.buffers[chunk]);
+  std::ranges::fill(size.ownerBlock, kNoSlot);
+  std::ranges::fill(size.ownerExpert, kNoSlot);
+  size.recycling.reset();
   impl.backend.releaseMemory(impl.staging);
+  impl.forgetRepack();
   impl.counters.resident = 0;
   impl.released = true;
+  impl.countLive();
   impl.publish();
 }
 
-bool ExpertStore::restore(const metal::AllocationAdmission &admit) {
+bool ExpertStore::restore(const metal::AllocationAdmission &admit, const metal::AllocationAdmission &optional) {
   std::lock_guard lock(impl_->mutex);
   Impl &impl = *impl_;
   if (!impl.released) throw std::logic_error("expert memory is not released");
-  uint64_t bytes = impl.staging.sizeBytes();
-  for (const Impl::Pool &pool : impl.pools) bytes += pool.arena.sizeBytes();
+  // The floor chunks and the staging come back in one part, or none of them.
+  Impl::Size &size = impl.size;
+  std::vector<const metal::MetalBuffer *> floor{&impl.staging};
+  for (uint32_t chunk = 0; chunk < size.chunkLayout.floorChunks; ++chunk) floor.push_back(&size.buffers[chunk]);
+  uint64_t bytes = 0;
+  for (const metal::MetalBuffer *buffer : floor) bytes += buffer->sizeBytes();
   std::vector<const metal::MetalBuffer *> restored;
   const metal::AllocationResult admitted = admit(bytes, [&] {
     try {
-      for (const Impl::Pool &pool : impl.pools) {
-        impl.backend.restoreMemory(pool.arena);
-        restored.push_back(&pool.arena);
+      for (const metal::MetalBuffer *buffer : floor) {
+        impl.backend.restoreMemory(*buffer);
+        restored.push_back(buffer);
       }
-      impl.backend.restoreMemory(impl.staging);
     } catch (const metal::MetalAllocationError &) {
       // A buffer the driver refused leaves them all released.
       for (const metal::MetalBuffer *buffer : restored) impl.backend.releaseMemory(*buffer);
@@ -1390,13 +1560,67 @@ bool ExpertStore::restore(const metal::AllocationAdmission &admit) {
     }
   });
   if (!admitted)
-    throw metal::MetalAllocationError(std::string("unable to restore the expert arena: ") +
+    throw metal::MetalAllocationError(std::string("unable to restore the expert chunks: ") +
                                           metal::allocationFailureName(admitted.failure),
                                       admitted.failure);
+  size.keep(size.chunkLayout.floorChunks);
+  size.recycling.resize(size.chunkLayout.first(size.chunkLayout.floorChunks));
+  // Each elastic chunk comes back in a part of its own while `optional`
+  // admits it, as a regrow takes them; the first refused stays released with
+  // those after it, which a regrow takes later, so that neither the room the
+  // cache may have taken while the store was smaller nor a host too short to
+  // keep them holds the restore back.
+  while (size.liveChunks() < size.chunkLayout.chunks)
+    if (!impl.grow(optional)) break;
+  // Every slot free, the lowest claimed first.
+  size.recycling.reset();
   impl.released = false;
+  impl.countLive();
   impl.fill();
   impl.publish();
   return true;
+}
+
+uint64_t ExpertStore::releaseAboveFloor() {
+  std::lock_guard lock(impl_->mutex);
+  Impl &impl = *impl_;
+  if (!impl.mayShrink()) return 0;
+  const uint32_t live = impl.size.liveChunks();
+  return live > impl.size.chunkLayout.floorChunks ? impl.shrink(live - 1) : 0;
+}
+
+uint64_t ExpertStore::releaseToFloor() {
+  std::lock_guard lock(impl_->mutex);
+  Impl &impl = *impl_;
+  if (!impl.mayShrink()) return 0;
+  const uint32_t floor = impl.size.chunkLayout.floorChunks;
+  return impl.size.liveChunks() > floor ? impl.shrink(floor) : 0;
+}
+
+uint64_t ExpertStore::growthBytes() const {
+  std::lock_guard lock(impl_->mutex);
+  const Impl &impl = *impl_;
+  if (impl.released || !impl.failure.empty()) return 0;
+  const Impl::Size &size = impl.size;
+  const uint32_t live = size.liveChunks();
+  return live < size.chunkLayout.chunks ? size.buffers[live].sizeBytes() : 0;
+}
+
+metal::AllocationResult ExpertStore::growTowardCap(const metal::AllocationAdmission &admit) {
+  std::lock_guard lock(impl_->mutex);
+  Impl &impl = *impl_;
+  const Impl::Size &size = impl.size;
+  if (impl.released || !impl.failure.empty() || impl.backend.commandInFlight() ||
+      size.liveChunks() == size.chunkLayout.chunks)
+    return {};
+  if (const metal::AllocationResult admitted = impl.grow(admit); !admitted) return admitted;
+  ++impl.counters.regrows;
+  impl.countLive();
+  impl.publish();
+  logLine("Expert store took back a chunk of ", size.buffers[size.liveChunks() - 1].sizeBytes() >> 20,
+          " MiB, its slots empty; ", impl.counters.chunks, " of ", impl.counters.capChunks, " chunks hold ",
+          impl.counters.slots, " slots.");
+  return {};
 }
 
 uint64_t ExpertStore::fixedBytes(const StreamedBlocks &blocks, ops::MoeShape shape) {

@@ -27,10 +27,12 @@ namespace {
 using splash::test::require;
 
 // A state the tier takes whenever reclaim or persist writes it, as long as
-// `slots` leave room: the restore points requests resume from.
+// `slots` leave room and the file takes writes: the restore points requests
+// resume from.
 struct Shelf final {
   uint32_t used = 0;
   uint32_t slots = 64;
+  bool takesWrites = true;
 };
 
 class ShelvedState final : public CompositeState {
@@ -43,7 +45,7 @@ public:
   }
   uint64_t bytes() const noexcept override { return 100; }
   uint64_t residentBytes() const noexcept override { return disk_ ? 0 : bytes(); }
-  bool canOffload(bool) const noexcept override { return !disk_; }
+  bool canOffload(bool) const noexcept override { return !disk_ && shelf_->takesWrites; }
   std::unique_ptr<StateOffload> offload(std::function<void()>) const override { return shelve(); }
   std::unique_ptr<StateOffload> persist(std::function<void()>) const override { return shelve(); }
 
@@ -120,17 +122,66 @@ public:
   // Every request ends, every transfer lands, and nothing leaks: the pool's
   // pages and the tier's slots belong to the cache's blocks alone.
   void drain() {
-    while (!requests_.empty()) {
-      sources_.erase(requests_.begin()->first);
-      cache_.endRequest(requests_.begin()->first);
-      requests_.erase(requests_.begin());
-    }
+    endRequests();
     tier_.complete();
     static_cast<void>(cache_.pollTransfers());
     cache_.checkInvariants();
     const KvPoolSnapshot pool = pool_.snapshot();
     require(pool.pagesActive == 0 && budget_->committedBytes() == 0 && cache_.spillSnapshot().heldBytes == 0,
             "a finished run left pages held, quota committed or copies held");
+  }
+
+  // Every request ends; the transfers in flight stay so.
+  void endRequests() {
+    while (!requests_.empty()) {
+      sources_.erase(requests_.begin()->first);
+      cache_.endRequest(requests_.begin()->first);
+      requests_.erase(requests_.begin());
+    }
+  }
+
+  // The quota is whole again, and in half the runs each the KV tier and the
+  // state file take no more writes; what was in flight has landed.
+  void settle() {
+    budget_->setLimitBytes(kSlots * 100);
+    budget_->setActiveLimitBytes(kSlots * 100);
+    shelf_->slots = 64;
+    cache_.keepDiskLimit();
+    tier_.writableFile = chance(50);
+    shelf_->takesWrites = chance(50);
+    tier_.complete();
+    static_cast<void>(cache_.pollTransfers());
+    cache_.checkInvariants();
+  }
+
+  // What the exchange for the expert store counts on (Cache::exchangeable)
+  // reclaimForExchange releases at once, repeated until it makes no
+  // progress, with no copy to the SSD cache started: no fewer extents and
+  // RAM copies of states. With `exact`, once nothing is in flight, exactly
+  // those, unless the KV tier takes writes and the state file none.
+  void checkExchange(bool exact) {
+    const CacheExchange predicted = cache_.exchangeable();
+    const uint64_t allocated = pool_.allocatedBytes();
+    const uint64_t resident = cache_.snapshot().stateCache.bytes;
+    const size_t writes = tier_.writes.size();
+    const uint64_t offloads = cache_.snapshot().stateCache.offloads;
+    for (uint32_t steps = 0; cache_.reclaimForExchange().madeProgress; ++steps)
+      require(steps < 100'000, "the exchange's reclaim did not end");
+    cache_.checkInvariants();
+    require(tier_.writes.size() == writes && cache_.snapshot().stateCache.offloads == offloads,
+            "the exchange's reclaim started a copy to the SSD cache");
+    const CacheExchange left = cache_.exchangeable();
+    require(!left.extentBytes && !left.states, "the exchange's reclaim left cache it counts on");
+    const uint64_t released = allocated - pool_.allocatedBytes();
+    const uint64_t freed = (resident - cache_.snapshot().stateCache.bytes) / 100;
+    const std::string counts = "counted " + std::to_string(predicted.extentBytes) + " bytes and " +
+                               std::to_string(predicted.states) + " states, released " +
+                               std::to_string(released) + " bytes and " + std::to_string(freed) + " states";
+    require(released >= predicted.extentBytes && freed >= predicted.states,
+            "the exchange counted more than its reclaim releases: " + counts);
+    if (exact && (!tier_.writableFile || shelf_->takesWrites))
+      require(released == predicted.extentBytes && freed == predicted.states,
+              "the exchange did not count what its reclaim releases: " + counts);
   }
 
 private:
@@ -343,7 +394,11 @@ void testRandomRuns() {
       try {
         for (int step = 0; step < 600; ++step)
           run.step();
+        run.endRequests();
+        run.checkExchange(false);
         run.drain();
+        run.settle();
+        run.checkExchange(true);
       } catch (const std::exception &error) {
         throw std::runtime_error(std::string(windowed ? "windowed " : "") + "seed " + std::to_string(seed) + ": " +
                                  error.what());

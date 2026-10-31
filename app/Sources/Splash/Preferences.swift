@@ -228,7 +228,7 @@ extension LaunchOption {
             section: .memory, kind: .choice(standard: "32-bit", choices: [("bf16", "16-bit")], custom: nil)),
         LaunchOption(
             flag: "--expert-memory", title: "Expert memory",
-            help: "Memory for a MoE model’s experts; the rest are read from the SSD as tokens need them. Off keeps every expert in memory.",
+            help: "The least memory a MoE model’s experts keep; they take all the memory the plan leaves them and give it back while requests need it, taking it again once memory is free, and the rest are read from the SSD as tokens need them. Off keeps every expert in memory.",
             section: .memory, kind: .choice(standard: "Auto", choices: [("off", "Off")], custom: size(example: "16G"))),
         LaunchOption(
             flag: "--ple-memory", title: "PLE table memory",

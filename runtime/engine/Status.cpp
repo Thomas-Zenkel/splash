@@ -144,11 +144,13 @@ void appendStreamedTable(std::ostringstream &out, const std::optional<model::Spa
       << ",\"poisoned\":" << boolean(table->poisoned) << ",\"failure\":" << json::quote(table->failure) << '}';
 }
 
-// Streamed routed experts' store (--expert-memory), or null: its arena,
-// staging and slots, the experts resident in them, per use (prefill,
-// decode) its loads: the distinct
-// experts they routed, those not resident (read) and of them those read
-// ahead (prefetched), the experts read ahead whole, the bytes read from the
+// Streamed routed experts' store (--expert-memory), or null: its bytes at
+// its cap and at its floor, its live chunks and those at the cap, the
+// chunks it gave back while memory was short and took back after, its live
+// chunks' bytes, its staging, its live slots and the experts resident in
+// them, per use (prefill, decode) its loads: the distinct experts they
+// routed, those not resident (read) and of them those read ahead
+// (prefetched), the experts read ahead whole, the bytes read from the
 // sources and their host steps' round trips, one per round (pickup, work,
 // resume); and why a load failed, which fails every later load.
 void appendStreamedExperts(std::ostringstream &out, const std::optional<model::ExpertStoreStats> &experts) {
@@ -156,7 +158,10 @@ void appendStreamedExperts(std::ostringstream &out, const std::optional<model::E
     out << "null";
     return;
   }
-  out << "{\"arena_bytes\":" << experts->arenaBytes << ",\"staging_bytes\":" << experts->stagingBytes
+  out << "{\"cap_bytes\":" << experts->capBytes << ",\"floor_bytes\":" << experts->floorBytes
+      << ",\"chunks\":" << experts->chunks << ",\"cap_chunks\":" << experts->capChunks
+      << ",\"shrinks\":" << experts->shrinks << ",\"regrows\":" << experts->regrows
+      << ",\"arena_bytes\":" << experts->arenaBytes << ",\"staging_bytes\":" << experts->stagingBytes
       << ",\"slots\":" << experts->slots << ",\"experts\":" << experts->experts
       << ",\"resident\":" << experts->resident;
   for (size_t use = 0; use < std::size(kStreamedUses); ++use) {

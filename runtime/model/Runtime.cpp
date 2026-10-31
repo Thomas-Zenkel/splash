@@ -5,6 +5,7 @@
 #endif
 #include "AwakeClock.hpp"
 #include "model/DSparkDraft.hpp"
+#include "model/ExpertStore.hpp"
 #include "model/KvBlockCache.hpp"
 #include "model/KvHistoryStream.hpp"
 #include "model/QwenState.hpp"
@@ -450,6 +451,8 @@ struct Runtime::Impl {
   // The readers of spilled K/V, when the target's K/V spills.
   KvBlockCache *blockCache;
   KvHistoryStream *historyStream;
+  // Admits the expert store's growth toward its cap (RuntimeContext).
+  metal::AllocationAdmission expertAdmission;
   // The request the history's staging was last reserved for
   // (reserveHistoryStaging), whose next prefill command streams into it.
   uint64_t stagingRequest = 0;
@@ -476,7 +479,8 @@ struct Runtime::Impl {
                                                 geometry.prefillChunks);
                         },
                         value.model.target)),
-        aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream) {
+        aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream),
+        expertAdmission(std::move(value.expertAdmission)) {
     if (states.layout() != model.stateLayout(states.layout().target.format) ||
         kvPages.layout() != model.targetKvLayout(kvPages.layout().format) || !blockCache != !historyStream) {
       throw std::invalid_argument(
@@ -3265,6 +3269,10 @@ uint32_t Runtime::statesToActivate() const noexcept {
   return impl_->states.statesToActivate();
 }
 
+uint64_t Runtime::idleBufferBytes(uint32_t evictedStates) const noexcept {
+  return impl_->states.idleBytes(evictedStates);
+}
+
 // A prompt reads its spilled history through the staging, a decode through
 // the hot block cache: the floor a decoding lane takes replaces the staging
 // once no prompt holds it, so a lane never holds both (the memory plan
@@ -3289,6 +3297,31 @@ ModelMemoryAdmission Runtime::reserveHistoryStaging(uint64_t requestId, uint32_t
 
 ModelMemoryAdmission Runtime::growSpilledReads() {
   return impl_->blockCache ? impl_->blockCache->growTowardTarget() : ModelMemoryAdmission{.ok = true};
+}
+
+// The store above its floor follows memory between commands (ExpertStore::
+// releaseAboveFloor, growTowardCap); a store without the admission stays as
+// it is.
+uint64_t Runtime::releaseExpertChunk() {
+  ExpertStore *store = impl_->model.expertStore();
+  return store ? store->releaseAboveFloor() : 0;
+}
+
+uint64_t Runtime::releaseExpertsToFloor() {
+  ExpertStore *store = impl_->model.expertStore();
+  return store ? store->releaseToFloor() : 0;
+}
+
+uint64_t Runtime::expertGrowthBytes() const {
+  const ExpertStore *store = impl_->model.expertStore();
+  return store && impl_->expertAdmission ? store->growthBytes() : 0;
+}
+
+ModelMemoryAdmission Runtime::growExperts() {
+  ExpertStore *store = impl_->model.expertStore();
+  if (!store || !impl_->expertAdmission) return {.ok = true};
+  const metal::AllocationResult grown = store->growTowardCap(impl_->expertAdmission);
+  return {.ok = static_cast<bool>(grown), .allocationFailure = grown.failure};
 }
 
 uint64_t Runtime::reclaimIdleState(bool keepLane, IdleMemory scope) noexcept {

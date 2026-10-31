@@ -258,6 +258,27 @@ bool StateCache::contains(uint64_t kvBlock) const noexcept {
   return found != entries_.end() && !found->second.invalid;
 }
 
+uint32_t StateCache::freedWithoutWrites(std::vector<uint64_t> &staying) const {
+  const uint64_t resume = resumePoint();
+  uint32_t freed = 0;
+  for (const RecencyOrder *order : {&checkpoints_, &ordinary_}) {
+    bool stays = false;
+    for (auto state = order->oldest(); state; state = order->next(*state)) {
+      const Entry &entry = entries_.at(state->id);
+      stays = stays || state->id == resume ||
+              (!entry.disk && entry.ram->canOffload(inUse(state->id)));
+      if (stays)
+        staying.push_back(state->id);
+      else
+        ++freed;
+    }
+  }
+  for (const auto &[kvBlock, entry] : entries_)
+    if (entry.ram && (entry.pins || entry.invalid || persisting(kvBlock)))
+      staying.push_back(kvBlock);
+  return freed;
+}
+
 uint64_t StateCache::resumePoint() const noexcept {
   // Speculative protection keeps the newest ordinary publication, such as
   // the point of a request that just finished, and a checkpoint only without
@@ -367,6 +388,8 @@ StateEviction StateCache::reclaim(uint64_t kvBlock, Unwritten unwritten) {
     return {false, true};
   // One write at a time, of a class the tier takes now.
   const bool writable = !entry.disk && entry.ram->canOffload(inUse(kvBlock));
+  if (writable && unwritten == Unwritten::Stay)
+    return {};
   if (writable && pending_ && unwritten != Unwritten::Drop)
     return {false, true};
   if (writable) {

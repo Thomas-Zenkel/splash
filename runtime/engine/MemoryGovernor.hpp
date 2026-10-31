@@ -125,12 +125,18 @@ struct MemoryGovernorSnapshot {
 // service restore from and publish for their follow-ups, and the KV they
 // restore through. What it would free there goes back to those requests'
 // growth, which neither the host's margin nor the warning holds back, and
-// the replay point it would take is the next resume point.
+// the replay point it would take is the next resume point. hostShort says
+// the host really lacks memory: a valid measurement short of the pass's
+// margin, or critical pressure, never macOS's warning alone. Only then does
+// a pass take the expert store's chunks above its floor
+// (Model::releaseExpertChunk), whose experts the next steps would read from
+// the SSD again.
 struct MemoryReclaimDirective {
   bool critical = false;
   uint64_t targetBytes = 0;
   bool keepResumePoint = false;
   ReclaimClass upTo = ReclaimClass::InUse;
+  bool hostShort = false;
 };
 
 // What a reclaim pass made of its directive's target.
@@ -213,6 +219,19 @@ public:
   // warning margin or while it holds for the recovery margin for a waiting
   // request (setRequestWaiting).
   [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
+  // The admission of growth the engine can do without, an expert store's
+  // chunks above its floor (model::ExpertStore::growTowardCap, restore),
+  // which a request in service never needs: the serving mark does not lift
+  // its host checks. Beside the limit and critical pressure, the host
+  // refuses it while macOS reports any pressure, while growth holds for a
+  // waiting request, and unless its headroom keeps the recovery margin
+  // (kHostRecoveryMarginBytes) beyond the bytes, so that what comes back
+  // never brings the host near the warning margin. Only the bytes beyond
+  // the growth credit (setGrowthCredit) count against the host's headroom,
+  // and with none beyond it no margin holds the growth back; the limit
+  // counts them all. Its refusal does not mark the host constrained: it
+  // asks no reclaim.
+  [[nodiscard]] metal::AllocationAdmission growthAdmission() noexcept;
   // Marks the reservations that follow as memory a request in service needs,
   // until it is cleared, and returns the mark it replaced, which a scope
   // that sets it restores (Serving). Neither the host's margins nor macOS's
@@ -222,6 +241,15 @@ public:
   // them like any other. A start marks what it allocates so until serving
   // begins (RuntimeResources::beginServing).
   bool setServing(bool serving) noexcept;
+  // Sets the bytes the engine has just returned to the system for the growth
+  // that follows, until it is set again, and returns the credit it replaced,
+  // which a scope that sets it restores. The control pass sets it while an
+  // engine without requests exchanges its cache for a chunk of the expert
+  // store (MemoryControl): those bytes are the host's already, so
+  // growthAdmission counts only the chunk's bytes beyond them against the
+  // host's headroom, whose sample may not show them yet. The control pass
+  // checks the rest against the sample it took before the exchange.
+  uint64_t setGrowthCredit(uint64_t bytes) noexcept;
   // Whether a request cannot proceed for want of memory, as each control pass
   // finds: only then does growth wait for the recovery margin once the host
   // has run short.
@@ -282,10 +310,13 @@ private:
   [[nodiscard]] bool growthHeld(const HostState &host) const noexcept {
     return requestWaiting_ && host.held();
   }
-  // allocationAdmission's reservation, or nothing with the cause of the
-  // refusal in failure.
+  // allocationAdmission's reservation, or growthAdmission's where
+  // `optional`.
+  [[nodiscard]] metal::AllocationAdmission admission(bool optional) noexcept;
+  // The admission's reservation, or nothing with the cause of the refusal in
+  // failure.
   [[nodiscard]] std::optional<Reservation>
-  tryReserve(uint64_t bytes, metal::AllocationFailure &failure);
+  tryReserve(uint64_t bytes, bool optional, metal::AllocationFailure &failure);
   [[nodiscard]] uint64_t
   chargedBytes(bool refreshDevice = false) const noexcept;
   [[nodiscard]] std::optional<HostMemory> sampleHost() const noexcept;
@@ -308,6 +339,7 @@ private:
   uint64_t hostHeldBytes_ = 0;
   uint64_t reservedBytes_ = 0;
   bool serving_ = false;
+  uint64_t growthCreditBytes_ = 0;
   bool requestWaiting_ = false;
   uint64_t deniedReservations_ = 0;
   MemoryPressure systemPressure_ = MemoryPressure::Normal;

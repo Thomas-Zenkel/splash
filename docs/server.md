@@ -90,7 +90,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
 | `--ple-memory` | Auto | Qwen3.8-Flash-Next: read the PLE n-gram table from the SSD through a host row cache of this size, e.g. `2G`; `off` loads the whole table. Auto loads it where memory holds it, else streams it through its share of the budget. DeepSeek-V4.1-Flash's Engram tables always stream this way, and `off` is refused. See [PLE table streaming](#ple-table-streaming). |
-| `--expert-memory` | Auto | MoE targets: hold routed experts in this much memory, e.g. `16G`, and read the others from the SSD when a step routes them; `off` loads every expert. Auto loads them all where memory holds them, else gives them what the context leaves. See [streamed experts](#streamed-experts). |
+| `--expert-memory` | Auto | MoE targets: the least memory routed experts keep, e.g. `16G`; they load whole where memory holds them all, as auto does, and otherwise take all the memory the plan leaves them, at least this, give memory back down to it while requests need it, and read the other experts from the SSD when a step routes them; `off` loads every expert. Auto loads them all where memory holds them, else gives them what the context leaves, given back down to 85% of their slots. See [streamed experts](#streamed-experts). |
 | `--sparse-kv-memory` | Auto | Qwen3.8-Flash-Next: memory for the KV blocks read back from the SSD for requests whose KV is there, e.g. `1200M`; never below its floor, which auto keeps. See [KV on the SSD](#kv-on-the-ssd). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both, though `POST /v1/memory/release` still frees the weights. See [weight loading](internals.md#weight-loading). |
 | `--max-cache-disk` | `auto` | SSD quota for cached KV pages and states: `auto` follows the volume, a quarter of its free space beyond a floor of 10 GiB (5% of a volume under 200 GiB), at most 32 GiB; a size such as `16G` is held as given while the volume keeps that floor; `0` turns the cache off. Kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
@@ -183,8 +183,8 @@ Splash sizes memory and context when it starts. Its Metal budget is the GPU's
 recommended working set less a small margin; `--max-memory` can only lower it,
 such as `--max-memory 28G`. The automatic plan takes the whole budget, so on a
 Mac that also runs other applications, `--max-memory` leaves them room: the
-automatic expert store and PLE row cache shrink with it. The budget caps Metal
-allocations, not combined process RSS. The context limit is the
+automatic expert store and PLE row cache are planned smaller with it. The budget
+caps Metal allocations, not combined process RSS. The context limit is the
 model's native window, 256K tokens for every supported family, when the budget
 holds it beside the weights and, unless `--disable-ane`, the
 [Neural Engine split](internals.md#neural-engine-prefill) this Mac's calibration of a dense
@@ -199,7 +199,8 @@ memory allow.
 One plan sizes everything within the budget (`engine::planStreamedMemory`).
 Its floors come first: the weights that load, the arenas, the runtime
 reserves, the SSD cache's state staging, one lane's state and the KV runway,
-the stores of the parts that stream at their smallest, and for a block-sparse
+the stores of the parts that stream at their smallest (the expert store at
+its floor where `--expert-memory` sets one), and for a block-sparse
 target the floors of a request whose KV is on the SSD
 ([KV on the SSD](#kv-on-the-ssd)). The rest goes by priority. A MoE target's
 routed experts load with their layers where that leaves KV its allowance, and
@@ -215,9 +216,15 @@ its experts load whole wherever that context fits beside them and stream to
 hold it where it does not, or else none, so its experts load wherever they
 fit; only once they stream does it keep the first 64K tokens too. The
 automatic SSD cache gives its state staging up where that alone would stream
-a part, unless the target's KV spills to it. `--expert-memory`, `--ple-memory`
-and `--sparse-kv-memory` set their own part instead; a size below the part's
-smallest store, a `--sparse-kv-memory` beyond what the floors leave and a
+a part, unless the target's KV spills to it. `--ple-memory` and
+`--sparse-kv-memory` set their own part instead. `--expert-memory` sets the
+expert store's floor, which the floors charge: the experts then load whole
+where memory holds every one, as automatic ones do, and otherwise stream
+through a store of all that the rest leaves them, so at least that floor;
+the plan holds the context and KV beside the store at that cap, and what
+the store gives back while memory is short only adds room
+([streamed experts](#streamed-experts)). A size below the part's smallest
+store, a `--sparse-kv-memory` beyond what the floors leave and a
 `--ple-memory` size for a table that cannot stream are refused, and startup
 logs how each part was sized. Only a loaded model sizes
 the arenas, which rest on its weights' formats and grow where a part
@@ -226,8 +233,8 @@ streamed table. One load gives them for whatever streams, so a start loads
 its weights once where the plan without the arenas already loads each part
 as the plan with them does, as for a model with no part to stream, and
 otherwise loads them again with the stores that plan gives (`Weights loaded
-again`): routed experts the first plan streams load at their smallest store
-until then.
+again`): routed experts the first plan streams load at their smallest store,
+or at the floor `--expert-memory` sets, until then.
 
 A block-sparse target serves the window where its floors hold a request of
 that length and the SSD cache has room for its KV, and otherwise the longest
@@ -331,6 +338,14 @@ size with a warning.
   it toward the hard budget beside Metal's footprint since the weights that
   serve began to load, not a first load that held the table whole before the
   plan with the arenas streamed it. It is not released while idle.
+- Once the weights that serve loaded, before the engine is ready, the engine
+  writes every page of the cache's rows, ids, recency links and index
+  (`SparseRowStore::commit`), so that the cache holds all of its host memory
+  from the start: the host memory the engine measures from then on, which
+  the start's checks and the expert store's growth go by, counts the whole
+  cache rather than the rows read so far. Auto's cache takes 512 MiB at most;
+  a `--ple-memory` size takes all of it. Stages and prefetches allocate their
+  working memory as they run.
 - `/status` reports it under `streamed_table`: the table and its bytes, the
   cache's size, capacity, rows and evictions; per use (`prefill`, `decode`)
   its stages, requested and distinct rows, hits, reads, hit rate and stage
@@ -345,13 +360,23 @@ Where memory cannot hold every routed expert of a MoE target beside the
 context (`--expert-memory auto`, the default,
 [memory and context](#memory-and-context)), or with `--expert-memory SIZE`,
 such as `--expert-memory 16G`, its routed experts stay in their files on the
-SSD, and a store holds as many of them as fit in all that the plan leaves
-them, or in SIZE bytes (`ExpertStore`, `runtime/model/ExpertStore.hpp`): the
-weights shrink by the routed experts' bytes, and the store counts in their
-place (`target_weights_bytes`). A store holds at least a layer's experts, in
-slots of the widest expert's size, which every layer's experts share whatever
-formats a layer mixes; the engine refuses a SIZE below that, and
-`--expert-memory off` loads every expert, as a SIZE that holds them all does.
+SSD, and a store holds as many of them as fit (`ExpertStore`,
+`runtime/model/ExpertStore.hpp`): the weights shrink by the routed experts'
+bytes, and the store counts in their place (`target_weights_bytes`). The store
+starts at its cap, all that the plan leaves the experts, and gives memory back
+down to its floor while requests or the Mac need it. Under auto the floor is 85%
+of its slots. With `--expert-memory SIZE` it is SIZE bytes, counted as the whole
+store's, its slots, staging and tables, which the plan's floors charge, rounded
+to whole slots and chunks, which startup logs beside SIZE where they differ; the
+cap is then all that the rest leaves the store, as under auto, so at least SIZE,
+and a SIZE the plan leaves nothing more than itself has nothing to give back,
+which startup says. Where memory holds every expert beside the KV kept resident,
+a SIZE loads them whole as auto does, and startup says it is ignored; forcing
+them to stream there takes a smaller `--max-memory`. A store holds at least a
+layer's experts, in slots of the widest expert's size, which every layer's
+experts share whatever formats a layer mixes; the engine refuses a SIZE below
+that, and `--expert-memory off` loads every expert, as a SIZE that holds them
+all does.
 
 - Each MoE layer of a command loads the experts its rows route that are not
   resident: after the layer's routing, a host step of the command claims
@@ -366,7 +391,8 @@ formats a layer mixes; the engine refuses a SIZE below that, and
   experts on a 48 GB M4 Pro: 15 instead of 19.5 ms). A decode step's load is one such round; a prefill command's
   loads take as many rounds as its rows may route experts, each staging half
   of the staging while the other half is read ahead. The kernels read every
-  routed expert through the layer's slot table, so resident and streamed
+  routed expert through the layer's slot table and the chunks that hold its
+  slots, so resident experts, one chunk of every expert, and streamed
   experts run the same kernels.
 - A decode step's load on staged tiles splits around its expert passes
   (`ExpertStore::addSplitLoadStart`, `ops::MoeSplitTiles`): its first host
@@ -394,12 +420,26 @@ formats a layer mixes; the engine refuses a SIZE below that, and
   expert no load routes may fail without failing anything. A decode step
   loads and predicts only the experts its lanes' verify rows route
   ([Drafts](models.md#drafts)); the selector writes those rows before the step's load.
-- Every layer's experts share one arena of slots of one size, the widest
-  expert's: a slot keeps all of an expert's planes together, so experts of
-  any formats take any slot, and the kernels read a slot's expert at its slot
-  times that size (`BlockMoeWeights::routedSlotBytes`). When the arena would
-  take more than the device's largest buffer (`maxBufferLength`), consecutive
-  layers share arenas that each fit, each recycling its own slots.
+- Every layer's experts share the slots of one size, the widest expert's: a
+  slot keeps all of an expert's planes together, so experts of any formats
+  take any slot, and the kernels read a slot's expert at its place in its
+  chunk times that size (`ops::ExpertChunks::slotBytes`). The slots lie in
+  chunks, each a buffer of its own of at most the device's largest buffer
+  (`maxBufferLength`). One chunk holds the floor, 0.85 of the slots by default
+  or the share of them `--expert-memory SIZE` holds; the rest lie in chunks of
+  about 1 GiB (more where they would take more than 47, since the expert
+  kernels' address table holds at most 48 chunks), the last of fewer slots; a
+  floor larger than the device's largest buffer takes the elastic chunks it
+  needs too. The kernels reach the chunks through their GPU addresses, which
+  the backend writes for each expert dispatch as it encodes the command, and
+  makes them resident for that dispatch's encoder rather than for every
+  command on the queue ([Residency](internals.md#residency-and-kv-extents)).
+  Chunks are few because each one a decode encoder makes resident costs GPU
+  time: 36 chunks of about 512 MiB cost a streamed decode cycle 2.3% of its
+  GPU time on the M5 Max, about 0.065% a chunk. A store has about one elastic
+  chunk per 6.7 GiB of its slots (0.15 of them, in chunks of about 1 GiB), so
+  the Studio's 17.2 GiB Flash-Next store, a floor and 3 elastic chunks, costs
+  about 0.25%. A store of one MoE layer is one chunk of every expert.
 - A decode step's loads keep the GPU awake through their host steps
   ([Host steps](internals.md#host-steps)), so the work after a load starts at once and at
   full clocks rather than after the GPU's wake-up.
@@ -414,14 +454,55 @@ formats a layer mixes; the engine refuses a SIZE below that, and
 - A load checks its files unchanged after it read them. A read is tried once
   more when it fails. A load that fails (a routed expert cannot be read, or
   a file was written) fails its command, and every later load fails too.
-- The store's memory is released while idle with the weights and restored
-  with them ([Weight loading](internals.md#weight-loading)).
-- `/status` reports the store under `streamed_experts`: its arena and
-  staging bytes, slots, its experts and those resident; per use (`prefill`,
-  `decode`) its loads, the distinct experts they routed, those read and of
-  them those read ahead, the experts read ahead whole, the hit rate, the bytes
-  read and the host steps' round trips, one per round (`host_steps`:
-  `pickup_ms`, `work_ms`, `resume_ms`); and the `failure` that stopped it.
+- The chunks above the floor are elastic. Where requests need memory the
+  engine's limit refuses, or the host is really short (its headroom below
+  the margin a reclaim pass keeps, or macOS reporting critical pressure;
+  macOS's warning alone never), the engine first evicts the cached prefixes
+  nothing in use holds, waiting for those whose copy to the SSD cache is
+  being written, then gives back the store's last chunk, one at a time, and
+  only then anything in use
+  ([admission and eviction](internals.md#admission-and-eviction)). A chunk
+  given back keeps its experts that fit: they are copied to free slots below
+  it, the experts the slots' recycling would recycle first evicted to make
+  room, and later steps read the evicted ones from the SSD again. Critical
+  pressure takes the store down to its floor at once, in one copy per format
+  rather than one per chunk. Once memory allows again, between commands,
+  the store takes one chunk back per pass, its slots empty, as long as macOS
+  reports no memory pressure, no request waits for memory, 30 s have passed
+  since a chunk last went and the weights are not released. While the
+  engine holds a request, resident or queued, the chunk takes only memory
+  `--max-memory` leaves free, and only while the host has the chunk and
+  2 GiB to spare. With none, the chunk is an exchange, the store ranking
+  above the prefix cache: the engine first evicts cached prefixes, but not
+  the one the newest conversation resumes from, and returns their memory to
+  macOS until it covers what the host lacks of the chunk and 2 GiB, or what
+  `--max-memory` lacks of the chunk. It evicts only prefixes that leave
+  memory at once, never one that would first need a copy on the SSD cache;
+  when those cannot cover the lack, every prefix stays cached and the chunk
+  waits. Each chunk given back or
+  taken back logs a line, and so does each format critical pressure takes to
+  its floor (`Expert store gave back`, `Expert store took back`).
+  Elasticity serves concurrency, the prefix cache and the rest of the Mac;
+  the advertised context is planned with the store at its cap and does not
+  change.
+- The store's live chunks and staging are released while idle with the
+  weights and restored with them: its floor and staging first, as the
+  request waiting needs them, then each elastic chunk only while macOS
+  reports no memory pressure and the host has the chunk and 2 GiB to spare,
+  the rest taken back later as above
+  ([Weight loading](internals.md#weight-loading)).
+- `/status` reports the store under `streamed_experts`: its bytes at its cap
+  and at its floor (`cap_bytes`, `floor_bytes`, counted as `--expert-memory`
+  counts them), its live chunks and those at the cap (`chunks`,
+  `cap_chunks`), the chunks it gave back and took back (`shrinks`,
+  `regrows`), its live chunks' bytes (`arena_bytes`) and staging bytes, its
+  live slots (the live chunks, bytes and slots are zero while the store is
+  released), its experts and those resident;
+  per use (`prefill`, `decode`) its loads, the distinct experts they routed,
+  those read and of them those read ahead, the experts read ahead whole, the
+  hit rate, the bytes read and the host steps' round trips, one per round
+  (`host_steps`: `pickup_ms`, `work_ms`, `resume_ms`); and the `failure` that
+  stopped it.
 
 ### KV cache precision
 

@@ -24,7 +24,7 @@ namespace splash::engine {
 [[nodiscard]] uint64_t systemUnixMicros() noexcept;
 
 // The loop's constructor refuses a config without its metrics, its weights,
-// their admission or its clocks.
+// their admissions or its clocks.
 struct NativeLoopConfig {
   engine::EngineConfig engine;
   RuntimeMetrics *metrics = nullptr;
@@ -34,8 +34,11 @@ struct NativeLoopConfig {
   model::WeightMemory *weights = nullptr;
   // Admits the memory the weights take back
   // (MemoryGovernor::allocationAdmission), as memory the requests waiting for
-  // them need (EngineConfig::serving).
+  // them need (EngineConfig::serving), and the memory they may take back but
+  // can do without, an expert store's chunks above its floor, as growth only
+  // a host with room to spare admits (MemoryGovernor::growthAdmission).
   metal::AllocationAdmission weightAdmission;
+  metal::AllocationAdmission growthAdmission;
   // Told true when the engine takes a request while it holds none, and false
   // when its last request ends; the process keeps the Mac from idle sleep in
   // between (main.mm). It must not throw. Empty where nothing needs to know.
@@ -135,6 +138,22 @@ public:
   reclaimMemory(const MemoryReclaimDirective &directive) {
     return core_.reclaimMemory(directive);
   }
+  // The expert store's growth toward its cap (Engine::growExperts,
+  // expertGrowthBytes, reclaimForExperts), which waits while the weights are
+  // released or being restored: none grows, and no cache goes for it,
+  // meanwhile. Between commands, in the control pass.
+  [[nodiscard]] uint64_t expertGrowthBytes() const {
+    return weightsHeld() ? core_.expertGrowthBytes() : 0;
+  }
+  [[nodiscard]] bool growExperts(uint64_t headroomBytes) {
+    return weightsHeld() && core_.growExperts(headroomBytes);
+  }
+  [[nodiscard]] uint64_t reclaimForExperts(uint64_t bytes) {
+    return weightsHeld() ? core_.reclaimForExperts(bytes) : 0;
+  }
+  [[nodiscard]] uint64_t expertReleases() const noexcept {
+    return core_.expertReleases();
+  }
 
 private:
   struct RequestTelemetry {
@@ -157,6 +176,10 @@ private:
   // under way; true when it did.
   bool releaseWeights();
   bool restoreWeights();
+  // The weights are neither released nor being restored.
+  [[nodiscard]] bool weightsHeld() const {
+    return !config_.weights->released() && !restoreStarted_;
+  }
   bool weightsRefused(metal::AllocationFailure failure);
   bool handleCancel(const protocol::CancelFrame &cancel);
   bool handleMask(const protocol::MaskResponseFrame &mask);

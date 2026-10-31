@@ -15,6 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include <unistd.h>
+
 namespace splash::model {
 
 void SparseRowTable::validate() const {
@@ -148,6 +150,9 @@ struct SparseRowStore::Impl {
   // The cache: slots of rows with their ids, a recency list (head most
   // recent) and an open-addressed index of slot + 1 (0 empty).
   mutable std::mutex cacheMutex;
+  // From commit() on, under cacheMutex: the cache's arrays hold all of their
+  // host memory.
+  bool committed = false;
   uint64_t capacity = 0;
   uint64_t used = 0;
   std::unique_ptr<uint8_t[]> rows;
@@ -357,6 +362,23 @@ uint64_t SparseRowStore::committedBytes() const noexcept {
          workingBytes(impl_->table.rowBytes, impl_->options.prefetchRows, impl_->options.stageRows);
 }
 
+void SparseRowStore::commit() {
+  Impl &s = *impl_;
+  const std::lock_guard lock(s.cacheMutex);
+  const uint64_t page = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+  // A byte of each page the array spans, read and written back: the write
+  // gives a page that only a read mapped memory of its own.
+  const auto touch = [page](void *array, uint64_t bytes) {
+    auto *const values = static_cast<volatile uint8_t *>(array);
+    for (uint64_t at = 0; at < bytes; at += page) values[at] = values[at];
+    if (bytes) values[bytes - 1] = values[bytes - 1];
+  };
+  touch(s.rows.get(), s.capacity * s.table.rowBytes);
+  for (uint32_t *array : {s.ids.get(), s.previous.get(), s.next.get()}) touch(array, s.capacity * sizeof(uint32_t));
+  touch(s.buckets.get(), (s.bucketMask + 1) * sizeof(uint32_t));
+  s.committed = true;
+}
+
 SparseRowStageResult SparseRowStore::stage(std::span<const uint32_t> ids, std::span<uint8_t> rows,
                                            std::span<uint32_t> slots, SparseRowUse use, bool adoptPrefetch) {
   Impl &s = *impl_;
@@ -491,6 +513,7 @@ SparseRowStats SparseRowStore::stats() const {
     const std::lock_guard lock(s.cacheMutex);
     result.cachedRows = s.used;
     result.evictions = s.evictions;
+    result.committed = s.committed;
   }
   for (uint32_t use = 0; use < kSparseRowUses; ++use) {
     const Impl::UseCounters &counters = s.uses[use];

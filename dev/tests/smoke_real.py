@@ -1775,8 +1775,10 @@ def add_server_arguments(parser):
     )
     parser.add_argument(
         "--expert-memory",
-        help="serve a MoE model's routed experts from RAM slots of this size in "
-        "all, reading the others from the SSD (splash serve --expert-memory)",
+        help="serve a MoE model's routed experts from RAM slots that keep at "
+        "least this size in all, reading the others from the SSD (splash serve "
+        "--expert-memory); where memory holds every expert they load whole, "
+        "and streaming them takes a smaller --max-memory too",
     )
     parser.add_argument(
         "--verify-rows",

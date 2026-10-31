@@ -257,8 +257,20 @@ The governor admits each image's memory (`MemoryGovernor::allocationAdmission`)
 as memory the waiting requests need: neither the host's margins nor macOS's
 warning refuse it, as for a request in service, and it fits the
 engine's limit, since the cache does not grow while the engine holds no
-request; critical pressure refuses it. A refused image, or one the driver or
-its writer cannot allocate, stays released, and the images before it stay. The
+request; critical pressure refuses it. The [expert
+store](server.md#streamed-experts) is the exception to that fit: a chunk it gave
+back while memory was short left room the cache may have taken since. So it
+comes back in parts: its floor chunks and staging in one, which fits as the
+images do, since they were live when it was released, then each elastic chunk in
+a part of its own, as growth the store can do without
+(`MemoryGovernor::growthAdmission`): the serving mark does not lift its host
+checks, and it comes back only while macOS reports no memory pressure and the
+host has the chunk and the 2 GiB recovery margin to spare. The first elastic
+chunk refused stays released with those after it, which the control pass takes
+back later as it does any chunk given back, and the restore goes on as if it had
+come back: only the floor holds the restore up. A refused image, or one the
+driver or its writer cannot allocate, stays released, and the images before it
+stay. The
 requests wait for memory, retrying every 0.1 s as a refused request does and
 counted in `admission.waiting_memory`, and the log says `Weights wait for
 memory to be restored`. Once the 30 s resource wait has passed since the first
@@ -529,7 +541,16 @@ windows (`gguf::TensorRows::windows`), so slice s's rows of each projection foll
 (`moe_group_routes_s2`, `moe_expert_gguf_m8_a_s2`); the softmax router's one gated slice is the
 unsuffixed instances. The expert passes launch the live tiles alone: the grouping kernel writes
 each pass's grid with the tile count, and the pass reads it as an indirect dispatch
-(`ComputeDispatch::indirectThreadgroups`). The staged tile runs gate and up in one pass, a gate
+(`ComputeDispatch::indirectThreadgroups`). They find a routed expert through the block's slot
+table and the chunks that hold its slots (`ops::ExpertChunks`): slot s below floor_slots is at
+place s of the floor chunk, chunk 0, and slot s from floor_slots on at place
+e - (c - 1) * chunk_slots of elastic chunk c = 1 + e / chunk_slots, where e = s - floor_slots (a
+branch uniform per threadgroup). The passes reach the chunks' regions through a table of
+`MOE_EXPERT_CHUNK_ADDRESSES` GPU addresses per chunk (`MoE.h`, `moe_expert_chunk`,
+[Residency](#residency-and-kv-extents)); a resident block's experts are one chunk of its routed
+planes, floor_slots = chunk_slots = its slots, a streamed block's the expert store's floor and
+elastic chunks of its size (`model/ExpertChunkLayout.hpp`,
+[Streamed experts](server.md#streamed-experts)). The staged tile runs gate and up in one pass, a gate
 and an up simdgroup on the same columns, bitwise the two passes' intermediate; the simdgroups
 share one pair table where gate and up share their routed and their shared formats.
 An expert's only tile of at most `MOE_GGUF_COLUMN_ROWS` live rows runs on the column tile
@@ -622,21 +643,31 @@ format's up and the prefill tiles, each output inside the fp64 bound of
 split, and one lane on the staged 16-row tile bitwise against the 8-row tile; and
 `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
 plan, the staged 8- and 32-row tiles and the Apple9 register tile whatever GPU runs it, each in
-every format it takes as each routed and shared expert tensor, against fp64, and bitwise against
-the full grids and two gate/up passes, and against its routed experts read through a permuted slot
-table and from an expert store's slots of one size; `gguf-moe-e512` runs it at Qwen3.8-Flash-Next's 512
-experts, `gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated
+every format it takes as each routed and shared expert tensor, against fp64, bitwise against
+the full grids and two gate/up passes, and with the experts in permuted slots across a floor
+chunk and elastic chunks of other, few slots, the last of fewer, bitwise as in one chunk, and
+in an expert store's slots of one size across such chunks, bitwise as in their own layout, and
+refuses floor and elastic chunks one unit short, slots narrower than a plane, a malformed chunk
+list or chunks made for another block; `gguf-moe-e512` runs all of it at Qwen3.8-Flash-Next's
+512 experts, `gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated
 shared slices, and `gguf-moe-deepseek` at DeepSeek-V4.1's: 384 experts, the top 6 by
 sqrt(softplus) plus a selection bias, weights times 1.5, one ungated shared slice and the
-experts' SwiGLU clamp. `deepseek41-kernels` checks DeepSeek-V4.1's own kernels (its
-manifold-constrained hyper-connections, latent attention, rotations and FP8/FP4 grids,
-compressor, indexer, top-k selection and candidate blocks, the Engram hash and gate) against CPU
-references of `dev/tools/deepseek41_reference.py`, the attention's matrix passes of a
-prefill's rows among them, and those of a sequence's pages and state
-([Latent attention](#latent-attention)): the groups a store writes to their places and nowhere
-else, the indexer and the attention through a page table bitwise against pools of the same keys,
-of a verify's rows and of a prefill's, a step's key lists, and the rings and open groups after a
-prefill's or a verify lane's retained rows; with `bench` it times them at the model's shapes. The goldens and how to regenerate them are
+experts' SwiGLU clamp; and `expert-store`, streamed experts at five shapes bitwise against the
+resident ones, in loads of every kind (a decode step's split around the experts that were
+resident), through a release and a restore, in a floor and three smaller elastic chunks, blocks
+of other formats in the slots of the widest expert's size, also as its chunks go and come back,
+a store of one block, which it reads whole into its floor chunk, and refuses slots its largest
+buffer holds in more than 48 chunks and a store of one block it does not hold;
+`expert-chunk-layout`, in `make test-engine-cpu`, checks the chunk layout rule itself.
+`deepseek41-kernels` checks DeepSeek-V4.1's own kernels (its manifold-constrained
+hyper-connections, latent attention, rotations and FP8/FP4 grids, compressor, indexer, top-k
+selection and candidate blocks, the Engram hash and gate) against CPU references of
+`dev/tools/deepseek41_reference.py`, the attention's matrix passes of a prefill's rows among
+them, and those of a sequence's pages and state ([Latent attention](#latent-attention)): the
+groups a store writes to their places and nowhere else, the indexer and the attention through a
+page table bitwise against pools of the same keys, of a verify's rows and of a prefill's, a
+step's key lists, and the rings and open groups after a prefill's or a verify lane's retained
+rows; with `bench` it times them at the model's shapes. The goldens and how to regenerate them are
 in `dev/tests/fixtures/weight-goldens/`; with `SPLASH_GGML_ORACLE=<libggml-base.dylib>`,
 `gguf-reference` also compares the reference with GGML directly and prints GGML's hashes.
 
@@ -1081,6 +1112,23 @@ engine releases it, never because macOS compressed or dropped an idle buffer.
 macOS page cache, driver allocations and other applications still affect memory
 pressure and swap.
 
+A buffer a dispatch binds is resident for it; one kernels reach by address is
+made resident in one of two ways. KV extents (`BufferReach::Addressed`) join
+the command queue's set, since nearly every command reads KV. A dispatch may
+instead list buffers in an address table (`metal::AddressTable`,
+`CommandGraph::addresses`): the backend writes their GPU addresses as it
+encodes the command, after the dispatch's parameters (`setBytes`, so at most
+512), and makes them resident from that dispatch to the end of its encoder
+(`useResources`, for reading, or reading and writing, declared once per table
+and usage in each encoder), never for the queue.
+The addresses are those of the buffers' memory when the command is encoded, so
+a buffer released and restored since (which comes back at another address) is
+reached where it is, and a table that reaches released memory is refused like
+a binding of it. The routed experts are reached this way, the expert store's
+chunks as a resident model's routed planes: a decode command reads few of
+them, and in the queue's set the 18 GiB of a streamed 35B's chunks made every
+command buffer wait for all of them, a decode cycle ten times longer.
+
 KV pages live in extents: ordinary shared Metal buffers of one size per pool,
 between half and one and a half times 128 MiB, in which every tensor region of
 each attention layer starts 64 KiB-aligned, sized to leave the fewest of the
@@ -1163,7 +1211,42 @@ in use unless a request waits, and keeps the state a follow-up resumes from,
 even while a request waits, whose growth the warning refuses as well (`/status`:
 `memory_governor.system_pressure`, and `growth_allowed` is false meanwhile). A
 pass counts only memory that leaves the engine; a cached state it evicts first
-refills the lane's state buffers it keeps. A start needs only what macOS can
+refills the lane's state buffers it keeps. Where routed experts stream, a pass
+the host is really short for, its headroom measured short of the pass's margin
+or macOS reporting critical pressure, also takes the [expert
+store](server.md#streamed-experts)'s chunks above its floor, a chunk at a time
+while its target is unmet, once nothing outside what is in use is left to free
+and before anything in use; the experts a chunk held move to the chunks below it
+or are evicted, and later steps read them from the SSD again. Memory on its way
+back holds the store back: while cache nothing in use holds waits for a
+transfer, a KV demotion or a state write, the pass ends pending, and the pass
+that continues it once the transfer landed takes that cache first. macOS's
+warning alone never takes the store. Once memory allows again the control
+pass takes one chunk back per pass, its slots empty: when macOS reports no
+memory pressure, no request waits for memory, the host lets growth go on, the
+weights are neither released nor being restored, and 30 s have passed since a
+chunk last went. The chunk takes from the host only its headroom beyond the
+2 GiB recovery margin, and from the engine only room `--max-memory` leaves
+free. While the engine holds any request, resident, queued or draining, it
+takes only that. With none the chunk is an exchange for cache nothing in use
+holds, which ranks below the store, for what the chunk lacks of either: the
+engine first returns that cache to the system, one reclaim step at a time,
+each releasing the extent it empties, until the bytes that left the engine
+cover what the chunk lacks, and keeps the resume point of the newest
+conversation. The governor's growth admission then counts those bytes as the
+host's already (`MemoryGovernor::setGrowthCredit`): its own sample of the host
+may not show them yet, and the pass checked the rest against the sample it
+took before the exchange. Cache that cannot pay for the chunk in that pass
+stays. The exchange starts no copy to the SSD cache, whose memory would come
+back only after the pass: a state or page that needs one stays, and so do the
+pages above that page and the newer states of that state's class (checkpoint
+or ordinary). Unless the idle state buffers beyond a lane's and the extents
+that what leaves at once would empty cover what the chunk lacks
+(`Engine::exchangeableBytes`, `Cache::exchangeable`), the exchange takes
+nothing and the chunk waits; it waits too while a transfer is in flight. With
+the SSD cache on, a cached conversation buys a chunk only once its state and
+pages have copies there, as `--persistent-cache` writes them. A start
+needs only what macOS can
 hand out at all beyond a reserve of a tenth of a small Mac's memory and 2 GiB of
 a larger one, counting what compressing the anonymous pages would free at the
 compressor's present ratio, at most half of them, short of critical pressure:
@@ -1209,9 +1292,19 @@ it (`cache.priority_suspensions` in `/status`) and resumes once a lane and its
 memory are free. A new request below the priority of a running lane neither
 starts nor takes a lane until no lane of that priority runs, since it could not
 run before. Critical pressure evicts every unpinned cache entry and stops all
-growth. Refused at `--max-memory`, a lane's state, or the model's memory for
-reading KV from the SSD cache, takes cached KV only while evicting it can empty
-an extent, and is tried again only once an extent or a state has gone.
+growth; it takes the expert store down to its floor after what nothing in use
+holds and before what is in use, in one compaction per format. Refused at
+`--max-memory`, a lane's state, or the model's memory for reading KV from the
+SSD cache, takes cached KV only while evicting it can empty an extent, and is
+tried again only once an extent or a state has gone. Any growth `--max-memory`
+refuses, a start's beside a resident request too, takes a chunk of the expert
+store above its floor once nothing outside what is in use is left and before
+anything in use, and is tried again; so does the prompt's replay point before
+it recycles another request's state in use. Growth that only shortens a command
+(the KV a prefill captures past its first state boundary) or leaves memory for
+later takes neither the store nor anything in use, a junction or checkpoint
+capture never takes the store, and neither does a refusal of the host, which
+the paced passes answer.
 
 A request keeps its reusable model state at the last whole 32-token page before
 its generation prompt, the text a chat template appends to open the reply: the
@@ -1222,7 +1315,14 @@ the KV it restores through. When the last request using it ends, the point
 becomes the newest ordinary state; the older points on its chain keep their age.
 Cache victims come in three classes: checkpoints, then ordinary states and KV
 (first the KV no state restores through, which saves no prefill), then what is
-in use. No work displaces anything of a class above its own. Memory for running
+in use. No work displaces anything of a class above its own. The expert store's
+chunks above its floor rank between the last two: they go once nothing ordinary
+is left, before anything in use, for work that may take what is in use and for
+needed growth whose class stops at ordinary, but never for growth that only
+shortens a command or leaves memory for later, which takes nothing in use
+either. One exception is kept: a paced pass a request waits for under macOS's
+warning alone, the host not short, takes what is in use while the store keeps
+its chunks, since the warning alone never shrinks the store. Memory for running
 requests takes what is in use after everything else, and so does a paced pass
 that a request waits for. Three kinds of work take nothing in use: a paced pass
 that nothing waits for, under macOS's warning too, and the two that follow. A
@@ -1341,7 +1441,8 @@ waiting request, or admitted before the request was first refused memory or
 suspended. Such a lane holds memory the request waits for until it finishes.
 Other lanes do not extend the wait. Readiness does not guarantee that a
 request-sized allocation fits. A request that cannot fit even alone, after every
-cached prefix was evicted, fails with 400 `capacity_exhausted`, naming
+cached prefix was evicted and the expert store shrank to its floor, fails with
+400 `capacity_exhausted`, naming
 `--max-memory` and `--max-context`; retrying it fails the same way.
 
 A cached state holds the target's GDN cell and the draft's context window, not

@@ -694,8 +694,9 @@ void testAttentionOnlyTarget(metal::MetalBackend &backend) {
     storage.releaseLane(0, 1);
     storage.releaseLane(1, 2);
     require(storage.idleCells() == 0 && storage.idleRings() == 2 && storage.idleWindows() == 3 &&
-                storage.statesToActivate() == 0,
-            "released attention-only lanes pooled a cell or lost a buffer");
+                storage.statesToActivate() == 0 &&
+                storage.idleBytes(1) == kDraftState.ringBytes() + 3 * kDraftState.windowBytes(),
+            "released attention-only lanes pooled a cell, lost a buffer or counted a cell's bytes");
     require(releaseAllIdle(storage, false) > 0 && storage.actualAllocatedBytes() == 0 &&
                 storage.idleRings() == 0 && storage.idleWindows() == 0,
             "an attention-only pool kept buffers past reclaim");
@@ -1065,16 +1066,22 @@ void run(const std::string &metallib) {
     require(storage.idleCells() == 4 && storage.idleRings() == 2 &&
                 storage.idleWindows() == 2,
             "released lane buffers are missing from the pool");
+    // What releasing down to one lane's worth frees once the cached state is
+    // dropped, counted before at the layout's sizes: a lane's buffers and the
+    // state's cell and window.
+    const uint64_t idle = storage.idleBytes(1);
+    require(idle == kStateLayout.laneBytes() + kStateLayout.cachedBytes(),
+            "the idle bytes a dropped state would leave are not the layout's");
     retained.reset();
     require(storage.idleCells() == 5 && storage.idleRings() == 2 &&
-                storage.idleWindows() == 3,
+                storage.idleWindows() == 3 && storage.idleBytes(0) == idle,
             "dropped cached state did not return its cell and window to the pool");
     // Releasing down to one lane's worth keeps two cells, the rings and a
-    // window warm.
-    require(releaseAllIdle(storage, true) ==
-                observedLaneActual + observedPrefixActual &&
+    // window warm, and frees no less than was counted.
+    const uint64_t released = releaseAllIdle(storage, true);
+    require(released == observedLaneActual + observedPrefixActual && released >= idle &&
                 storage.idleCells() == 2 && storage.idleRings() == 1 &&
-                storage.idleWindows() == 1,
+                storage.idleWindows() == 1 && storage.idleBytes(0) == 0,
             "partial idle release did not keep the requested buffers");
     require(releaseAllIdle(storage, false) == observedLaneActual,
             "idle lane buffers were not reclaimed");
