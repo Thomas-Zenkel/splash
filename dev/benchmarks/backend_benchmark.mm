@@ -1006,6 +1006,11 @@ int main(int argc, char **argv) {
     if (progress)
       progress->identity(identity);
 
+    // These warmups run after serving began, and widths 2-4 each add a lane.
+    // Like a start's warmup, what they allocate is memory a request in
+    // service needs (MemoryGovernor::setServing): unmarked, the host's
+    // margins refuse a lane the plan holds, and the run fails.
+    const bool wasServing = resources->memoryGovernor().setServing(true);
     if (progress)
       progress->begin("warmup", "prefill_2048", 0,
                       model::ExecutionLimits::prefillTokenBudget);
@@ -1030,6 +1035,7 @@ int main(int argc, char **argv) {
       decodeWarmupGpu[width - 1] =
           executor->telemetry().lastDecodeGpuSeconds * 1000.0;
     }
+    resources->memoryGovernor().setServing(wasServing);
 
     Events events;
     engine::EngineConfig engineConfig;
