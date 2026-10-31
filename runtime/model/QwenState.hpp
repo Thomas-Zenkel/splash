@@ -280,6 +280,12 @@ public:
   // cached state holds: without idle rings no number of states makes up the
   // lack.
   [[nodiscard]] uint32_t statesToActivate() const noexcept;
+  // What releaseOneIdle(true), called until it gives none, releases once
+  // `evictedStates` more cached states have returned their cell and context
+  // window to the pool (QwenBufferPool::give), at the layout's sizes, which
+  // each allocation covers: a lane keeps two cells, the draft rings and a
+  // window, and cells of no bytes count none.
+  [[nodiscard]] uint64_t idleBytes(uint32_t evictedStates) const noexcept;
 
   // Hot-path metadata operations; none performs a buffer copy. A step makes
   // next() current. swapParity: a prefill step's, which read the lane's

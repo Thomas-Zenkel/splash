@@ -6,7 +6,14 @@
 // again in place; and when more lanes add experts to each cycle until a cycle
 // routes more than the slots hold, the experts every cycle routes keep
 // hitting (recycling the least recently used slot keeps a fifth of them). A
-// claim allocates nothing. On the decode selections of real requests
+// claim allocates nothing. A compaction to fewer slots evicts the keys ARC
+// would recycle, T1's past its target and T2's at it, without a ghost, until
+// the keys past the slots fit the free slots below them, moves those keys
+// there in their lists' order, keeps as many keys as fit and the ghosts
+// within ARC's bounds, and leaves no key or claim past the slots; one straight
+// to fewer slots keeps the keys compactions a chunk at a time keep, moving
+// each once at most. On the
+// decode selections of real requests
 // (dev/tests/fixtures/kv-selection-traces, the directory the test takes), the
 // hot block cache's resolves miss at most 2% more than recycling the least
 // recently used block would.
@@ -27,6 +34,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 // Every allocation of the test's thread, which a claim must not add to.
@@ -53,6 +61,8 @@ struct Arena final {
   std::map<uint64_t, uint32_t> slotOf;
   std::vector<uint64_t> owner;
   uint64_t load = 0;
+  // How often compactions moved each key.
+  std::map<uint64_t, uint32_t> moves;
   // Routes `experts` in one load; returns how many were resident.
   uint32_t route(const std::vector<uint64_t> &experts, bool chunk) {
     ++load;
@@ -72,6 +82,27 @@ struct Arena final {
       slotOf[expert] = slot;
     }
     return hits;
+  }
+  // Compacts to `slots` slots, as the store follows the evictions and moves.
+  void compact(uint32_t slots) {
+    order.compact(
+        slots,
+        [&](uint32_t slot) {
+          require(slot < owner.size() && owner[slot] != kFree, "a compaction evicted a free slot");
+          slotOf.erase(owner[slot]);
+          owner[slot] = kFree;
+        },
+        [&](uint32_t from, uint32_t to) {
+          require(from >= slots && to < slots && owner[from] != kFree && owner[to] == kFree,
+                  "a compaction moved a key from below the slots or into a held slot");
+          ++moves[owner[from]];
+          slotOf[owner[from]] = to;
+          owner[to] = std::exchange(owner[from], kFree);
+        });
+    for (uint32_t slot = slots; slot < owner.size(); ++slot)
+      require(owner[slot] == kFree, "a compaction left a key past the slots");
+    owner.resize(slots);
+    for (const auto &[key, slot] : slotOf) require(order.find(key) == slot, "a compacted key is not where it moved");
   }
 };
 
@@ -153,6 +184,155 @@ void resizes() {
   require(slots.ghostHits() == 2, "shrinking forgot a ghost within the slots");
   for (uint64_t load = 7; load < 40; ++load)
     require(slots.claim(100 + load, load, false) < 5, "a shrunk recycler took a slot past its size");
+}
+
+// A compaction evicts REPLACE's victims: T1's oldest keys while T1 holds
+// more than its target, and moves the keys past the slots into the lowest
+// free slots below them, where they keep their places in T2's order, which
+// the claims after it recycle.
+void compactsInRecencyOrder() {
+  Arena arena(8);
+  std::vector<uint64_t> keys{0, 1, 2, 3, 4, 5, 6, 7};
+  static_cast<void>(arena.route(keys, false));
+  for (uint64_t key = 0; key < 8; ++key) require(arena.slotOf.at(key) == key, "a fresh recycler's claims moved");
+  // T2 holds 7, 2, 5, 0 and 6 in that order, T1 1, 3 and 4.
+  for (const uint64_t key : {7, 2, 5, 0, 6}) arena.order.touch(arena.slotOf.at(key), 2, false);
+  std::vector<uint32_t> evicted;
+  std::vector<std::pair<uint32_t, uint32_t>> moved;
+  arena.order.compact(
+      5, [&](uint32_t slot) { evicted.push_back(slot); },
+      [&](uint32_t from, uint32_t to) { moved.emplace_back(from, to); });
+  require(evicted == std::vector<uint32_t>{1, 3, 4}, "a compaction evicted other keys than T1's oldest");
+  require(moved == std::vector<std::pair<uint32_t, uint32_t>>{{5, 1}, {6, 3}, {7, 4}},
+          "a compaction moved the keys past the slots elsewhere than the lowest free slots");
+  require(arena.order.size() == 5 && arena.order.find(0) == 0 && arena.order.find(2) == 2 &&
+              arena.order.find(5) == 1 && arena.order.find(6) == 3 && arena.order.find(7) == 4 &&
+              !arena.order.find(1) && !arena.order.find(3) && !arena.order.find(4),
+          "a compacted key is not where it moved, or an evicted one is still found");
+  // One load's claims recycle T2 in its order: 7, 2, 5, 0, 6.
+  const std::vector<uint64_t> recycled{7, 2, 5, 0, 6};
+  for (uint64_t claim = 0; claim < recycled.size(); ++claim) {
+    static_cast<void>(arena.order.claim(100 + claim, 3, false));
+    require(!arena.order.find(recycled[claim]), "a compaction changed T2's order: claim " + std::to_string(claim) +
+                                                    " did not recycle key " + std::to_string(recycled[claim]));
+  }
+  for (uint64_t load = 4; load < 40; ++load)
+    require(arena.order.claim(1000 + load, load, false) < 5, "a compacted recycler took a slot past its size");
+}
+
+// With T1 at its target, a compaction evicts T2's oldest keys, and a ghost
+// T1 gave up stays one in the fewer slots.
+void compactsAtTheTarget() {
+  SlotRecycler slots(4);
+  for (uint64_t key = 0; key < 4; ++key) require(slots.claim(key, 1, false) == key, "a fresh claim moved");
+  slots.touch(0, 2, false);
+  slots.touch(1, 2, false);
+  // Key 4 recycles T1's 2, whose claim as a ghost grows T1's target to one
+  // and recycles T1's 3 into a ghost: T1 holds 4, T2 0, 1 and 2.
+  require(slots.claim(4, 3, false) == 2 && slots.claim(2, 4, false) == 3 && slots.ghostHits() == 1,
+          "the claims before the compaction recycled other slots");
+  std::vector<uint32_t> evicted;
+  std::vector<std::pair<uint32_t, uint32_t>> moved;
+  slots.compact(
+      2, [&](uint32_t slot) { evicted.push_back(slot); },
+      [&](uint32_t from, uint32_t to) { moved.emplace_back(from, to); });
+  require(evicted == std::vector<uint32_t>{0, 1} &&
+              moved == std::vector<std::pair<uint32_t, uint32_t>>{{2, 0}, {3, 1}},
+          "a compaction with T1 at its target evicted other keys than T2's oldest");
+  require(slots.find(4) == 0 && slots.find(2) == 1 && !slots.find(0) && !slots.find(1),
+          "a compacted key is not where it moved");
+  // 3 is claimed as the ghost T1 gave up, and the victims, which left none,
+  // as new keys.
+  static_cast<void>(slots.claim(3, 5, false));
+  require(slots.ghostHits() == 2, "a compaction forgot a ghost within the slots");
+  static_cast<void>(slots.claim(0, 6, false));
+  static_cast<void>(slots.claim(1, 7, false));
+  require(slots.ghostHits() == 2, "a compaction's victim left a ghost");
+}
+
+// Compactions of a recycler whose ghosts fill ARC's bounds, between loads
+// of keys used again and again and others in turn, keep as many keys as fit,
+// leave no key or claim past the slots and the ghosts within the bounds (a
+// claim throws past them), which keep hitting; a compaction to no slot
+// evicts every key, and the recycler grows again.
+void compactionsKeepTheBounds() {
+  Arena arena(64);
+  uint64_t fresh = 0;
+  const auto loads = [&](uint32_t count) {
+    for (uint32_t load = 0; load < count; ++load) {
+      std::vector<uint64_t> keys;
+      for (uint64_t key = 0; key < arena.order.size() / 2; ++key) keys.push_back(key);
+      // More others in turn than the slots the keys used again leave.
+      for (uint64_t other = 0; other < arena.order.size() / 4; ++other)
+        keys.push_back(1000 + fresh++ % arena.order.size());
+      static_cast<void>(arena.route(keys, load % 7 == 3));
+      if (load % 11 == 5 && !arena.slotOf.empty()) {
+        const auto [key, slot] = *arena.slotOf.begin();
+        arena.order.free(slot);
+        arena.slotOf.erase(key);
+        arena.owner[slot] = Arena::kFree;
+      }
+    }
+  };
+  for (const uint32_t slots : {48u, 47u, 20u, 9u, 1u}) {
+    loads(60);
+    const size_t keys = arena.slotOf.size();
+    const uint64_t hits = arena.order.ghostHits();
+    arena.compact(slots);
+    require(arena.order.size() == slots && arena.slotOf.size() == std::min<size_t>(keys, slots),
+            "a compaction to " + std::to_string(slots) + " slots kept " + std::to_string(arena.slotOf.size()) +
+                " of " + std::to_string(keys) + " keys");
+    loads(40);
+    require(slots == 1 || arena.order.ghostHits() > hits,
+            "the loads after a compaction to " + std::to_string(slots) + " slots hit no ghost");
+    for (const auto &[key, slot] : arena.slotOf)
+      require(slot < slots, "a claim after a compaction took a slot past its size");
+  }
+  arena.compact(0);
+  require(arena.order.size() == 0 && arena.slotOf.empty(), "a compaction to no slot kept a key");
+  arena.order.resize(16);
+  arena.owner.assign(16, Arena::kFree);
+  loads(20);
+  require(!arena.slotOf.empty(), "a recycler compacted to no slot did not grow again");
+  rejects([&] { arena.order.compact(17, [](uint32_t) {}, [](uint32_t, uint32_t) {}); }, "more slots",
+          "a compaction to more slots than the recycler holds was taken");
+}
+
+// A compaction straight to fewer slots, as critical pressure takes the store
+// down to its floor (model::ExpertStore::releaseToFloor), keeps the keys
+// that compactions a chunk at a time down to the same slots keep, since
+// moves keep the keys' places in their lists, and moves each key once at
+// most, no more keys in all than those compactions move, whether the slots
+// were full or partly free.
+void compactsToTheFloorOnce() {
+  for (const uint64_t held : {64u, 48u}) {
+    Arena once(64), steps(64);
+    for (Arena *arena : {&once, &steps}) {
+      for (uint64_t key = 0; key < held; ++key) static_cast<void>(arena->route({key}, false));
+      // Every third key routed again, into T2.
+      std::vector<uint64_t> again;
+      for (uint64_t key = 0; key < held; key += 3) again.push_back(key);
+      static_cast<void>(arena->route(again, false));
+    }
+    once.compact(16);
+    for (const uint32_t slots : {52u, 40u, 28u, 16u}) steps.compact(slots);
+    const auto keys = [](const Arena &arena) {
+      std::set<uint64_t> result;
+      for (const auto &[key, slot] : arena.slotOf) result.insert(key);
+      return result;
+    };
+    uint64_t movedOnce = 0, movedSteps = 0;
+    for (const auto &[key, count] : once.moves) {
+      require(count == 1, "a compaction straight to fewer slots moved key " + std::to_string(key) + " twice");
+      movedOnce += count;
+    }
+    for (const auto &[key, count] : steps.moves) movedSteps += count;
+    require(keys(once) == keys(steps) && once.slotOf.size() == 16,
+            "a compaction straight to fewer slots kept other keys than compactions a chunk at a time");
+    require(movedOnce <= movedSteps, "a compaction straight to fewer slots moved " + std::to_string(movedOnce) +
+                                         " keys, more than compactions a chunk at a time, " +
+                                         std::to_string(movedSteps));
+  }
 }
 
 void aScanSparesTheFrequent() {
@@ -345,6 +525,10 @@ int main(int argc, char **argv) {
     freeSlotsFirst();
     findsWhatItHolds();
     resizes();
+    compactsInRecencyOrder();
+    compactsAtTheTarget();
+    compactionsKeepTheBounds();
+    compactsToTheFloorOnce();
     aScanSparesTheFrequent();
     aRoutedCoreOutlivesMoreLanes();
     claimsAllocateNothing();

@@ -1914,9 +1914,9 @@ Engine::Reservation Engine::reserveCapture(Request &active, StateClass kind, uin
   if (result.fromLane)
     return result;
   // Room comes from what this state's class may take: cached KV unless it
-  // is an optional checkpoint, and states in use only for the prompt's
-  // replay point, which is in use itself. A pin keeps the lane's
-  // checkpoint, if any, out of it.
+  // is an optional checkpoint, and the expert store's chunks above its
+  // floor, then states in use, only for the prompt's replay point, which is
+  // in use itself. A pin keeps the lane's checkpoint, if any, out of it.
   result.recycled = makeStateRoom(kind, [&] {
     result.buffers = model_.reserveState(id, tokens, refusal);
     return result.buffers != nullptr;
@@ -1942,14 +1942,36 @@ template <class Take> bool Engine::makeStateRoom(StateClass kind, Take &&take) {
   const bool growth = !config_.growthPaused();
   const uint64_t needed = model_.snapshotBytes();
   uint64_t released = 0;
-  StateRoom room;
-  do {
-    room = cache_.reclaimOneState(kind, growth);
-    released += room.extentBytes;
-    if (room && take())
+  // Steps of `reclaim` until `take` gets the buffers, nothing more of its
+  // kind goes, or what they gave covers one state.
+  enum class Room : uint8_t { Taken, Refused, Exhausted };
+  const auto makeRoom = [&](const auto &reclaim) {
+    StateRoom room;
+    do {
+      room = reclaim();
+      released += room.extentBytes;
+      if (room && take())
+        return Room::Taken;
+    } while (room.extentBytes && released < needed);
+    return room ? Room::Refused : Room::Exhausted;
+  };
+  const Room made = makeRoom([&] { return cache_.reclaimOneState(kind, growth); });
+  if (made != Room::Exhausted || kind != StateClass::InUse)
+    return made == Room::Taken;
+  // The prompt's replay point then takes chunks of the expert store above
+  // its floor, until they cover its buffers, before another request's state
+  // in use, while the host lets the engine grow: the paced reclaim shrinks
+  // the store for the host.
+  while (growth && released < needed) {
+    const uint64_t chunk = releaseExpertChunk();
+    if (!chunk)
+      break;
+    released += chunk;
+    signalResourceProgress();
+    if (take())
       return true;
-  } while (room.extentBytes && released < needed);
-  return false;
+  }
+  return makeRoom([&] { return cache_.reclaimInUseState(); }) == Room::Taken;
 }
 
 uint64_t Engine::completedTokens(const Request &active) const {
@@ -2051,10 +2073,10 @@ auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
         admission.allocationFailure == metal::AllocationFailure::HostPressure;
     CacheReclaimResult reclaimed;
     if constexpr (std::is_same_v<Admission, StateAdmission>)
-      reclaimed = paused ? reuseCachedStateWhilePaused(upTo) : reclaimForState(upTo);
+      reclaimed = paused ? reuseCachedStateWhilePaused(upTo) : reclaimForState(upTo, optional);
     else if constexpr (std::is_same_v<Admission, TokenAdmission>)
       reclaimed = paused ? reuseCachedPagesWhilePaused(admission, upTo)
-                         : reclaimForKv(admission, upTo);
+                         : reclaimForKv(admission, upTo, optional);
     else
       // The model's memory for reads of spilled KV (a hot block cache floor,
       // a history's staging) takes what a state takes; while the host
@@ -2101,10 +2123,14 @@ auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
 // gives memory back: an extent, or a state (Cache::reclaimForMemory), which
 // makes progress, and the allocation is asked for again, only once memory
 // has come back. The KV it evicts before then frees pages other KV may
-// take, so it wakes the requests waiting for memory as progress does.
-// Memory for later (the hot block cache's growth toward its planned size)
-// takes no rebuildable cache entry, among which that very cache's slots past
-// its floor are, nor the empty extent kept for the next request.
+// take, so it wakes the requests waiting for memory as progress does. What
+// nothing in use holds goes first, then a chunk of the expert store above
+// its floor (releaseExpertChunk), then, up to InUse, what is in use; memory
+// on its way back holds back the last two.
+// Memory for later (the hot block cache's growth toward its planned size,
+// any optional allocation) takes no rebuildable cache entry, among which
+// that very cache's slots past its floor are, nor the empty extent kept for
+// the next request, nor the expert store, nor anything in use.
 // A host refusal comes to neither step but to the reuse path (allocate()):
 // the pressure controller owns that shrink, and evicting for an allocator
 // that refuses all the same would drain the cache, and the caches the model
@@ -2113,7 +2139,18 @@ CacheReclaimResult Engine::reclaimForState(ReclaimClass upTo, bool forLater) {
   if (reclaimIdleState(true, forLater ? model::IdleMemory::Buffers
                                       : model::IdleMemory::BuffersThenCaches))
     return {true, 0};
-  const CacheReclaimResult reclaimed = cache_.reclaimForMemory(upTo, forLater);
+  CacheReclaimResult reclaimed = cache_.reclaimForMemory(ReclaimClass::Ordinary, forLater);
+  if (!reclaimed.madeProgress && !reclaimed.pending && !forLater) {
+    if (const uint64_t chunk = releaseExpertChunk()) {
+      signalResourceProgress();
+      return {.madeProgress = true, .reclaimedBytes = chunk, .evictedKv = reclaimed.evictedKv};
+    }
+    if (upTo == ReclaimClass::InUse) {
+      const bool evictedKv = reclaimed.evictedKv;
+      reclaimed = cache_.reclaimForMemory(ReclaimClass::InUse, forLater);
+      reclaimed.evictedKv = reclaimed.evictedKv || evictedKv;
+    }
+  }
   if (reclaimed.madeProgress || reclaimed.evictedKv)
     signalResourceProgress();
   return reclaimed;
@@ -2122,20 +2159,94 @@ CacheReclaimResult Engine::reclaimForState(ReclaimClass upTo, bool forLater) {
 // The reclaim step for KV pages the engine's limit refused. Allocated extents
 // stay for the pages to reuse; idle state memory beyond the lane's pooled
 // buffers goes first, then the cache gives up what covers the shortfall, of
-// the pages' form, in one step, and the lane's buffers go last. Their draft
-// ring is the one buffer no cached state holds: while it stays, a request
-// that waits can start beside this one from cached states' cells and windows.
-CacheReclaimResult Engine::reclaimForKv(const TokenAdmission &admission, ReclaimClass upTo) {
+// the pages' form, in one step: what nothing in use holds, then a chunk of
+// the expert store above its floor (releaseExpertChunk), then, up to InUse,
+// what is in use; memory on its way back holds back the last two, and so
+// does an optional allocation (a capture's KV past its first boundary, whose
+// refusal only ends the command early). The lane's buffers go last. Their
+// draft ring is the one buffer no cached state holds: while it stays, a
+// request that waits can start beside this one from cached states' cells and
+// windows.
+CacheReclaimResult Engine::reclaimForKv(const TokenAdmission &admission, ReclaimClass upTo,
+                                        bool optional) {
   if (reclaimIdleState(true, model::IdleMemory::BuffersThenCaches))
     return {true, 0};
-  const CacheReclaimResult reclaimed = cache_.reclaimForPages(
-      admission.additionalPages, CacheReclaimMode::KeepExtents, upTo, admission.form);
+  const auto reclaimPages = [&](ReclaimClass reach) {
+    return cache_.reclaimForPages(admission.additionalPages, CacheReclaimMode::KeepExtents, reach,
+                                  admission.form);
+  };
+  CacheReclaimResult reclaimed = reclaimPages(ReclaimClass::Ordinary);
+  if (!reclaimed.madeProgress && !reclaimed.pending && !optional) {
+    if (const uint64_t chunk = releaseExpertChunk()) {
+      signalResourceProgress();
+      return {.madeProgress = true, .reclaimedBytes = chunk};
+    }
+    if (upTo == ReclaimClass::InUse)
+      reclaimed = reclaimPages(ReclaimClass::InUse);
+  }
   if (reclaimed.madeProgress)
     signalResourceProgress();
   if (!reclaimed.madeProgress && !reclaimed.pending &&
       reclaimIdleState(false, model::IdleMemory::Buffers))
     return {true, 0};
   return reclaimed;
+}
+
+uint64_t Engine::releaseExpertChunk() {
+  const uint64_t bytes = model_.releaseExpertChunk();
+  if (bytes)
+    ++expertReleases_;
+  return bytes;
+}
+
+uint64_t Engine::releaseExpertsToFloor() {
+  const uint64_t bytes = model_.releaseExpertsToFloor();
+  if (bytes)
+    ++expertReleases_;
+  return bytes;
+}
+
+bool Engine::growExperts(uint64_t headroomBytes) {
+  if (pending_)
+    throw std::logic_error("expert growth requested while a command is in flight");
+  const uint64_t bytes = model_.expertGrowthBytes();
+  // It takes only room the engine's limit has free, and asks for none it
+  // lacks, which would count as a denied reservation for nothing. An engine
+  // without requests makes that room by the exchange alone
+  // (reclaimForExperts), which buys the chunk or takes nothing.
+  return bytes && headroomBytes >= bytes && model_.growExperts().granted();
+}
+
+uint64_t Engine::reclaimForExperts(uint64_t bytes) {
+  if (pending_)
+    throw std::logic_error("cache reclaim for the expert store requested while a command is in flight");
+  // Cache that cannot buy the chunk would go for nothing: as a lane takes a
+  // cached state only when those in RAM cover what it lacks
+  // (reuseCachedStateWhilePaused), nothing goes unless what leaves at once
+  // covers the bytes, and then the bytes leave in this call.
+  if (!idle() || exchangeableBytes() < bytes)
+    return 0;
+  uint64_t returned = 0;
+  while (returned < bytes) {
+    const CacheReclaimResult step = reclaimStepForExperts();
+    if (!step.madeProgress)
+      break;
+    returned += step.reclaimedBytes;
+  }
+  return returned;
+}
+
+uint64_t Engine::exchangeableBytes() const {
+  const CacheExchange cache = cache_.exchangeable();
+  return model_.idleBufferBytes(cache.states) + cache.extentBytes;
+}
+
+CacheReclaimResult Engine::reclaimStepForExperts() {
+  if (const uint64_t buffer = model_.reclaimIdleState(true, model::IdleMemory::Buffers)) {
+    signalResourceProgress();
+    return {.madeProgress = true, .reclaimedBytes = buffer};
+  }
+  return cache_.reclaimForExchange();
 }
 
 bool Engine::reclaimIdleState(bool keepLane, model::IdleMemory scope) noexcept {
@@ -2264,23 +2375,49 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
     }
   };
   reclaimModelCaches();
+  // The expert store's chunks above its floor go after what nothing in use
+  // holds and before what is in use.
   if (directive.critical) {
-    const CacheReclaimResult evicted = cache_.evictAll();
-    reclaimed = evicted.madeProgress;
-    released += evicted.reclaimedBytes;
-    releaseIdle();
+    const auto evictAll = [&](ReclaimClass upTo) {
+      const CacheReclaimResult evicted = cache_.evictAll(upTo);
+      reclaimed = reclaimed || evicted.madeProgress;
+      released += evicted.reclaimedBytes;
+      releaseIdle();
+    };
+    evictAll(ReclaimClass::Ordinary);
+    released += releaseExpertsToFloor();
+    evictAll(ReclaimClass::InUse);
   } else {
     // Even a zero-byte directive releases completely empty KV extents.
     released += cache_.releaseEmptyExtents(keep);
-    while (targetUnmet()) {
-      const CacheReclaimResult step =
-          cache_.reclaimOne(CacheReclaimMode::ReleaseExtents, directive.upTo,
-                            directive.keepResumePoint, keep);
-      if (!step.madeProgress)
-        break;
-      reclaimed = true;
-      released += step.reclaimedBytes;
-      releaseIdle();
+    // True when the steps stopped on what waits for a transfer in flight
+    // rather than on nothing left to take.
+    const auto reclaimUpTo = [&](ReclaimClass upTo) {
+      while (targetUnmet()) {
+        const CacheReclaimResult step = cache_.reclaimOne(
+            CacheReclaimMode::ReleaseExtents, upTo, directive.keepResumePoint, keep);
+        if (!step.madeProgress)
+          return step.pending;
+        reclaimed = true;
+        released += step.reclaimedBytes;
+        releaseIdle();
+      }
+      return false;
+    };
+    // Cache nothing in use holds that waits for a transfer, an SSD demotion
+    // or a state write, still ranks below the store and what is in use: the
+    // pass ends Pending, and the pass that continues it once the transfer
+    // landed takes it first.
+    if (!reclaimUpTo(ReclaimClass::Ordinary)) {
+      if (directive.hostShort)
+        while (targetUnmet()) {
+          const uint64_t chunk = releaseExpertChunk();
+          if (!chunk)
+            break;
+          released += chunk;
+        }
+      if (directive.upTo == ReclaimClass::InUse)
+        static_cast<void>(reclaimUpTo(ReclaimClass::InUse));
     }
   }
   // Image rows only an evicted state held are ordinary cache entries now.
@@ -2539,8 +2676,8 @@ Engine::LaneEnd Engine::capacityExhausted(std::string_view what,
     message += " (" + std::string(detail) + ")";
   // A lone lane judge failed: only other limits fit it.
   message += "; the request does not fit in the memory this server may use, even after "
-             "every cached prefix was evicted: restart the server with a larger "
-             "--max-memory or a smaller --max-context";
+             "every cached prefix was evicted and any store of streamed experts shrank to its "
+             "floor: restart the server with a larger --max-memory or a smaller --max-context";
   return {LaneOutcome::CapacityExhausted, std::move(message)};
 }
 

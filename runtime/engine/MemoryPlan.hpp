@@ -54,10 +54,17 @@ minimumRequiredBytes(uint64_t fixedBytes, uint64_t laneStateBytes,
 
 // How a part of the weights that can stream from the SSD is held
 // (--expert-memory, --ple-memory): as the planner decides (Auto), loaded
-// whole (Off), or streamed through a store of `bytes` (Size), which loads
-// the part whole instead when it would hold all of it.
+// whole (Off), or streamed as `bytes` set (Size), which loads the part whole
+// instead when they would hold all of it. The PLE table streams through a
+// row cache of `bytes`. The routed experts are planned as automatic ones,
+// with `bytes` charged among the floors: they load whole where the budget
+// holds every one, and otherwise stream through a store whose floor is
+// `bytes` and whose cap the planner sizes as an automatic store's. Loaded is
+// the store of exactly `bytes` a loaded model streams the part through,
+// which the engine's plan plans with (RuntimeResources::create); no option
+// sets it.
 struct StreamedSetting final {
-  enum class Mode : uint8_t { Auto, Off, Size };
+  enum class Mode : uint8_t { Auto, Off, Size, Loaded };
   Mode mode = Mode::Auto;
   uint64_t bytes = 0;
 
@@ -67,10 +74,11 @@ struct StreamedSetting final {
 // A part of the weights that can stream from the SSD instead of loading: a
 // MoE target's routed experts (model::ExpertStore) or the table its GGUF
 // holds (model::SparseRowStore). allBytes is what it takes loaded whole, zero
-// for a model without it, and floorBytes the smallest store that streams it.
+// for a model without it, and minimumBytes the smallest store that streams
+// it.
 struct StreamedPart final {
   uint64_t allBytes = 0;
-  uint64_t floorBytes = 0;
+  uint64_t minimumBytes = 0;
   StreamedSetting setting;
 };
 
@@ -130,7 +138,7 @@ struct KvSpillPlan final {
   uint32_t floorTokens = 0;
   uint64_t floorBytes = 0;
   // The longest context spilling serves: what memory holds beside the
-  // streamed stores at their floors, and what the SSD cache's room for
+  // streamed stores at their smallest, and what the SSD cache's room for
   // active KV holds (DiskSpace) beside every lane's state.
   uint32_t memoryTokens = 0;
   uint32_t diskTokens = 0;
@@ -198,9 +206,13 @@ struct StreamedMemoryInputs final {
 };
 
 // The stores the plan streams the parts through, zero for a part that loads
-// whole or a model without it, and a spill-capable target's plan.
+// whole or a model without it, and a spill-capable target's plan. The
+// routed experts' store takes expertBytes, its cap, and gives back what
+// memory needs down to its floor, expertFloorBytes: --expert-memory's size,
+// or zero for the store's own (model::ExpertStoreOptions::floorBytes).
 struct StreamedMemoryPlan final {
   uint64_t expertBytes = 0;
+  uint64_t expertFloorBytes = 0;
   uint64_t tableBytes = 0;
   KvSpillPlan spill{};
 };
@@ -216,20 +228,25 @@ struct StreamedMemoryResult final {
 // Plans the stores of the parts that stream and a spill-capable target's
 // floors from one budget (docs/server.md, Memory and context). The floors
 // come first: the fixed bytes and the arenas, a lane's state and the KV
-// runway (minimumRequiredBytes), the stores at their floors and the spill
-// floors at the context spilling serves. Then the routed experts load whole
-// where that leaves KV its allowance, and otherwise stream through all that
-// the allowance and the PLE table's share leave; the table loads whole where
-// the rest holds it, and otherwise streams through its share, 512 MiB at most.
+// runway (minimumRequiredBytes), the stores at their smallest (the routed
+// experts' at --expert-memory's size where it is set) and the spill floors
+// at the context spilling serves. Then the routed experts load whole where
+// that leaves KV its allowance, and otherwise stream through all that the
+// allowance and the PLE table's share leave; the table loads whole where the
+// rest holds it, and otherwise streams through its share, 512 MiB at most.
 // The allowance is the KV of a context in the fewest pages whose whole
 // extents hold it, as one request's capacity rounds them (kvCapacityPagesFor):
 // a spill-capable target's first 64K tokens; a dense target's --max-context,
 // or none, so that its experts load wherever main loads them, and the first
 // 64K tokens once they stream. The arenas are those of the parts that
 // stream: where the plan with the arenas of fewer parts streams more, it
-// plans again with those. An explicit setting replaces its part; one below
-// the part's floor, a hot cache target beyond what the floors leave, and
-// floors beyond the budget are refused.
+// plans again with those. An explicit size of the PLE table replaces its
+// part; one of the routed experts is charged among the floors, and they load
+// whole or stream as automatic experts do, a store that streams them taking
+// all that the rest leaves them, so at least that size, with that size as
+// its floor.
+// A size below the part's smallest store, a hot cache target beyond what
+// the floors leave, and floors beyond the budget are refused.
 [[nodiscard]] StreamedMemoryResult planStreamedMemory(const StreamedMemoryInputs &inputs);
 
 struct EngineMemoryPolicy {

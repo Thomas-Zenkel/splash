@@ -143,10 +143,13 @@ struct RuntimeResourcesConfig {
   // a target without one, and a size that holds the whole table loads it.
   StreamedSetting pleMemory;
   // --expert-memory: a MoE target's routed experts stream from their files
-  // through a store of a size (its slots, staging and tables), or load with
-  // their layers (off); auto leaves them to the memory plan. Ignored, with a
-  // warning, for a dense target, and a size that holds every routed expert
-  // loads them.
+  // through a store whose floor is a size (its slots, staging and tables),
+  // the least it keeps however short memory is, and whose cap is all that
+  // the memory plan leaves it beside that floor, so at least that size; or
+  // load with their layers (off); auto leaves them to the memory plan, the
+  // floor to the store. A size loads them with their layers, as auto does,
+  // where memory holds every one, and so does a size that holds every one;
+  // both say it is ignored, and so does a dense target.
   StreamedSetting expertMemory;
   // --sparse-kv-memory: the target of a spill-capable target's hot block
   // cache, at least its floor; none (auto) keeps its floor.

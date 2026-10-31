@@ -267,14 +267,21 @@ public:
   // in flight. Returns the model's idle state buffers first, then the caches
   // the model can rebuild while the directive's byte target is unmet; a
   // critical directive has no target and takes them all. Under critical
-  // pressure it then evicts every unpinned cache entry (Cache::evictAll()).
+  // pressure it then evicts every unpinned cache entry nothing in use holds
+  // (Cache::evictAll), gives back every chunk of the expert store above its
+  // floor at once (Model::releaseExpertsToFloor), and evicts the rest.
   // Otherwise it releases empty KV extents and reclaims the cache one
-  // Cache::reclaimOne step at a time, up to the directive's class, in the
-  // order that step's contract (Cache.hpp) gives, returning the buffers an
-  // evicted state handed back to the model's pool after each step. While
-  // the target is still unmet, it then takes the image rows only evicted
-  // states held. A pass counts only memory that leaves the engine: released
-  // KV extents, the caches and idle buffers the model returns; evicting a
+  // Cache::reclaimOne step at a time, in the order that step's contract
+  // (Cache.hpp) gives, returning the buffers an evicted state handed back to
+  // the model's pool after each step: what nothing in use holds while that
+  // frees some; then, while the host is short
+  // (MemoryReclaimDirective::hostShort), the expert store's chunks above its
+  // floor, one per step (Model::releaseExpertChunk); then, up to InUse, what
+  // is in use. What nothing in use holds that waits for a transfer in flight
+  // holds the last two back: the pass ends Pending. While the target is
+  // still unmet, it then takes the image rows only evicted states held. A
+  // pass counts only memory that leaves the engine: released KV extents,
+  // store chunks, the caches and idle buffers the model returns; evicting a
   // state frees nothing by itself.
   // Pages whose copies are being written count toward the target. A pass
   // short of critical keeps one lane's pooled buffers and one empty extent.
@@ -283,8 +290,43 @@ public:
   // Live command buffers are never eviction candidates. A pass first collects
   // the transfers that landed, so one that continues a reclaim they held back
   // takes what they freed. The result says whether the directive's target is
-  // met, waits for transfers in flight, or finds nothing left to reclaim.
+  // met, waits for transfers in flight, or finds nothing left that the
+  // directive lets it take: with hostShort, the store is at its floor too.
   [[nodiscard]] MemoryReclaimResult reclaimMemory(const MemoryReclaimDirective &directive);
+  // Takes back one chunk of the expert store toward its cap
+  // (Model::growExperts) for the control pass, which decides when memory
+  // allows it (MemoryControl). Runs only between commands: throws
+  // std::logic_error while a command is in flight. It takes only what
+  // headroomBytes, the room the engine's limit has free, covers, and asks
+  // for none it lacks, which would count as a denied reservation for
+  // nothing. It never takes cache, what is in use or the store itself: an
+  // engine without requests makes the room first (reclaimForExperts), which
+  // the control pass asks for. True when the chunk came back.
+  [[nodiscard]] bool growExperts(uint64_t headroomBytes);
+  // The cache's side of the exchange the control pass makes for the expert
+  // store's next chunk while the host's headroom or the engine's limit lacks
+  // `bytes` of it (MemoryControl). Cache that cannot cover the bytes would go
+  // for nothing, so it takes nothing unless what leaves at once covers them
+  // (exchangeableBytes); it starts no copy to the SSD cache, whose memory
+  // would come back only after the call, so cache that needs one stays.
+  // Then, with no request in the engine, it returns memory to the system a
+  // step at a time until the bytes returned cover `bytes`: the model's idle
+  // buffers beyond those one lane starts from, then the cache nothing in use
+  // holds, one Cache::reclaimForExchange step at a time, each releasing the
+  // extent it empties. It keeps the resume point, which the next turn of the
+  // newest conversation resumes from, and the runway extent. Beside any
+  // request, resident, queued or draining, whose memory outranks the
+  // store's and whose prefix the cache may hold, it takes nothing. Returns
+  // the bytes that left the engine, zero or at least `bytes`: buffers the
+  // model released and extents released, never pages freed in an extent
+  // that stays. Runs only between commands: throws std::logic_error while a
+  // command is in flight.
+  [[nodiscard]] uint64_t reclaimForExperts(uint64_t bytes);
+  // The bytes growExperts takes next (Model::expertGrowthBytes).
+  [[nodiscard]] uint64_t expertGrowthBytes() const { return model_.expertGrowthBytes(); }
+  // The reclaim steps that gave chunks of the expert store back, which the
+  // control pass's growth waits after.
+  [[nodiscard]] uint64_t expertReleases() const noexcept { return expertReleases_; }
   // At a clean stop, once tick() has stopped: makes every restore point
   // still waiting for its delay durable, the newest first, as the writes it
   // starts land (WriteBehind::flush). True once none is left. The requests
@@ -666,17 +708,43 @@ private:
   // Makes room for one state's buffers, a step of what its class may take
   // (Cache::reclaimOneState) at a time, until `take` gets them, nothing more
   // of the class goes, or the extents given cover one state; true once
-  // `take` got them. Between commands only.
+  // `take` got them. Between commands only. The prompt's replay point, once
+  // nothing else of its class goes, takes the expert store's chunks above its
+  // floor (releaseExpertChunk), one at a time until they cover its buffers,
+  // while the host lets the engine grow, and only then another request's
+  // state in use (Cache::reclaimInUseState).
   template <class Take> [[nodiscard]] bool makeStateRoom(StateClass kind, Take &&take);
   // The reclaim steps for a lane's state and for KV pages the engine's limit
   // refused. Idle memory of the kind refused stays for it to reuse; idle
   // memory of the other kind is released first. Each takes cache up to the
   // class allocate() is given. Memory for later, an optional allocation of
   // the model's memory, takes no rebuildable cache of the model's and keeps
-  // the next request's empty extent.
+  // the next request's empty extent. Both take a chunk of the expert store
+  // above its floor between the cache nothing in use holds and what is in
+  // use. Memory for later and an optional allocation take neither: growth
+  // that only shortens a command or fills a cache takes nothing ranked above
+  // the cache nothing in use holds.
   [[nodiscard]] CacheReclaimResult reclaimForState(ReclaimClass upTo, bool forLater = false);
   [[nodiscard]] CacheReclaimResult reclaimForKv(const TokenAdmission &admission,
-                                                ReclaimClass upTo);
+                                                ReclaimClass upTo, bool optional);
+  // Each gives back one chunk of the expert store above its floor
+  // (Model::releaseExpertChunk), or every one (Model::releaseExpertsToFloor),
+  // and counts the step; their bytes, or zero.
+  [[nodiscard]] uint64_t releaseExpertChunk();
+  [[nodiscard]] uint64_t releaseExpertsToFloor();
+  // One step of the exchange (reclaimForExperts): an idle buffer beyond
+  // those one lane starts from, else one Cache::reclaimForExchange step of
+  // the cache nothing in use holds, which keeps the resume point and the
+  // runway extent, releases the extent it empties and starts no copy. Its
+  // progress, and the bytes it returned to the system (reclaimedBytes).
+  [[nodiscard]] CacheReclaimResult reclaimStepForExperts();
+  // What reclaimForExperts returns with no request in the engine, its steps
+  // repeated until none makes progress: the model's idle buffers beyond a
+  // lane's, with those of the cached states the cache frees
+  // (Model::idleBufferBytes of Cache::exchangeable's states), and the
+  // extents the cache releases (Cache::exchangeable). Nothing while a copy
+  // to or from the SSD cache is in flight.
+  [[nodiscard]] uint64_t exchangeableBytes() const;
   [[nodiscard]] bool reclaimIdleState(bool keepLane, model::IdleMemory scope) noexcept;
   [[nodiscard]] CacheReclaimResult reuseCachedStateWhilePaused(ReclaimClass upTo);
   [[nodiscard]] CacheReclaimResult reuseCachedPagesWhilePaused(
@@ -743,7 +811,9 @@ private:
   // lane holds back. A refusal from the host reuses what the engine holds;
   // when that gives nothing, a request in service retries as one
   // (EngineConfig::serving), which only the engine's limit and critical
-  // pressure refuse. A refusal from the engine's limit reclaims cache. When
+  // pressure refuse. A refusal from the engine's limit reclaims cache and,
+  // unless the allocation is optional, a chunk of the expert store above its
+  // floor before anything in use (reclaimForState, reclaimForKv). When
   // neither gives anything, fallback, given the denial so far, may let go of
   // what the request itself pins or turn its KV to Spill, which allocates
   // nothing, so the host's refusal offers it too; the allocation is then
@@ -867,6 +937,7 @@ private:
   // lane last released its memory, or the suspension itself met a limit
   // that only freed memory lifts, unlike a host pause.
   bool allocationFailed_ = false;
+  uint64_t expertReleases_ = 0;
   EngineSnapshot counters_;
 };
 

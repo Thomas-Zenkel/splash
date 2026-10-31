@@ -369,7 +369,11 @@ ExpertChunks ExpertChunks::of(std::vector<metal::MetalBuffer> planes, uint32_t f
     ++z;
   }
   ExpertChunks chunks;
-  chunks.planes_ = std::make_shared<const std::vector<metal::MetalBuffer>>(std::move(planes));
+  chunks.live_ = std::make_shared<Live>();
+  for (uint64_t live = 1; live <= count; ++live)
+    chunks.live_->planes.push_back(std::make_shared<const std::vector<metal::MetalBuffer>>(
+        planes.begin(), planes.begin() + static_cast<std::ptrdiff_t>(live * MOE_EXPERT_CHUNK_ADDRESSES)));
+  chunks.live_->count.store(static_cast<uint32_t>(count), std::memory_order_release);
   chunks.floorSlots_ = floorSlots;
   chunks.chunkSlots_ = chunkSlots;
   chunks.slots_ = slots;
@@ -379,7 +383,14 @@ ExpertChunks ExpertChunks::of(std::vector<metal::MetalBuffer> planes, uint32_t f
 
 bool ExpertChunks::checkedFor(uint32_t slots, const QuantizedSegment &gate, const QuantizedSegment &up,
                               const QuantizedSegment &down) const noexcept {
-  return planes_ && slots == slots_ && routed_ == std::array{routedOf(gate), routedOf(up), routedOf(down)};
+  return live_ && slots == slots_ && routed_ == std::array{routedOf(gate), routedOf(up), routedOf(down)};
+}
+
+void ExpertChunks::keep(uint32_t chunks) {
+  if (!chunks || chunks > this->chunks())
+    throw std::invalid_argument("MoE expert chunks keep " + std::to_string(chunks) + " of " +
+                                std::to_string(this->chunks()) + " chunks");
+  live_->count.store(chunks, std::memory_order_release);
 }
 
 ExpertChunks residentExpertChunks(const BlockMoeWeights &weights) {

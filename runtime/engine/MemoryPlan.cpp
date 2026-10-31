@@ -44,33 +44,43 @@ uint64_t extentsBytes(uint64_t pages, uint64_t extentPages, uint64_t pageBytes) 
 }
 
 // A streamed part as its setting leaves it to the planner: the bytes the
-// floors charge it, and all of it; an Auto part streams through more than
-// its floor or loads whole as the budget allows, any other only as set. An
-// Auto part whose smallest store takes all it would loads whole.
+// floors charge it, and all of it. An automatic part loads whole where the
+// budget holds it beside the KV allowance, and otherwise streams through
+// what the floors charge it and as much more as the budget allows; routed
+// experts given a size are automatic, the floors charging that size, which
+// is the floor of the store they stream through (`floor`). Any other part
+// loads whole, or streams through what the floors charge it, as set. An Auto
+// part whose smallest store takes all it would loads whole.
 struct Part final {
-  uint64_t floor = 0;
+  uint64_t charged = 0;
   uint64_t all = 0;
   bool automatic = false;
   bool streams = false;
+  bool floor = false;
 };
 
-std::optional<Part> resolve(const StreamedPart &part, std::string_view option, std::string &error) {
+// The part as `option` sets it: a size is its store's floor where
+// `floorSize`, as the routed experts' is, and otherwise its store, as the
+// PLE table's row cache is.
+std::optional<Part> resolve(const StreamedPart &part, std::string_view option, bool floorSize, std::string &error) {
   if (!part.allBytes) return Part{};
+  const uint64_t bytes = part.setting.bytes;
   switch (part.setting.mode) {
   case StreamedSetting::Mode::Auto:
-    if (part.floorBytes < part.allBytes) return Part{part.floorBytes, part.allBytes, true, false};
+    if (part.minimumBytes < part.allBytes) return Part{part.minimumBytes, part.allBytes, true, false};
     [[fallthrough]];
   case StreamedSetting::Mode::Off:
     return Part{part.allBytes, part.allBytes, false, false};
   case StreamedSetting::Mode::Size:
-    if (part.setting.bytes >= part.allBytes) return Part{part.allBytes, part.allBytes, false, false};
-    if (part.setting.bytes < part.floorBytes) {
-      error = std::string(option) + " of " + std::to_string(part.setting.bytes / kMiB) +
-              " MiB is less than its smallest store, " + std::to_string((part.floorBytes + kMiB - 1) / kMiB) +
-              " MiB";
+    if (bytes >= part.allBytes) return Part{part.allBytes, part.allBytes, false, false};
+    if (bytes < part.minimumBytes) {
+      error = std::string(option) + " of " + std::to_string(bytes / kMiB) + " MiB is less than its smallest store, " +
+              std::to_string((part.minimumBytes + kMiB - 1) / kMiB) + " MiB";
       return std::nullopt;
     }
-    return Part{part.setting.bytes, part.setting.bytes, false, true};
+    return floorSize ? Part{bytes, part.allBytes, true, false, true} : Part{bytes, bytes, false, true};
+  case StreamedSetting::Mode::Loaded:
+    return Part{bytes, bytes, false, true};
   }
   return Part{};
 }
@@ -168,11 +178,12 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
                                uint64_t arenaBytes, uint64_t spillArenaBytes) {
   const kv::Layout &layout = in.kvLayout;
   const auto overflow = [] { return StreamedMemoryResult{std::nullopt, "the memory plan overflows uint64"}; };
-  // The floors: what loads, the arenas and the stores at their floors, a
-  // lane's state and the KV runway, and a spill-capable target's spill
-  // floors.
+  // The floors: what loads, the arenas and the stores at what the floors
+  // charge them (their smallest, or the routed experts' floor
+  // --expert-memory sets), a lane's state and the KV runway, and a
+  // spill-capable target's spill floors.
   uint64_t loaded = 0;
-  for (const uint64_t bytes : {in.fixedBytes, arenaBytes, experts.floor, table.floor})
+  for (const uint64_t bytes : {in.fixedBytes, arenaBytes, experts.charged, table.charged})
     if (!checkedAdd(loaded, bytes, loaded)) return overflow();
   const std::optional<uint64_t> minimum = minimumRequiredBytes(loaded, in.laneStateBytes, layout);
   if (!minimum) return overflow();
@@ -231,25 +242,29 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
         remaining(kvPagesBytes(layout, budget, floorPages, layout.extentPagesFor(budget)), runwayBytes));
   };
   const int64_t tableShare =
-      table.automatic ? static_cast<int64_t>(remaining(std::min(table.all, kTableShareBytes), table.floor)) : 0;
+      table.automatic ? static_cast<int64_t>(remaining(std::min(table.all, kTableShareBytes), table.charged)) : 0;
   bool expertsStream = experts.streams;
-  plan.expertBytes = experts.streams ? experts.floor : 0;
+  plan.expertBytes = experts.streams ? experts.charged : 0;
   if (experts.automatic) {
-    const auto above = static_cast<int64_t>(experts.all - experts.floor);
+    const auto above = static_cast<int64_t>(experts.all - experts.charged);
     if (rest - allowance(false) - tableShare >= above) {
       rest -= above;
     } else {
       expertsStream = true;
       const int64_t bytes = std::clamp<int64_t>(rest - allowance(true) - tableShare, 0, above);
-      plan.expertBytes = experts.floor + static_cast<uint64_t>(bytes);
+      plan.expertBytes = experts.charged + static_cast<uint64_t>(bytes);
       rest -= bytes;
     }
   }
-  plan.tableBytes = table.streams ? table.floor : 0;
+  // A size of the routed experts is the floor of the store they stream
+  // through; an automatic store keeps its own
+  // (model::ExpertStoreOptions::floorBytes).
+  plan.expertFloorBytes = expertsStream && experts.floor ? experts.charged : 0;
+  plan.tableBytes = table.streams ? table.charged : 0;
   if (table.automatic) {
     const int64_t kept = rest - allowance(expertsStream);
-    if (kept < static_cast<int64_t>(table.all - table.floor))
-      plan.tableBytes = table.floor + static_cast<uint64_t>(std::clamp<int64_t>(kept, 0, tableShare));
+    if (kept < static_cast<int64_t>(table.all - table.charged))
+      plan.tableBytes = table.charged + static_cast<uint64_t>(std::clamp<int64_t>(kept, 0, tableShare));
   }
   return {plan, {}};
 }
@@ -409,8 +424,8 @@ StreamedMemoryResult planStreamedMemory(const StreamedMemoryInputs &in) {
       (in.sparseKv && !in.sparseKv->laneSlots()))
     return {std::nullopt, "invalid memory planner inputs"};
   std::string error;
-  const std::optional<Part> experts = resolve(in.experts, "--expert-memory", error);
-  const std::optional<Part> table = experts ? resolve(in.table, "--ple-memory", error) : std::nullopt;
+  const std::optional<Part> experts = resolve(in.experts, "--expert-memory", true, error);
+  const std::optional<Part> table = experts ? resolve(in.table, "--ple-memory", false, error) : std::nullopt;
   if (!table) return {std::nullopt, error};
   // The arenas of the parts set to stream, and where that plan streams
   // more, those of the parts it streams: a part that streams with smaller

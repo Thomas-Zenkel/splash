@@ -147,6 +147,10 @@ public:
     const FormRecord &record = formRecord(form);
     return record.allocatedExtents * extentPages_ - record.activePages;
   }
+  // The form's allocated extents, empty ones and the runway among them.
+  [[nodiscard]] uint32_t allocatedExtents(kv::PageForm form) const noexcept {
+    return formRecord(form).allocatedExtents;
+  }
 
   // Releases completely unreferenced extents, of the form or of any, at
   // most `limit` of them, and returns the bytes released. keepRunway keeps

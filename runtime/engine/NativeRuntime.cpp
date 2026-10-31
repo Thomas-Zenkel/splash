@@ -30,7 +30,7 @@ NativeRuntime::NativeRuntime(NativeLoopConfig config, double idleReleaseSeconds,
       statusProvider_(std::move(statusProvider)), limits_(limits),
       parser_(limits_), core_(config_.engine, cache, model, *this) {
   if (!output_ || !statusProvider_ || !config_.metrics || !config_.weights ||
-      !config_.weightAdmission || !config_.unixMicros ||
+      !config_.weightAdmission || !config_.growthAdmission || !config_.unixMicros ||
       !config_.monotonicMilliseconds)
     throw std::invalid_argument("the native engine loop lacks a component it needs");
   if (!(idleReleaseSeconds_ > 0.0))
@@ -145,9 +145,10 @@ bool NativeRuntime::restoreWeights() {
   bool restored = false;
   try {
     // Memory the requests waiting need: the host's margins do not hold it
-    // back, critical pressure and the engine's limit refuse it.
+    // back, critical pressure and the engine's limit refuse it. What they can
+    // do without comes back only while the host has room to spare.
     const Serving serving(config_.engine.serving, !telemetry_.empty());
-    restored = config_.weights->restore(config_.weightAdmission);
+    restored = config_.weights->restore(config_.weightAdmission, config_.growthAdmission);
   } catch (const metal::MetalAllocationError &refusal) {
     return weightsRefused(refusal.failure());
   }
