@@ -47,7 +47,8 @@ final class Draft {
 }
 
 /// Where a message is written: the text and the images attached; under them what the Server runs,
-/// how much the model thinks, and Send, or Stop while a reply streams.
+/// how much of the model's context the next prompt takes, how much the model thinks, and Send, or
+/// Stop while a reply streams.
 struct Composer: View {
     @Environment(AppState.self) private var state
     @Environment(\.colorScheme) private var colorScheme
@@ -62,7 +63,7 @@ struct Composer: View {
                 Attachments(draft: draft)
             }
             ComposerField(text: $draft.text, height: $height, focusRequests: draft.focusRequests,
-                          placeholder: "Message Splash", submit: send, cancel: stop, acceptsImages: images,
+                          placeholder: "Message Splash", submit: state.sendDraft, cancel: stop, acceptsImages: images,
                           attach: draft.attach)
                 .frame(height: min(max(height, 22), 220))
             HStack(spacing: 6) {
@@ -75,14 +76,18 @@ struct Composer: View {
                 }
                 EngineSlot()
                 Spacer(minLength: 12)
+                if let usage = state.contextUsage {
+                    ContextRing(usage: usage)
+                        .transition(.opacity)
+                }
                 EffortMenu()
-                Button { if streaming { state.chats.stop() } else { send() } } label: {
+                Button { if streaming { state.chats.stop() } else { state.sendDraft() } } label: {
                     Image(systemName: streaming ? "stop.fill" : "arrow.up")
                         .font(.system(size: streaming ? 10 : 13, weight: streaming ? .bold : .semibold))
                         .contentTransition(.symbolEffect(.replace))
                 }
                 .buttonStyle(InkCircle())
-                .disabled(!streaming && !sendable)
+                .disabled(!streaming && !state.canSendDraft)
                 .keyboardShortcut(streaming ? KeyboardShortcut(".", modifiers: .command) : nil)
                 .help(streaming ? "Stop" : help)
                 .accessibilityLabel(streaming ? "Stop" : "Send")
@@ -91,6 +96,7 @@ struct Composer: View {
             .buttonStyle(.hover)
             // The first control's glyph on the text's edge.
             .padding(.leading, -6)
+            .animation(Motion.settle, value: state.contextUsage == nil)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
@@ -101,6 +107,10 @@ struct Composer: View {
         .fileImporter(isPresented: $picking, allowedContentTypes: [.image], allowsMultipleSelection: true) { result in
             draft.attach(((try? result.get()) ?? []).compactMap(NSImage.init(contentsOf:)))
         }
+        // The ring counts the next prompt as it is written.
+        .onChange(of: state.contextRequest, initial: true) { _, request in
+            state.chatContext.refresh(request)
+        }
     }
 
     /// Whether the open conversation's reply streams.
@@ -108,21 +118,11 @@ struct Composer: View {
         state.chats.streaming != nil && state.chats.streaming == state.chats.current?.id
     }
 
-    private var sendable: Bool {
-        !draft.isEmpty && state.server.answers && state.chats.streaming == nil
-            && (draft.images.isEmpty || state.server.acceptsImages)
-    }
-
     private var help: String {
         if !state.server.answers { return "Available once a model is running" }
         if !draft.images.isEmpty && !state.server.acceptsImages { return "This model can’t see images" }
+        if let note = state.overflow?.note { return note }
         return "Send"
-    }
-
-    private func send() {
-        guard sendable else { return }
-        let message = draft.take()
-        state.send(message.text, images: message.images)
     }
 
     /// Stops the open conversation's reply, the way Escape cancels; false when none streams.
@@ -130,6 +130,40 @@ struct Composer: View {
         guard streaming else { return false }
         state.chats.stop()
         return true
+    }
+}
+
+/// How much of the model's context the next prompt takes, as a ring filling clockwise: in the
+/// secondary color while it leaves room for a reply, orange once it leaves less than the reply
+/// allowance, red once the context cannot hold it. Its help gives the exact figures.
+private struct ContextRing: View {
+    let usage: ContextUsage
+
+    var body: some View {
+        ZStack {
+            Circle().stroke(.quaternary, lineWidth: 2)
+            Circle()
+                .trim(from: 0, to: usage.fraction)
+                .stroke(tint, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+        }
+        .frame(width: 14, height: 14)
+        // Room around the ring for the pointer to find its help.
+        .padding(5)
+        .contentShape(.rect)
+        .animation(Motion.settle, value: usage)
+        .help(usage.explanation)
+        .accessibilityElement()
+        .accessibilityLabel("Context")
+        .accessibilityValue(usage.explanation)
+    }
+
+    private var tint: AnyShapeStyle {
+        switch usage.level {
+        case .normal: AnyShapeStyle(.secondary)
+        case .tight: AnyShapeStyle(.orange)
+        case .full: AnyShapeStyle(.red)
+        }
     }
 }
 

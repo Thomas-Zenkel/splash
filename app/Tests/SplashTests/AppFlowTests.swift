@@ -337,7 +337,8 @@ struct AppFlowTests {
 
     /// Sends `prompt` as the app's composer does and waits for the reply to end.
     private func converse(_ prompt: String) async throws {
-        state.send(prompt, images: [])
+        state.draft.text = prompt
+        state.sendDraft()
         #expect(state.chats.streaming != nil)
         try await waitFor(state.chats.streaming == nil, "the reply", seconds: 300)
         let reply = try #require(state.chats.current?.messages.last)

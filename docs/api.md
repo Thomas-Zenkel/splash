@@ -21,6 +21,7 @@ Messages requires it.
 | `GET`, `DELETE /v1/responses/{id}` | A stored response ([Responses state](#responses-state)) |
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/messages/count_tokens` | A Messages request's prompt tokens, images included, as `{"input_tokens": N}`, without inference |
+| `POST /v1/chat/completions/count_tokens` | A Chat request's prompt tokens, images included, as `{"input_tokens": N}`, without inference |
 | `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit and what reasoning efforts do ([default reasoning effort](server.md#default-reasoning-effort)) |
 | `POST /tokenize`, `/apply-template` | A text's tokens, or a conversation's rendered prompt, without inference |
 | `POST /v1/judgments`, `/v1/systemone` | Scores over fixed answers ([judgment contracts](#judgment-contracts)) |
@@ -146,6 +147,12 @@ and returns `{"prompt":"..."}` using the same template as generation.
 raw tokenization does not account for image embeddings (use `count_tokens` for that).
 Both endpoints run without inference and share bounded preparation capacity with
 `count_tokens`; they can inspect prompts larger than the serving context limit.
+
+`POST /v1/chat/completions/count_tokens` accepts the same `messages`, images,
+tools and reasoning options as Chat Completions and returns `{"input_tokens": N}`.
+The count includes the chat template and image embeddings, even when the prompt
+exceeds the serving context. It does not generate an answer or reserve output
+tokens.
 
 ## Request limits and timeouts
 

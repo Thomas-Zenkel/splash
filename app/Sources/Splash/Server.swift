@@ -104,14 +104,16 @@ final class Server {
     static let log = URL.libraryDirectory.appending(path: "Logs/Splash/server.log")
 
     private let runtime: Runtime
+    private let log: URL
     private var child: ChildProcess?
     private var tail: LogTail?
     private var stopRequested = false
     private var firstError: String?
     private var watch: Task<Void, Never>?
 
-    init(runtime: Runtime) {
+    init(runtime: Runtime, log: URL = Server.log) {
         self.runtime = runtime
+        self.log = log
     }
 
     var running: Bool { child != nil }
@@ -178,7 +180,7 @@ final class Server {
         reasoning = nil
         firstError = nil
         stopRequested = false
-        resetLog(Self.log)
+        resetLog(log)
         if portInUse(settings.port) {
             return refuse("Port \(settings.port) is in use by another app. Quit that app, or choose another port in Launch Options › Advanced.")
         }
@@ -190,14 +192,14 @@ final class Server {
             child = try ChildProcess(
                 command: runtime.command(settings.serveArguments(model: model)),
                 environment: runtime.environment.merging(settings.environment) { $1 },
-                log: Self.log,
+                log: log,
                 exited: { [weak self] in self?.exited($0) }
             )
         } catch {
             phase = .failed("Splash couldn’t start it: \(error.localizedDescription)")
             return
         }
-        tail = LogTail(Self.log) { [weak self] in self?.received($0) }
+        tail = LogTail(log) { [weak self] in self?.received($0) }
         let pid = child!.pid
         UserDefaults.standard.set(Int(pid), forKey: Preference.serverPID)
         UserDefaults.standard.set(settings.port, forKey: Preference.serverPort)
@@ -206,7 +208,7 @@ final class Server {
 
     /// Fails a start before it runs anything, saying why in the log too.
     private func refuse(_ message: String) {
-        try? Data((message + "\n").utf8).write(to: Self.log)
+        try? Data((message + "\n").utf8).write(to: log)
         phase = .failed(message)
     }
 
